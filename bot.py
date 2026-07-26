@@ -10892,7 +10892,13 @@ class PointShopItemSelect(discord.ui.Select):
         if not options:
             options.append(discord.SelectOption(label="No items available", value="none", emoji="❌"))
 
-        super().__init__(placeholder="🛍️ Select an item to purchase...", options=options, custom_id="shop_item_select")
+        super().__init__(
+            placeholder="🛍️ Select an item to purchase...",
+            options=options,
+            custom_id="shop_item_select",
+            min_values=0,
+            max_values=1,
+        )
 
     async def callback(self, interaction: discord.Interaction):
         """Show purchase modal when item is selected.
@@ -10902,6 +10908,10 @@ class PointShopItemSelect(discord.ui.Select):
         the stateless template view registered at startup can serve shop
         messages posted before a restart.
         """
+        if not self.values:
+            await interaction.response.defer()
+            return
+
         selected_id = self.values[0]
 
         if selected_id == "none":
@@ -11009,6 +11019,22 @@ class PointShopItemSelect(discord.ui.Select):
         )
         await interaction.response.send_modal(modal)
 
+        # Discord clients otherwise keep rendering the last selected option on
+        # the storefront after the modal opens. Rebuild the message's existing
+        # components with no default option so the shared selector is ready for
+        # the next purchase (and the next user) without retaining view state.
+        if interaction.message:
+            try:
+                refreshed_view = discord.ui.LayoutView.from_message(interaction.message, timeout=None)
+                for child in refreshed_view.walk_children():
+                    if getattr(child, "custom_id", None) != "shop_item_select":
+                        continue
+                    for option in getattr(child, "options", []):
+                        option.default = False
+                await interaction.message.edit(view=refreshed_view)
+            except Exception as exc:
+                logger.warning("[Point Shop] Could not reset the item selector: %s", exc)
+
 
 class PointShopView(discord.ui.View):
     """Persistent view for the point shop with item selector (legacy)"""
@@ -11019,7 +11045,7 @@ class PointShopView(discord.ui.View):
         if items:
             self.add_item(PointShopItemSelect(items))
 
-        # Add a check balance button
+        self.add_item(PointShopBuyNowButton())
         self.add_item(PointShopBalanceButton())
 
 
@@ -11208,6 +11234,55 @@ class PointShopBalanceButton(discord.ui.Button):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+class PointShopPickerView(discord.ui.View):
+    """Short-lived private picker opened from the public storefront."""
+
+    def __init__(self, items: list):
+        super().__init__(timeout=300)
+        self.add_item(PointShopItemSelect(items))
+
+
+class PointShopBuyNowButton(discord.ui.Button):
+    """Open a DB-fresh item picker visible only to the buyer."""
+
+    def __init__(self):
+        super().__init__(
+            style=discord.ButtonStyle.primary,
+            label="Buy Now",
+            custom_id="shop_buy_now",
+            emoji="🛒",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        guild_id = interaction.guild.id if interaction.guild else None
+
+        with engine.connect() as conn:
+            items = conn.execute(
+                text(
+                    """
+                SELECT id, name, description, price, stock, image_url, is_active
+                FROM point_shop_items
+                WHERE is_active = TRUE AND discord_server_id = :guild_id
+                ORDER BY price ASC
+            """
+                ),
+                {"guild_id": guild_id},
+            ).fetchall()
+
+        if not items:
+            await interaction.response.send_message(
+                "❌ No items are available for purchase right now.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "Select an item to continue your purchase:",
+            view=PointShopPickerView(items),
+            ephemeral=True,
+        )
+
+
 class ShopLayoutView(discord.ui.LayoutView):
     """Single-message Components V2 storefront: header, mosaic grid, purchase
     select, balance button, and footer all live in one message, so shop updates
@@ -11235,13 +11310,13 @@ class ShopLayoutView(discord.ui.LayoutView):
 
         if items or force_select:
             self.add_item(discord.ui.ActionRow(PointShopItemSelect(items)))
-        self.add_item(discord.ui.ActionRow(PointShopBalanceButton()))
+        self.add_item(discord.ui.ActionRow(PointShopBuyNowButton(), PointShopBalanceButton()))
         self.add_item(discord.ui.TextDisplay("💡 *Earn points by watching streams!*"))
 
     @classmethod
     def template(cls):
         """Stateless instance for bot.add_view at startup: keeps the select and
-        balance button on already-posted shop messages working across restarts
+        purchase and balance controls on already-posted shop messages working across restarts
         (their callbacks read everything from the interaction + DB)."""
         return cls(items=[], force_select=True)
 
