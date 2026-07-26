@@ -2242,6 +2242,87 @@ try:
             )
         )
 
+        # Dashboard notification inbox + browser-push outbox. These shared
+        # tables are also migrated by the dashboard so either Railway service
+        # can boot first.
+        conn.execute(
+            text(
+                """
+        CREATE TABLE IF NOT EXISTS notifications (
+            id SERIAL PRIMARY KEY,
+            discord_server_id BIGINT NOT NULL,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT,
+            data JSONB,
+            is_read BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+            )
+        )
+        conn.execute(
+            text(
+                """
+        CREATE INDEX IF NOT EXISTS idx_notifications_server_read
+        ON notifications(discord_server_id, is_read, created_at DESC);
+        """
+            )
+        )
+        conn.execute(
+            text(
+                """
+        CREATE TABLE IF NOT EXISTS web_push_subscriptions (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            discord_server_id BIGINT NOT NULL,
+            endpoint TEXT NOT NULL,
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (user_id, discord_server_id, endpoint)
+        );
+        """
+            )
+        )
+        conn.execute(
+            text(
+                """
+        CREATE INDEX IF NOT EXISTS idx_web_push_subscriptions_server
+        ON web_push_subscriptions (discord_server_id);
+        """
+            )
+        )
+        conn.execute(
+            text(
+                """
+        CREATE TABLE IF NOT EXISTS web_push_deliveries (
+            id BIGSERIAL PRIMARY KEY,
+            notification_id INTEGER NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+            subscription_id BIGINT NOT NULL REFERENCES web_push_subscriptions(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            claimed_at TIMESTAMPTZ,
+            sent_at TIMESTAMPTZ,
+            last_error TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (notification_id, subscription_id)
+        );
+        """
+            )
+        )
+        conn.execute(
+            text(
+                """
+        CREATE INDEX IF NOT EXISTS idx_web_push_deliveries_pending
+        ON web_push_deliveries (status, next_attempt_at);
+        """
+            )
+        )
+        conn.execute(text("DELETE FROM notifications WHERE type IN ('stream_live', 'stream_offline')"))
+
         # Point system settings
         conn.execute(
             text(
@@ -10471,6 +10552,40 @@ class PointShopConfirmView(discord.ui.View):
                 ).fetchone()
 
                 notif_id = int(notif_row[0]) if notif_row and notif_row[0] is not None else None
+
+                # Queue Web Push deliveries in the same transaction as the
+                # notification. PostgreSQL emits NOTIFY only after commit, so
+                # the dedicated worker always sees durable rows. A savepoint
+                # keeps push infrastructure failures from cancelling an order.
+                if notif_id is not None:
+                    push_savepoint = conn.begin_nested()
+                    try:
+                        queued_rows = conn.execute(
+                            text(
+                                """
+                            INSERT INTO web_push_deliveries (notification_id, subscription_id)
+                            SELECT :notification_id, id
+                            FROM web_push_subscriptions
+                            WHERE discord_server_id = :server_id
+                            ON CONFLICT (notification_id, subscription_id) DO NOTHING
+                            RETURNING id
+                        """
+                            ),
+                            {"notification_id": notif_id, "server_id": self.server_id},
+                        ).fetchall()
+                        if queued_rows:
+                            conn.execute(
+                                text("SELECT pg_notify('web_push_queued', CAST(:notification_id AS TEXT))"),
+                                {"notification_id": notif_id},
+                            )
+                        push_savepoint.commit()
+                    except Exception as push_error:
+                        push_savepoint.rollback()
+                        logger.warning(
+                            "[Point Shop] Web Push enqueue skipped for notification %s: %s",
+                            notif_id,
+                            push_error,
+                        )
 
                 # Auto-award raffle tickets if applicable (use savepoint so failure doesn't abort main transaction)
                 raffle_tickets_awarded = False
