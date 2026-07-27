@@ -8,8 +8,8 @@ JSON for the configured campaign code, the user is auto-verified (raffle_shuffle
 verified=TRUE) and granted the configured `shuffle_verified_role_id` role.
 
 This mirrors features/linking/link_panel.py (embed + persistent button view + admin
-create command + re-attach on restart) and is the automated equivalent of the admin
-`!verifyshuffle` command in raffle_system/commands.py.
+create command + re-attach on restart). It replaced the manual `!linkshuffle` /
+`!verifyshuffle` command pair, which has been removed.
 """
 
 import asyncio
@@ -18,6 +18,7 @@ import os
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import text
 
@@ -627,6 +628,7 @@ async def setup_shuffle_panel_system(bot, engine, settings_getter):
         logger.debug(f"✅ Shuffle verify panel initialized")
 
     @bot.hybrid_command(name="createshufflepanel")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def create_shuffle_panel_cmd(ctx):
         """[ADMIN] Create the Shuffle verify panel in this channel"""

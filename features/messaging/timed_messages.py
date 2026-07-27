@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from sqlalchemy import text
 
@@ -501,6 +502,7 @@ class TimedMessagesCommands(commands.Cog):
         await self.bot.wait_until_ready()
 
     @commands.hybrid_command(name="addtimer", aliases=["addtimedmessage", "timermessage"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def add_timed_message(self, ctx, interval: int, *, message: str):
         """
@@ -527,6 +529,7 @@ class TimedMessagesCommands(commands.Cog):
             await ctx.send(f"❌ {result['message']}")
 
     @commands.hybrid_command(name="removetimer", aliases=["deletetimer", "rmtimer"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def remove_timed_message(self, ctx, message_id: int):
         """
@@ -547,6 +550,7 @@ class TimedMessagesCommands(commands.Cog):
             await ctx.send(f"❌ {result['message']}")
 
     @commands.hybrid_command(name="toggletimer", aliases=["enabletimer", "disabletimer"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def toggle_timed_message(self, ctx, message_id: int, enabled: str = None):
         """
@@ -576,6 +580,7 @@ class TimedMessagesCommands(commands.Cog):
             await ctx.send(f"❌ {result['message']}")
 
     @commands.hybrid_command(name="updatetimer", aliases=["settimer"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def update_timer_interval(self, ctx, message_id: int, interval: int):
         """
@@ -596,6 +601,7 @@ class TimedMessagesCommands(commands.Cog):
             await ctx.send(f"❌ {result['message']}")
 
     @commands.hybrid_command(name="listtimers", aliases=["timers", "timedmessages"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def list_timed_messages(self, ctx):
         """
@@ -646,6 +652,7 @@ class TimedMessagesCommands(commands.Cog):
         await ctx.send(embed=embed)
 
     @commands.hybrid_command(name="timerpanel", aliases=["managetimers"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def timer_control_panel(self, ctx):
         """

@@ -22,6 +22,7 @@ from datetime import datetime
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 from discord.ui import Modal, TextInput, View
 from sqlalchemy import text
@@ -500,6 +501,7 @@ async def setup_howl_panel_system(bot, engine, settings_getter):
         logger.debug(f"✅ Howl verify panel initialized")
 
     @bot.hybrid_command(name="createhowlpanel")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def create_howl_panel_cmd(ctx):
         """[ADMIN] Create the Howl verify panel in this channel"""

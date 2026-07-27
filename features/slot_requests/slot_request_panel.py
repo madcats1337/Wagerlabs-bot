@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ui import Button, Modal, TextInput, View
 from sqlalchemy import text
@@ -815,6 +816,7 @@ class SlotRequestPanelCommands(commands.Cog):
         await self.bot.wait_until_ready()
 
     @commands.hybrid_command(name="slotpanel")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def create_slot_panel(self, ctx):
         """

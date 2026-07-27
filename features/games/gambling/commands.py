@@ -8,6 +8,7 @@ import logging
 import traceback
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import text
 
@@ -542,6 +543,7 @@ class GamblingCog(commands.Cog, name="Gambling"):
     # /setgamblechannel — Set gambling channel (admin only)
     # -------------------------------------------------------
     @commands.hybrid_command(name="setgamblechannel", aliases=["setgambling"])
+    @app_commands.default_permissions(manage_guild=True)
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
     async def cmd_set_gamble_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):

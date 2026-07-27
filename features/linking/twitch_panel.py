@@ -10,6 +10,7 @@ viewer can link a Kick AND a Twitch account in the same server.
 import logging
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from discord.ui import Button, View
 from sqlalchemy import text
@@ -209,6 +210,7 @@ async def setup_twitch_link_panel_system(bot, engine, oauth_url_generator):
         logger.debug("✅ Twitch link panel initialized")
 
     @bot.hybrid_command(name="createtwitchpanel")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def create_twitch_panel_cmd(ctx):
         """[ADMIN] Create the Twitch link panel in this channel."""

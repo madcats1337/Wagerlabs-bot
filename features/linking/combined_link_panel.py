@@ -20,6 +20,7 @@ import logging
 import os
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import text
 
@@ -490,6 +491,7 @@ async def setup_combined_link_panel_system(bot, engine, kick_url_generator, twit
         logger.warning(f"[CombinedLink] add_view failed (non-fatal): {e}")
 
     @bot.hybrid_command(name="createlinkpanel")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def create_link_panel_cmd(ctx):
         """[ADMIN] Create the combined link panel in this channel."""

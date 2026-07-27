@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ui import Button, Modal, TextInput, View
 from sqlalchemy import text
@@ -471,6 +472,7 @@ async def setup_gtb_panel(bot, engine, gtb_manager, kick_send_callback=None):
 
     # Add command to create the panel
     @bot.hybrid_command(name="creategtbpanel")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def create_gtb_panel_cmd(ctx):
         """[ADMIN] Create the GTB panel in this channel"""

@@ -6,6 +6,7 @@ Allows admins to trigger webhook setup via Discord command
 import asyncio
 import logging
 
+from discord import app_commands
 from discord.ext import commands
 
 from setup_webhooks import WEBHOOK_URL, setup_webhooks_for_server
@@ -20,6 +21,7 @@ class WebhookSetupCommands(commands.Cog):
         self.bot = bot
 
     @commands.hybrid_command(name="setup-webhooks")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def setup_webhooks(self, ctx):
         """

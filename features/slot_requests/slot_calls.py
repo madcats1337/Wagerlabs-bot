@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import text
 
@@ -983,6 +984,7 @@ class SlotCallCommands(commands.Cog):
         return self.default_tracker
 
     @commands.hybrid_command(name="slotcalls")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def toggle_slot_calls(self, ctx, action: str = None):
         """
@@ -1033,6 +1035,7 @@ class SlotCallCommands(commands.Cog):
             await ctx.send("❌ Invalid action. Use `/slotcalls on`, `/slotcalls off`, or `/slotcalls status`")
 
     @commands.hybrid_command(name="pickslot", aliases=["randomslot", "slotpick"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def pick_random_slot(self, ctx):
         """
@@ -1139,6 +1142,7 @@ class SlotCallCommands(commands.Cog):
             await ctx.send(f"❌ Error picking random slot: {e}")
 
     @commands.hybrid_command(name="slotlist", aliases=["listslots", "slots"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def list_slot_requests(self, ctx):
         """
@@ -1212,6 +1216,7 @@ class SlotCallCommands(commands.Cog):
             await ctx.send(f"❌ Error getting slot list: {e}")
 
     @commands.hybrid_command(name="clearslots", aliases=["clearrequests", "resetslots"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def clear_slot_requests(self, ctx):
         """

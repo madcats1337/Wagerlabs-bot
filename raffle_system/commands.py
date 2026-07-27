@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import text
 
@@ -335,371 +336,12 @@ Get ready to participate when the period starts!
             traceback.print_exc()
             await ctx.send(f"❌ Error loading raffle info. Please try again.")
 
-    @commands.hybrid_command(name="linkshuffle")
-    async def link_shuffle(self, ctx, shuffle_username: str = None):
-        """
-        Link your Shuffle.com account to earn raffle tickets automatically
-        Usage: /linkshuffle <shuffle_username>
-        Example: /linkshuffle CryptoKing420
-
-        Earn configurable tickets per $1000 wagered when using affiliate code 'lele'
-        """
-        # Reads the database before its first reply - acknowledge the slash interaction first.
-        await defer_slash_response(ctx)
-
-        try:
-            _, _, wager_tickets = get_ticket_reward_settings(self.engine, ctx.guild.id if ctx.guild else None, logger)
-            settings = self._get_guild_settings(ctx)
-            platform = platform_display_name(settings)
-            code = settings.shuffle_campaign_code
-
-            if not shuffle_username:
-                await ctx.send(
-                    f"❌ {ctx.author.mention} Please provide your {platform} username!\n\n"
-                    f"**Usage**: `/linkshuffle <your_shuffle_username>`\n"
-                    f"**Example**: `/linkshuffle CryptoKing420`\n\n"
-                    f"💡 **Tip**: Use code **'{code}'** on {platform} to earn {wager_tickets} tickets per $1000 wagered!"
-                )
-                return
-
-            discord_id = ctx.author.id
-            guild_id = ctx.guild.id if ctx.guild else None
-
-            managers = self._get_guild_managers(ctx)
-            shuffle_tracker = managers["shuffle_tracker"]
-
-            # Get Kick name from links table
-            with self.engine.begin() as conn:
-                result = conn.execute(
-                    text(
-                        """
-                    SELECT kick_name FROM links WHERE discord_id = :discord_id AND discord_server_id = :guild_id
-                """
-                    ),
-                    {"discord_id": discord_id, "guild_id": guild_id},
-                )
-
-                row = result.fetchone()
-                if not row:
-                    await ctx.send(
-                        f"❌ {ctx.author.mention} You must link your Kick account first!\n"
-                        "Use this server's Link Account panel to get started."
-                    )
-                    return
-
-                kick_name = row[0]
-
-            # Attempt to link
-            result = shuffle_tracker.link_shuffle_account(
-                shuffle_username=shuffle_username,
-                kick_name=kick_name,
-                discord_id=discord_id,
-                verified=False,  # Requires admin verification
-            )
-
-            if result["status"] == "success":
-                await ctx.send(
-                    f"✅ {ctx.author.mention} Shuffle link request created!\n\n"
-                    f"**Shuffle**: `{shuffle_username}`\n"
-                    f"**Kick**: `{kick_name}`\n\n"
-                    f"⏳ **Pending Admin Verification**\n"
-                    f"An admin will review your request. Once verified:\n"
-                    f"• Your {platform} wagers under code **'{code}'** will earn **{wager_tickets} tickets per $1000**\n"
-                    f"• Tickets are awarded automatically for future wagers\n"
-                    f"• Use `/tickets` to check your balance!"
-                )
-
-                # Notify admins (optional - send to admin channel)
-                logger.info(f"🔗 New Shuffle link request: {shuffle_username} → {kick_name} (Discord: {discord_id})")
-
-            elif result["status"] == "already_linked":
-                await ctx.send(
-                    f"❌ {ctx.author.mention} Shuffle username '{shuffle_username}' is already linked to "
-                    f"{result['existing_kick_name']}!"
-                )
-
-            elif result["status"] == "discord_already_linked":
-                await ctx.send(
-                    f"❌ {ctx.author.mention} You already have a Shuffle account linked: "
-                    f"{result['existing_shuffle_username']}\n"
-                    f"Contact an admin if you need to change it."
-                )
-            else:
-                await ctx.send(f"❌ Error creating link request: {result.get('error', 'Unknown error')}")
-
-        except Exception as e:
-            logger.error(f"Error linking Shuffle account: {e}")
-            await ctx.send(f"❌ Error processing link request. Please try again.")
-
     # ========================================
     # ADMIN COMMANDS
     # ========================================
 
-    @commands.hybrid_command(name="verifyshuffle", aliases=["shuffleverify", "raffleverify"])
-    @commands.has_permissions(administrator=True)
-    async def verify_shuffle_link(self, ctx, user: commands.UserConverter, shuffle_username: str):
-        """
-        [ADMIN] Verify and link a Shuffle account (creates link if it doesn't exist)
-        Usage: /verifyshuffle @user <shuffle_username>
-        Example: /verifyshuffle @John CryptoKing420
-        """
-        # Reads the database before its first reply — acknowledge the slash interaction first.
-        await defer_slash_response(ctx)
-
-        try:
-            guild_id = ctx.guild.id
-            managers = self._get_guild_managers(ctx)
-            ticket_manager = managers["ticket_manager"]
-
-            settings = self._get_guild_settings(ctx)
-            code = settings.shuffle_campaign_code
-
-            discord_id = user.id
-            admin_id = ctx.author.id
-
-            with self.engine.begin() as conn:
-                # Get kick name from links table
-                link_result = conn.execute(
-                    text(
-                        """
-                    SELECT kick_name FROM links WHERE discord_id = :discord_id AND discord_server_id = :guild_id
-                """
-                    ),
-                    {"discord_id": discord_id, "guild_id": guild_id},
-                )
-
-                link_row = link_result.fetchone()
-                if not link_row:
-                    await ctx.send(
-                        f"❌ {user.mention} must link their Kick account first using this server's Link Account panel."
-                    )
-                    return
-
-                kick_name = link_row[0]
-
-                # Check if link already exists
-                result = conn.execute(
-                    text(
-                        """
-                    SELECT verified FROM raffle_shuffle_links
-                    WHERE discord_id = :discord_id AND shuffle_username = :username
-                """
-                    ),
-                    {"discord_id": discord_id, "username": shuffle_username},
-                )
-
-                row = result.fetchone()
-
-                if row and row[0]:  # already verified
-                    await ctx.send(f"ℹ️ This link is already verified!")
-                    return
-
-                # Create or update the link
-                if not row:
-                    # Create new link
-                    conn.execute(
-                        text(
-                            """
-                        INSERT INTO raffle_shuffle_links
-                        (shuffle_username, kick_name, discord_id, platform, verified, verified_by_discord_id, verified_at)
-                        VALUES (:username, :kick_name, :discord_id, 'shuffle', TRUE, :admin_id, CURRENT_TIMESTAMP)
-                        ON CONFLICT (shuffle_username, platform)
-                        DO UPDATE SET
-                            kick_name = EXCLUDED.kick_name,
-                            discord_id = EXCLUDED.discord_id,
-                            verified = TRUE,
-                            verified_by_discord_id = EXCLUDED.verified_by_discord_id,
-                            verified_at = CURRENT_TIMESTAMP
-                    """
-                        ),
-                        {
-                            "username": shuffle_username,
-                            "kick_name": kick_name,
-                            "discord_id": discord_id,
-                            "admin_id": admin_id,
-                        },
-                    )
-                    logger.info(
-                        f"✅ Admin {ctx.author} created and verified Shuffle link: {shuffle_username} → {kick_name} (Discord {discord_id})"
-                    )
-                else:
-                    # Update existing unverified link
-                    conn.execute(
-                        text(
-                            """
-                        UPDATE raffle_shuffle_links
-                        SET
-                            verified = TRUE,
-                            verified_by_discord_id = :admin_id,
-                            verified_at = CURRENT_TIMESTAMP,
-                            kick_name = :kick_name
-                        WHERE discord_id = :discord_id AND shuffle_username = :username
-                    """
-                        ),
-                        {
-                            "admin_id": admin_id,
-                            "discord_id": discord_id,
-                            "username": shuffle_username,
-                            "kick_name": kick_name,
-                        },
-                    )
-                    logger.info(
-                        f"✅ Admin {ctx.author} verified existing Shuffle link: {shuffle_username} → {kick_name} (Discord {discord_id})"
-                    )
-
-                # Get current period info
-                period_result = conn.execute(
-                    text(
-                        """
-                    SELECT id, start_date FROM raffle_periods WHERE status = 'active' AND discord_server_id = :guild_id
-                """
-                    ),
-                    {"guild_id": guild_id},
-                )
-                period_row = period_result.fetchone()
-
-                if not period_row:
-                    await ctx.send(f"❌ No active raffle period!")
-                    return
-
-                period_id = period_row[0]
-                period_start = period_row[1]
-
-                # Check if user has wager tracking for current period
-                wager_result = conn.execute(
-                    text(
-                        """
-                    SELECT total_wager_usd, created_at
-                    FROM raffle_shuffle_wagers
-                    WHERE shuffle_username = :username AND period_id = :period_id
-                """
-                    ),
-                    {"username": shuffle_username, "period_id": period_id},
-                )
-
-                wager_row = wager_result.fetchone()
-                tickets_awarded = 0
-
-                if wager_row:
-                    total_wager = wager_row[0]
-                    wager_created = wager_row[1]
-
-                    # If wager tracking was created AFTER period started, award tickets for the wager
-                    if wager_created >= period_start and total_wager > 0:
-                        from .config import SHUFFLE_TICKETS_PER_1000_USD
-
-                        # Convert Decimal to float for calculation
-                        tickets_awarded = int((float(total_wager) / 1000.0) * SHUFFLE_TICKETS_PER_1000_USD)
-
-                        if tickets_awarded > 0:
-                            # Award the tickets
-                            success = ticket_manager.award_tickets(
-                                discord_id=discord_id,
-                                kick_name=kick_name,
-                                tickets=tickets_awarded,
-                                source="shuffle_wager",
-                                description=f"Shuffle wagers during period (pre-verification): ${total_wager:.2f}",
-                                period_id=period_id,
-                            )
-
-                            if success:
-                                # Update wager tracking
-                                conn.execute(
-                                    text(
-                                        """
-                                    UPDATE raffle_shuffle_wagers
-                                    SET
-                                        discord_id = :discord_id,
-                                        kick_name = :kick_name,
-                                        last_known_wager = total_wager_usd,
-                                        tickets_awarded = :tickets
-                                    WHERE shuffle_username = :username AND period_id = :period_id
-                                """
-                                    ),
-                                    {
-                                        "discord_id": discord_id,
-                                        "kick_name": kick_name,
-                                        "tickets": tickets_awarded,
-                                        "username": shuffle_username,
-                                        "period_id": period_id,
-                                    },
-                                )
-
-                                logger.info(
-                                    f"💰 Awarded {tickets_awarded} tickets for pre-verification wagers: {shuffle_username} (${total_wager:.2f})"
-                                )
-                    else:
-                        # Wagers were from previous period, don't award tickets
-                        conn.execute(
-                            text(
-                                """
-                            UPDATE raffle_shuffle_wagers
-                            SET
-                                discord_id = :discord_id,
-                                kick_name = :kick_name,
-                                last_known_wager = total_wager_usd
-                            WHERE shuffle_username = :username AND period_id = :period_id
-                        """
-                            ),
-                            {
-                                "discord_id": discord_id,
-                                "kick_name": kick_name,
-                                "username": shuffle_username,
-                                "period_id": period_id,
-                            },
-                        )
-
-            # Assign the verified-Shuffle role (resolved from the per-guild
-            # dashboard setting shuffle_verified_role_id, with a legacy name
-            # fallback). role_name drives the user-facing confirmation text.
-            role_assigned = False
-            role_name = None
-            try:
-                # Get the guild member
-                member = ctx.guild.get_member(discord_id)
-                if member:
-                    shuffle_role = None
-                    role_id = settings.get_int("shuffle_verified_role_id")
-                    if role_id:
-                        shuffle_role = ctx.guild.get_role(role_id)
-                    if not shuffle_role:
-                        shuffle_role = discord.utils.get(ctx.guild.roles, name="Shuffle Code User")
-                    if shuffle_role:
-                        role_name = shuffle_role.name
-                        if shuffle_role not in member.roles:
-                            await member.add_roles(shuffle_role, reason=f"Verified Shuffle account by {ctx.author}")
-                            role_assigned = True
-                            logger.info(f"🎭 Assigned '{role_name}' role to {member} ({discord_id})")
-                    else:
-                        logger.warning(f"⚠️ Verified-Shuffle role not configured for guild {ctx.guild.id}")
-            except Exception as e:
-                logger.error(f"Error assigning verified-Shuffle role: {e}")
-
-            if tickets_awarded > 0:
-                role_msg = f"\n🎭 **Role assigned:** {role_name}" if role_assigned else ""
-                await ctx.send(
-                    f"✅ **Verified!** {user.mention}'s Shuffle account '{shuffle_username}' is now linked.\n"
-                    f"🎟️ **Awarded {tickets_awarded:,} tickets** for ${wager_row[0]:.2f} wagered this period!\n"
-                    f"Future wagers under code '{code}' will continue earning tickets.{role_msg}"
-                )
-            else:
-                role_msg = f"\n🎭 **Role assigned:** {role_name}" if role_assigned else ""
-                await ctx.send(
-                    f"✅ **Verified!** {user.mention}'s Shuffle account '{shuffle_username}' is now linked.\n"
-                    f"Future wagers under code '{code}' will earn raffle tickets!{role_msg}"
-                )
-
-            logger.info(
-                f"✅ Admin {ctx.author} verified Shuffle link: {shuffle_username} → {kick_name} (Discord {discord_id}) - {tickets_awarded} tickets awarded"
-            )
-
-        except commands.BadArgument:
-            await ctx.send(f"❌ Invalid user mention. Usage: `/verifyshuffle @user <shuffle_username>`")
-        except Exception as e:
-            logger.error(f"Error verifying Shuffle link: {e}")
-            await ctx.send(f"❌ Error verifying link. Please try again.")
-
     @commands.hybrid_command(name="rafflegive")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def give_tickets(self, ctx, user: commands.UserConverter, tickets: int, *, reason: str = "Admin bonus"):
         """
@@ -761,6 +403,7 @@ Get ready to participate when the period starts!
             await ctx.send(f"❌ Error awarding tickets. Please try again.")
 
     @commands.hybrid_command(name="raffleremove")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def remove_tickets(self, ctx, user: commands.UserConverter, tickets: int, *, reason: str = "Admin removal"):
         """
@@ -818,6 +461,7 @@ Get ready to participate when the period starts!
             await ctx.send(f"❌ Error removing tickets. Please try again.")
 
     @commands.hybrid_command(name="raffledraw")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def draw_winner(self, ctx, *, prize_description: str = "Monthly Raffle Prize"):
         """
@@ -915,6 +559,7 @@ Congratulations! 🎊
             await ctx.send(f"❌ Error drawing winner. Please try again.")
 
     @commands.hybrid_command(name="rafflestats")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def raffle_stats(self, ctx, user: discord.Member = None):
         """
@@ -1045,6 +690,7 @@ Use `/rafflestats @user` to see individual stats
     # ========================================
 
     @commands.hybrid_command(name="raffleend", aliases=["endraffle"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def end_raffle(self, ctx):
         """
@@ -1099,6 +745,7 @@ Use `/rafflestats @user` to see individual stats
             await ctx.send(f"❌ Error ending raffle period: {str(e)}")
 
     @commands.hybrid_command(name="rafflestart", aliases=["newraffle"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def start_raffle(self, ctx, start_day: int = None, end_day: int = None):
         """
@@ -1175,6 +822,7 @@ Use `/rafflestats @user` to see individual stats
             await ctx.send(f"❌ Error starting raffle period: {str(e)}")
 
     @commands.hybrid_command(name="rafflerestart", aliases=["resetraffle"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def restart_raffle(self, ctx):
         """
@@ -1259,6 +907,7 @@ Use `/rafflestats @user` to see individual stats
             await ctx.send(f"❌ Error restarting raffle: {str(e)}")
 
     @commands.hybrid_command(name="rafflesetdate", aliases=["raffledates"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def set_raffle_dates(self, ctx, start_date: str, end_date: str):
         """
@@ -1326,6 +975,7 @@ Use `/rafflestats @user` to see individual stats
             await ctx.send(f"❌ Error updating dates: {str(e)}")
 
     @commands.hybrid_command(name="shuffledebug")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def shuffle_debug(self, ctx):
         """
@@ -1411,6 +1061,7 @@ Use `/rafflestats @user` to see individual stats
             await ctx.send(f"❌ Error: {str(e)}")
 
     @commands.hybrid_command(name="shuffleunlinked")
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def shuffle_unlinked(self, ctx, limit: int = 20):
         """
@@ -1454,7 +1105,9 @@ Use `/rafflestats @user` to see individual stats
                     last_check = row[2].strftime("%Y-%m-%d %H:%M") if row[2] else "Never"
                     response += f"• **{username}**: ${wager:,.2f} wagered (last checked: {last_check})\n"
 
-                response += f"\n**To link:** Users run `/linkshuffle <username>`, then you verify with `/verifyshuffle @user <username>`"
+                response += (
+                    "\n**To link:** Users verify themselves from the Shuffle Verify panel (`/createshufflepanel`)."
+                )
 
                 await ctx.send(response)
 
@@ -1463,6 +1116,7 @@ Use `/rafflestats @user` to see individual stats
             await ctx.send(f"❌ Error: {str(e)}")
 
     @commands.hybrid_command(name="raffleupdateboard", aliases=["updateraffleboard", "refreshraffle"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def update_raffle_board(self, ctx):
         """
@@ -1484,6 +1138,7 @@ Use `/rafflestats @user` to see individual stats
             await ctx.send(f"❌ Error updating leaderboard: {str(e)}")
 
     @commands.hybrid_command(name="rafflecleartickets", aliases=["cleartickets", "resettickets"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def clear_all_tickets(self, ctx):
         """
@@ -1556,6 +1211,7 @@ Use `/rafflestats @user` to see individual stats
             await ctx.send(f"❌ Error: {str(e)}")
 
     @commands.hybrid_command(name="rafflecleanup", aliases=["cleanupwatchtime"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def cleanup_watchtime_tickets(self, ctx):
         """
@@ -1674,6 +1330,7 @@ Use `/rafflestats @user` to see individual stats
             traceback.print_exc()
 
     @commands.hybrid_command(name="rafflerestoresubs", aliases=["restoresubs"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def restore_gifted_sub_tickets(self, ctx):
         """
@@ -1769,6 +1426,7 @@ Use `/rafflestats @user` to see individual stats
             traceback.print_exc()
 
     @commands.hybrid_command(name="rafflechecktables", aliases=["checktables"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def check_raffle_tables(self, ctx):
         """
@@ -1888,6 +1546,7 @@ Use `/rafflestats @user` to see individual stats
             traceback.print_exc()
 
     @commands.hybrid_command(name="raffleclearwatchtime", aliases=["clearwatchtimetickets"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def clear_watchtime_tickets_only(self, ctx):
         """
@@ -1988,6 +1647,7 @@ Use `/rafflestats @user` to see individual stats
             traceback.print_exc()
 
     @commands.hybrid_command(name="rafflestatus", aliases=["rafflechecksystems"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def check_raffle_systems(self, ctx):
         """
@@ -2016,7 +1676,7 @@ Use `/rafflestats @user` to see individual stats
             checks.append("✅ **Shuffle Wager Tracking** (every 15 minutes)")
             checks.append("   • Polls Shuffle affiliate API")
             checks.append("   • $1,000 wagered = 20 tickets")
-            checks.append("   • Requires admin verification (/verifyshuffle)\n")
+            checks.append("   • Requires verification via the Shuffle Verify panel\n")
 
             # 4. Auto Leaderboard (runs every 5 minutes)
             checks.append("✅ **Auto-Updating Leaderboard** (every 5 minutes)")
@@ -2050,6 +1710,7 @@ Use `/rafflestats @user` to see individual stats
             await ctx.send(f"❌ Error: {str(e)}")
 
     @commands.hybrid_command(name="raffledebugwatchtime", aliases=["debugwatchtime"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def debug_watchtime_conversion(self, ctx, kick_name: str = None):
         """
@@ -2170,6 +1831,7 @@ Use `/rafflestats @user` to see individual stats
             traceback.print_exc()
 
     @commands.hybrid_command(name="raffleresetwatchtime", aliases=["resetwatchtimebase"])
+    @app_commands.default_permissions(administrator=True)
     @commands.has_permissions(administrator=True)
     async def reset_watchtime_baseline(self, ctx):
         """

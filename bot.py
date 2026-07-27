@@ -19,6 +19,7 @@ import discord
 import redis
 import requests
 import websockets
+from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text  # type: ignore
@@ -6411,6 +6412,7 @@ def dynamic_cooldown(cooldown_mapping):
 
 
 @bot.hybrid_command(name="unlink")
+@app_commands.default_permissions(manage_guild=True)
 @commands.has_permissions(manage_guild=True)
 async def cmd_unlink(ctx, member: discord.Member = None):
     """Admin command to unlink a user's Kick account from Discord.
@@ -6478,6 +6480,7 @@ async def unlink_error(ctx, error):
 
 
 @bot.hybrid_command(name="updatekick")
+@app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 async def cmd_update_kick(ctx, member: discord.Member, new_kick_username: str):
     """[ADMIN] Update a user's linked Kick username.
@@ -6826,6 +6829,7 @@ async def update_kick_error(ctx, error):
 
 
 @bot.hybrid_command(name="grantlinkrole", aliases=["synclinkedroles"])
+@app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 async def cmd_grant_link_role(ctx, member: discord.Member = None):
     """[ADMIN] Grant the linked role to users who are already linked.
@@ -7096,6 +7100,7 @@ async def cmd_watchtime(ctx, target: str = None):
 # Admin Commands
 # -------------------------
 @bot.hybrid_command(name="tracking")
+@app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 # 🔒 SECURITY: Ensure command only works in the configured guild
 async def toggle_tracking(ctx, action: str = None, subaction: str = None):
@@ -7201,6 +7206,7 @@ async def tracking_error(ctx, error):
 
 
 @bot.hybrid_command(name="linklogs")
+@app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 async def link_logs_toggle(ctx, action: str = None):
     """
@@ -7295,6 +7301,7 @@ async def link_logs_error(ctx, error):
 
 
 @bot.hybrid_command(name="callblacklist", aliases=["srblacklist", "blockslotcall"])
+@app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 async def slot_call_blacklist(ctx, action: str = None, kick_username: str = None, *, reason: str = None):
     """
@@ -7464,6 +7471,7 @@ async def slot_call_blacklist_error(ctx, error):
 
 
 @bot.hybrid_command(name="roles")
+@app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 async def manage_roles(ctx, action: str = None, role_name: str = None, minutes: int = None):
     """
@@ -7731,6 +7739,7 @@ async def manage_roles_error(ctx, error):
 
 
 @bot.hybrid_command(name="testsub")
+@app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 async def test_subscription(ctx, kick_username: str = None, sub_count: int = 1):
     """
@@ -7816,6 +7825,7 @@ async def test_subscription_error(ctx, error):
 
 
 @bot.hybrid_command(name="convertwatchtime")
+@app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 async def convert_watchtime_manual(ctx):
     """
@@ -7871,6 +7881,7 @@ async def convert_watchtime_manual_error(ctx, error):
 
 
 @bot.hybrid_command(name="fixwatchtime")
+@app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 async def fix_watchtime_for_current_period(ctx):
     """
@@ -8070,9 +8081,7 @@ async def command_list(ctx):
             "`/tickets` - View your raffle tickets\n"
             "`/raffleboard` - View ticket leaderboard\n"
             "`/raffleinfo` - View raffle period information\n"
-            "`/fair` - How to verify a provably-fair draw\n"
-            "`/linkshuffle <username>` - Link Shuffle account for wager tracking\n"
-            "`/verifyshuffle` - Verify Shuffle wagers for bonus tickets"
+            "`/fair` - How to verify a provably-fair draw"
         ),
         inline=False,
     )
@@ -8094,6 +8103,7 @@ async def command_list(ctx):
 
 
 @bot.hybrid_command(name="admincommands", aliases=["adminhelp"])
+@app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 async def admin_command_list(ctx):
     """
@@ -8208,6 +8218,7 @@ async def admin_command_list(ctx):
 
 
 @bot.hybrid_command(name="systemstatus")
+@app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 async def raffle_system_info(ctx):
     """
@@ -8267,6 +8278,7 @@ async def raffle_system_info_error(ctx, error):
 
 
 @bot.hybrid_command(name="setup_link_panel")
+@app_commands.default_permissions(manage_guild=True)
 @commands.has_permissions(manage_guild=True)
 async def setup_link_panel(ctx, emoji: str = "🔗"):
     """
@@ -8340,6 +8352,7 @@ async def setup_link_panel_error(ctx, error):
 
 
 @bot.hybrid_command(name="post_link_info")
+@app_commands.default_permissions(manage_guild=True)
 @commands.has_permissions(manage_guild=True)
 async def post_link_info(ctx):
     """
@@ -8404,6 +8417,7 @@ async def post_link_info_error(ctx, error):
 
 
 @bot.hybrid_command(name="health")
+@app_commands.default_permissions(manage_guild=True)
 @commands.has_permissions(manage_guild=True)
 async def health_check(ctx):
     """
@@ -9322,6 +9336,7 @@ async def on_ready():
 
                     # Add GTB panel command (only once)
                     @bot.hybrid_command(name="creategtbpanel")
+                    @app_commands.default_permissions(administrator=True)
                     @commands.has_permissions(administrator=True)
                     async def create_gtb_panel_cmd(ctx):
                         """[ADMIN] Create the GTB panel in this channel"""
@@ -12038,6 +12053,7 @@ async def cmd_points_leaderboard(ctx, limit: int = 10):
 
 
 @bot.hybrid_command(name="postshop")
+@app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
 async def cmd_post_shop(ctx, channel: discord.TextChannel = None):
     """[ADMIN] Post the point shop to a channel"""
