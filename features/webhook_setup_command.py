@@ -19,7 +19,7 @@ class WebhookSetupCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name="setup-webhooks")
+    @commands.hybrid_command(name="setup-webhooks")
     @commands.has_permissions(administrator=True)
     async def setup_webhooks(self, ctx):
         """
@@ -31,7 +31,7 @@ class WebhookSetupCommands(commands.Cog):
         - Register new webhooks with secure secrets
         - Enable real-time Kick events
 
-        Usage: !setup-webhooks
+        Usage: /setup-webhooks
         """
         logger.info(f"[WEBHOOKS] Setup command called by {ctx.author} in guild {ctx.guild.name}")
 

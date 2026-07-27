@@ -500,13 +500,13 @@ class TimedMessagesCommands(commands.Cog):
         """Wait for bot to be ready before starting task"""
         await self.bot.wait_until_ready()
 
-    @commands.command(name="addtimer", aliases=["addtimedmessage", "timermessage"])
+    @commands.hybrid_command(name="addtimer", aliases=["addtimedmessage", "timermessage"])
     @commands.has_permissions(administrator=True)
     async def add_timed_message(self, ctx, interval: int, *, message: str):
         """
         [ADMIN] Add a timed message to Kick chat
-        Usage: !addtimer <minutes> <message>
-        Example: !addtimer 30 Check out our Discord: discord.gg/example
+        Usage: /addtimer <minutes> <message>
+        Example: /addtimer 30 Check out our Discord: discord.gg/example
         """
         manager = self._get_manager(ctx.guild.id)
         if not manager:
@@ -526,13 +526,13 @@ class TimedMessagesCommands(commands.Cog):
         else:
             await ctx.send(f"❌ {result['message']}")
 
-    @commands.command(name="removetimer", aliases=["deletetimer", "rmtimer"])
+    @commands.hybrid_command(name="removetimer", aliases=["deletetimer", "rmtimer"])
     @commands.has_permissions(administrator=True)
     async def remove_timed_message(self, ctx, message_id: int):
         """
         [ADMIN] Remove a timed message
-        Usage: !removetimer <message_id>
-        Example: !removetimer 1
+        Usage: /removetimer <message_id>
+        Example: /removetimer 1
         """
         manager = self._get_manager(ctx.guild.id)
         if not manager:
@@ -546,13 +546,13 @@ class TimedMessagesCommands(commands.Cog):
         else:
             await ctx.send(f"❌ {result['message']}")
 
-    @commands.command(name="toggletimer", aliases=["enabletimer", "disabletimer"])
+    @commands.hybrid_command(name="toggletimer", aliases=["enabletimer", "disabletimer"])
     @commands.has_permissions(administrator=True)
     async def toggle_timed_message(self, ctx, message_id: int, enabled: str = None):
         """
         [ADMIN] Enable or disable a timed message
-        Usage: !toggletimer <message_id> <on|off>
-        Example: !toggletimer 1 off
+        Usage: /toggletimer <message_id> <on|off>
+        Example: /toggletimer 1 off
         """
         manager = self._get_manager(ctx.guild.id)
         if not manager:
@@ -575,13 +575,13 @@ class TimedMessagesCommands(commands.Cog):
         else:
             await ctx.send(f"❌ {result['message']}")
 
-    @commands.command(name="updatetimer", aliases=["settimer"])
+    @commands.hybrid_command(name="updatetimer", aliases=["settimer"])
     @commands.has_permissions(administrator=True)
     async def update_timer_interval(self, ctx, message_id: int, interval: int):
         """
         [ADMIN] Update the interval of a timed message
-        Usage: !updatetimer <message_id> <minutes>
-        Example: !updatetimer 1 60
+        Usage: /updatetimer <message_id> <minutes>
+        Example: /updatetimer 1 60
         """
         manager = self._get_manager(ctx.guild.id)
         if not manager:
@@ -595,12 +595,12 @@ class TimedMessagesCommands(commands.Cog):
         else:
             await ctx.send(f"❌ {result['message']}")
 
-    @commands.command(name="listtimers", aliases=["timers", "timedmessages"])
+    @commands.hybrid_command(name="listtimers", aliases=["timers", "timedmessages"])
     @commands.has_permissions(administrator=True)
     async def list_timed_messages(self, ctx):
         """
         [ADMIN] List all timed messages
-        Usage: !listtimers
+        Usage: /listtimers
         """
         manager = self._get_manager(ctx.guild.id)
         if not manager:
@@ -645,12 +645,12 @@ class TimedMessagesCommands(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @commands.command(name="timerpanel", aliases=["managetimers"])
+    @commands.hybrid_command(name="timerpanel", aliases=["managetimers"])
     @commands.has_permissions(administrator=True)
     async def timer_control_panel(self, ctx):
         """
         [ADMIN] Open interactive timer management panel
-        Usage: !timerpanel
+        Usage: /timerpanel
 
         React to manage timers:
         📋 - Refresh panel
@@ -678,7 +678,7 @@ class TimedMessagesCommands(commands.Cog):
 
         if not messages:
             embed.add_field(
-                name="📭 No Timers", value="Use `!addtimer <minutes> <message>` to create one!", inline=False
+                name="📭 No Timers", value="Use `/addtimer <minutes> <message>` to create one!", inline=False
             )
         else:
             # Show summary of all messages
@@ -718,7 +718,7 @@ class TimedMessagesCommands(commands.Cog):
             if len(messages) > 10:
                 embed.add_field(
                     name="ℹ️ More Timers",
-                    value=f"Showing 10 of {len(messages)}. Use `!listtimers` to see all.",
+                    value=f"Showing 10 of {len(messages)}. Use `/listtimers` to see all.",
                     inline=False,
                 )
 
@@ -726,8 +726,8 @@ class TimedMessagesCommands(commands.Cog):
         embed.add_field(
             name="📝 Commands",
             value=(
-                "`!addtimer <min> <msg>` • `!removetimer <id>`\n"
-                "`!toggletimer <id> on/off` • `!updatetimer <id> <min>`"
+                "`/addtimer <min> <msg>` • `/removetimer <id>`\n"
+                "`/toggletimer <id> on/off` • `/updatetimer <id> <min>`"
             ),
             inline=False,
         )

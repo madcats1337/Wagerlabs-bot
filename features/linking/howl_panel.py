@@ -499,7 +499,7 @@ async def setup_howl_panel_system(bot, engine, settings_getter):
         panels[guild.id] = panel
         logger.debug(f"✅ Howl verify panel initialized")
 
-    @bot.command(name="createhowlpanel")
+    @bot.hybrid_command(name="createhowlpanel")
     @commands.has_permissions(administrator=True)
     async def create_howl_panel_cmd(ctx):
         """[ADMIN] Create the Howl verify panel in this channel"""

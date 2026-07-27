@@ -10,6 +10,7 @@ import discord
 from discord.ext import commands
 from sqlalchemy import text
 
+from features.discord_app_commands import defer_slash_response
 from utils.bot_settings import BotSettingsManager
 from utils.log_context import set_server
 from utils.server_urls import get_server_public_page_url
@@ -66,11 +67,11 @@ class RaffleCommands(commands.Cog):
     # USER COMMANDS
     # ========================================
 
-    @commands.command(name="tickets", aliases=["ticket", "mytickets"])
+    @commands.hybrid_command(name="tickets", aliases=["ticket", "mytickets"])
     async def check_tickets(self, ctx):
         """
         Check your raffle ticket balance
-        Usage: !tickets
+        Usage: /tickets
         """
         logger.info(
             f"[TICKETS] Command called by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild.name if ctx.guild else 'DM'}"
@@ -122,7 +123,7 @@ class RaffleCommands(commands.Cog):
 • Shuffle Wagers: {tickets['shuffle_wager_tickets']} tickets
 • Bonus: {tickets['bonus_tickets']} tickets
 
-Use `!leaderboard` to see top participants!
+Use `/leaderboard` to see top participants!
             """
 
             await ctx.send(embed_text.strip())
@@ -131,11 +132,11 @@ Use `!leaderboard` to see top participants!
             logger.error(f"Error checking tickets: {e}")
             await ctx.send(f"❌ Error checking tickets. Please try again.")
 
-    @commands.command(name="fair", aliases=["pf", "provablyfair"])
+    @commands.hybrid_command(name="fair", aliases=["pf", "provablyfair"])
     async def provably_fair_info(self, ctx):
         """
         Explain how to verify a provably-fair draw
-        Usage: !fair / !pf
+        Usage: /fair
         """
         try:
             guild_id = ctx.guild.id if ctx.guild else None
@@ -152,15 +153,15 @@ Use `!leaderboard` to see top participants!
             )
             await ctx.send(embed=embed)
         except Exception as e:
-            logger.error(f"Error in !fair command: {e}")
+            logger.error(f"Error in /fair command: {e}")
             await ctx.send("❌ Could not build the verification link. Please try again.")
 
-    @commands.command(name="raffleboard", aliases=["raffletop", "rafflerankings"])
+    @commands.hybrid_command(name="raffleboard", aliases=["raffletop", "rafflerankings"])
     async def raffle_leaderboard(self, ctx, limit: int = 10):
         """
         View raffle ticket leaderboard
-        Usage: !raffleboard [limit]
-        Example: !raffleboard 20
+        Usage: /raffleboard [limit]
+        Example: /raffleboard 20
         """
         try:
             if limit < 1 or limit > 50:
@@ -200,7 +201,7 @@ Use `!leaderboard` to see top participants!
 
                 response += f"{medal} **{kick_name}**: {total:,} tickets ({prob:.2%} chance)\n"
 
-            response += f"\nUse `!tickets` to check your own balance!"
+            response += f"\nUse `/tickets` to check your own balance!"
 
             await ctx.send(response)
 
@@ -208,11 +209,11 @@ Use `!leaderboard` to see top participants!
             logger.error(f"Error showing leaderboard: {e}")
             await ctx.send(f"❌ Error loading leaderboard. Please try again.")
 
-    @commands.command(name="raffleinfo", aliases=["raffle"])
+    @commands.hybrid_command(name="raffleinfo", aliases=["raffle"])
     async def raffle_info(self, ctx):
         """
         View current raffle period information
-        Usage: !raffleinfo
+        Usage: /raffleinfo
         """
         try:
             from datetime import datetime
@@ -265,7 +266,7 @@ Use `!leaderboard` to see top participants!
 ⭐ **Bonus** - Admin awarded for events
 
 **Commands**:
-• `!tickets` - Check your ticket balance
+• `/tickets` - Check your ticket balance
 • **Shuffle Verification** - Create a ticket to link your Shuffle account
 
 Get ready to participate when the period starts!
@@ -311,8 +312,8 @@ Get ready to participate when the period starts!
 ⭐ **Bonus** - Admin awarded for events
 
 **Commands**:
-• `!tickets` - Check your ticket balance
-• `!raffleboard` - View top participants
+• `/tickets` - Check your ticket balance
+• `/raffleboard` - View top participants
 • **Shuffle Verification** - Create a ticket to link your Shuffle account
                 """
 
@@ -334,15 +335,18 @@ Get ready to participate when the period starts!
             traceback.print_exc()
             await ctx.send(f"❌ Error loading raffle info. Please try again.")
 
-    @commands.command(name="linkshuffle")
+    @commands.hybrid_command(name="linkshuffle")
     async def link_shuffle(self, ctx, shuffle_username: str = None):
         """
         Link your Shuffle.com account to earn raffle tickets automatically
-        Usage: !linkshuffle <shuffle_username>
-        Example: !linkshuffle CryptoKing420
+        Usage: /linkshuffle <shuffle_username>
+        Example: /linkshuffle CryptoKing420
 
         Earn configurable tickets per $1000 wagered when using affiliate code 'lele'
         """
+        # Reads the database before its first reply - acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             _, _, wager_tickets = get_ticket_reward_settings(self.engine, ctx.guild.id if ctx.guild else None, logger)
             settings = self._get_guild_settings(ctx)
@@ -352,8 +356,8 @@ Get ready to participate when the period starts!
             if not shuffle_username:
                 await ctx.send(
                     f"❌ {ctx.author.mention} Please provide your {platform} username!\n\n"
-                    f"**Usage**: `!linkshuffle <your_shuffle_username>`\n"
-                    f"**Example**: `!linkshuffle CryptoKing420`\n\n"
+                    f"**Usage**: `/linkshuffle <your_shuffle_username>`\n"
+                    f"**Example**: `/linkshuffle CryptoKing420`\n\n"
                     f"💡 **Tip**: Use code **'{code}'** on {platform} to earn {wager_tickets} tickets per $1000 wagered!"
                 )
                 return
@@ -379,7 +383,7 @@ Get ready to participate when the period starts!
                 if not row:
                     await ctx.send(
                         f"❌ {ctx.author.mention} You must link your Kick account first!\n"
-                        f"React to the link panel or use `!link` to get started."
+                        "Use this server's Link Account panel to get started."
                     )
                     return
 
@@ -402,7 +406,7 @@ Get ready to participate when the period starts!
                     f"An admin will review your request. Once verified:\n"
                     f"• Your {platform} wagers under code **'{code}'** will earn **{wager_tickets} tickets per $1000**\n"
                     f"• Tickets are awarded automatically for future wagers\n"
-                    f"• Use `!tickets` to check your balance!"
+                    f"• Use `/tickets` to check your balance!"
                 )
 
                 # Notify admins (optional - send to admin channel)
@@ -431,14 +435,17 @@ Get ready to participate when the period starts!
     # ADMIN COMMANDS
     # ========================================
 
-    @commands.command(name="verifyshuffle", aliases=["shuffleverify", "raffleverify"])
+    @commands.hybrid_command(name="verifyshuffle", aliases=["shuffleverify", "raffleverify"])
     @commands.has_permissions(administrator=True)
     async def verify_shuffle_link(self, ctx, user: commands.UserConverter, shuffle_username: str):
         """
         [ADMIN] Verify and link a Shuffle account (creates link if it doesn't exist)
-        Usage: !verifyshuffle @user <shuffle_username>
-        Example: !verifyshuffle @John CryptoKing420
+        Usage: /verifyshuffle @user <shuffle_username>
+        Example: /verifyshuffle @John CryptoKing420
         """
+        # Reads the database before its first reply — acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
             managers = self._get_guild_managers(ctx)
@@ -463,7 +470,9 @@ Get ready to participate when the period starts!
 
                 link_row = link_result.fetchone()
                 if not link_row:
-                    await ctx.send(f"❌ {user.mention} must link their Kick account first! Use `!link`")
+                    await ctx.send(
+                        f"❌ {user.mention} must link their Kick account first using this server's Link Account panel."
+                    )
                     return
 
                 kick_name = link_row[0]
@@ -685,19 +694,22 @@ Get ready to participate when the period starts!
             )
 
         except commands.BadArgument:
-            await ctx.send(f"❌ Invalid user mention. Usage: `!verifyshuffle @user <shuffle_username>`")
+            await ctx.send(f"❌ Invalid user mention. Usage: `/verifyshuffle @user <shuffle_username>`")
         except Exception as e:
             logger.error(f"Error verifying Shuffle link: {e}")
             await ctx.send(f"❌ Error verifying link. Please try again.")
 
-    @commands.command(name="rafflegive")
+    @commands.hybrid_command(name="rafflegive")
     @commands.has_permissions(administrator=True)
     async def give_tickets(self, ctx, user: commands.UserConverter, tickets: int, *, reason: str = "Admin bonus"):
         """
         [ADMIN] Manually award tickets to a user
-        Usage: !rafflegive @user <tickets> [reason]
-        Example: !rafflegive @John 100 Event participation bonus
+        Usage: /rafflegive @user <tickets> [reason]
+        Example: /rafflegive @John 100 Event participation bonus
         """
+        # Reads the database before its first reply - acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
             managers = self._get_guild_managers(ctx)
@@ -743,19 +755,22 @@ Get ready to participate when the period starts!
                 await ctx.send(f"❌ Failed to award tickets. Check logs for details.")
 
         except commands.BadArgument:
-            await ctx.send(f"❌ Invalid user or ticket amount. Usage: `!rafflegive @user <tickets> [reason]`")
+            await ctx.send(f"❌ Invalid user or ticket amount. Usage: `/rafflegive @user <tickets> [reason]`")
         except Exception as e:
             logger.error(f"Error giving tickets: {e}")
             await ctx.send(f"❌ Error awarding tickets. Please try again.")
 
-    @commands.command(name="raffleremove")
+    @commands.hybrid_command(name="raffleremove")
     @commands.has_permissions(administrator=True)
     async def remove_tickets(self, ctx, user: commands.UserConverter, tickets: int, *, reason: str = "Admin removal"):
         """
         [ADMIN] Remove tickets from a user
-        Usage: !raffleremove @user <tickets> [reason]
-        Example: !raffleremove @John 50 Rule violation
+        Usage: /raffleremove @user <tickets> [reason]
+        Example: /raffleremove @John 50 Rule violation
         """
+        # Reads the database before its first reply - acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
             managers = self._get_guild_managers(ctx)
@@ -797,19 +812,22 @@ Get ready to participate when the period starts!
                 await ctx.send(f"❌ Failed to remove tickets. User may not have enough tickets.")
 
         except commands.BadArgument:
-            await ctx.send(f"❌ Invalid user or ticket amount. Usage: `!raffleremove @user <tickets> [reason]`")
+            await ctx.send(f"❌ Invalid user or ticket amount. Usage: `/raffleremove @user <tickets> [reason]`")
         except Exception as e:
             logger.error(f"Error removing tickets: {e}")
             await ctx.send(f"❌ Error removing tickets. Please try again.")
 
-    @commands.command(name="raffledraw")
+    @commands.hybrid_command(name="raffledraw")
     @commands.has_permissions(administrator=True)
     async def draw_winner(self, ctx, *, prize_description: str = "Monthly Raffle Prize"):
         """
         [ADMIN] Draw a raffle winner
-        Usage: !raffledraw [prize description]
-        Example: !raffledraw $500 Cash Prize
+        Usage: /raffledraw [prize description]
+        Example: /raffledraw $500 Cash Prize
         """
+        # Reads the database before its first reply - acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             managers = self._get_guild_managers(ctx)
             ticket_manager = managers["ticket_manager"]
@@ -896,13 +914,16 @@ Congratulations! 🎊
             traceback.print_exc()
             await ctx.send(f"❌ Error drawing winner. Please try again.")
 
-    @commands.command(name="rafflestats")
+    @commands.hybrid_command(name="rafflestats")
     @commands.has_permissions(administrator=True)
     async def raffle_stats(self, ctx, user: discord.Member = None):
         """
         [ADMIN] View detailed raffle statistics
-        Usage: !rafflestats [@user]
+        Usage: /rafflestats [@user]
         """
+        # Reads the database before its first reply - acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             managers = self._get_guild_managers(ctx)
             ticket_manager = managers["ticket_manager"]
@@ -1008,7 +1029,7 @@ Congratulations! 🎊
 • Total Participants: {stats['total_participants']}
 • Average per participant: {stats['total_tickets'] / max(stats['total_participants'], 1):.1f} tickets
 
-Use `!rafflestats @user` to see individual stats
+Use `/rafflestats @user` to see individual stats
                 """
 
                 await ctx.send(response.strip())
@@ -1023,13 +1044,16 @@ Use `!rafflestats @user` to see individual stats
     # PERIOD MANAGEMENT COMMANDS
     # ========================================
 
-    @commands.command(name="raffleend", aliases=["endraffle"])
+    @commands.hybrid_command(name="raffleend", aliases=["endraffle"])
     @commands.has_permissions(administrator=True)
     async def end_raffle(self, ctx):
         """
         [ADMIN] End the current raffle period
-        Usage: !raffleend
+        Usage: /raffleend
         """
+        # Reads the database before its first reply — acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
 
@@ -1067,22 +1091,25 @@ Use `!rafflestats @user` to see individual stats
 
                 await ctx.send(
                     f"✅ Raffle period #{period[4]} has been ended.\n"
-                    f"Use `!raffledraw` to select a winner, then `!rafflestart` to begin a new period."
+                    f"Use `/raffledraw` to select a winner, then `/rafflestart` to begin a new period."
                 )
 
         except Exception as e:
             logger.error(f"Error ending raffle period: {e}")
             await ctx.send(f"❌ Error ending raffle period: {str(e)}")
 
-    @commands.command(name="rafflestart", aliases=["newraffle"])
+    @commands.hybrid_command(name="rafflestart", aliases=["newraffle"])
     @commands.has_permissions(administrator=True)
     async def start_raffle(self, ctx, start_day: int = None, end_day: int = None):
         """
         [ADMIN] Start a new raffle period
-        Usage: !rafflestart [start_day] [end_day]
-        Example: !rafflestart 1 30  (1st to 30th of current month)
+        Usage: /rafflestart [start_day] [end_day]
+        Example: /rafflestart 1 30  (1st to 30th of current month)
         If no dates provided, uses current month (1st to last day)
         """
+        # Reads the database before its first reply — acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
             from datetime import datetime
@@ -1102,7 +1129,7 @@ Use `!rafflestats @user` to see individual stats
                     {"guild_id": guild_id},
                 )
                 if result.fetchone():
-                    await ctx.send("❌ There's already an active raffle period! Use `!raffleend` first.")
+                    await ctx.send("❌ There's already an active raffle period! Use `/raffleend` first.")
                     return
 
                 # Calculate dates
@@ -1147,13 +1174,16 @@ Use `!rafflestats @user` to see individual stats
             logger.error(f"Error starting raffle period: {e}")
             await ctx.send(f"❌ Error starting raffle period: {str(e)}")
 
-    @commands.command(name="rafflerestart", aliases=["resetraffle"])
+    @commands.hybrid_command(name="rafflerestart", aliases=["resetraffle"])
     @commands.has_permissions(administrator=True)
     async def restart_raffle(self, ctx):
         """
         [ADMIN] End current period and immediately start a new one for next month
-        Usage: !rafflerestart
+        Usage: /rafflerestart
         """
+        # Reads the database before its first reply — acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
             from datetime import datetime
@@ -1221,21 +1251,24 @@ Use `!rafflestats @user` to see individual stats
                     f"✅ Raffle reset complete!\n\n"
                     f"**Old Period**: Ended with {old_tickets:,} total tickets\n"
                     f"**New Period #{new_period_number}**: {start.strftime('%b %d, %Y')} - {end.strftime('%b %d, %Y')}\n\n"
-                    f"💡 Don't forget to draw a winner from the old period: `!raffledraw`"
+                    f"💡 Don't forget to draw a winner from the old period: `/raffledraw`"
                 )
 
         except Exception as e:
             logger.error(f"Error restarting raffle: {e}")
             await ctx.send(f"❌ Error restarting raffle: {str(e)}")
 
-    @commands.command(name="rafflesetdate", aliases=["raffledates"])
+    @commands.hybrid_command(name="rafflesetdate", aliases=["raffledates"])
     @commands.has_permissions(administrator=True)
     async def set_raffle_dates(self, ctx, start_date: str, end_date: str):
         """
         [ADMIN] Update the current raffle period dates
-        Usage: !rafflesetdate YYYY-MM-DD YYYY-MM-DD
-        Example: !rafflesetdate 2025-11-01 2025-11-30
+        Usage: /rafflesetdate YYYY-MM-DD YYYY-MM-DD
+        Example: /rafflesetdate 2025-11-01 2025-11-30
         """
+        # Reads the database before its first reply - acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
             from datetime import datetime
@@ -1268,7 +1301,7 @@ Use `!rafflestats @user` to see individual stats
                 period = result.fetchone()
 
                 if not period:
-                    await ctx.send("❌ No active raffle period! Use `!rafflestart` to create one.")
+                    await ctx.send("❌ No active raffle period! Use `/rafflestart` to create one.")
                     return
 
                 # Update dates
@@ -1292,12 +1325,12 @@ Use `!rafflestats @user` to see individual stats
             logger.error(f"Error setting raffle dates: {e}")
             await ctx.send(f"❌ Error updating dates: {str(e)}")
 
-    @commands.command(name="shuffledebug")
+    @commands.hybrid_command(name="shuffledebug")
     @commands.has_permissions(administrator=True)
     async def shuffle_debug(self, ctx):
         """
         [ADMIN] Debug Shuffle wager tracking
-        Usage: !shuffledebug
+        Usage: /shuffledebug
         """
         try:
             guild_id = ctx.guild.id
@@ -1377,13 +1410,16 @@ Use `!rafflestats @user` to see individual stats
             traceback.print_exc()
             await ctx.send(f"❌ Error: {str(e)}")
 
-    @commands.command(name="shuffleunlinked")
+    @commands.hybrid_command(name="shuffleunlinked")
     @commands.has_permissions(administrator=True)
     async def shuffle_unlinked(self, ctx, limit: int = 20):
         """
         [ADMIN] Show unlinked Shuffle accounts with wagers
-        Usage: !shuffleunlinked [limit]
+        Usage: /shuffleunlinked [limit]
         """
+        # Reads the database before its first reply — acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
 
@@ -1418,7 +1454,7 @@ Use `!rafflestats @user` to see individual stats
                     last_check = row[2].strftime("%Y-%m-%d %H:%M") if row[2] else "Never"
                     response += f"• **{username}**: ${wager:,.2f} wagered (last checked: {last_check})\n"
 
-                response += f"\n**To link:** Users run `!linkshuffle <username>`, then you verify with `!verifyshuffle @user <username>`"
+                response += f"\n**To link:** Users run `/linkshuffle <username>`, then you verify with `/verifyshuffle @user <username>`"
 
                 await ctx.send(response)
 
@@ -1426,12 +1462,12 @@ Use `!rafflestats @user` to see individual stats
             logger.error(f"Error showing unlinked Shuffle users: {e}")
             await ctx.send(f"❌ Error: {str(e)}")
 
-    @commands.command(name="raffleupdateboard", aliases=["updateraffleboard", "refreshraffle"])
+    @commands.hybrid_command(name="raffleupdateboard", aliases=["updateraffleboard", "refreshraffle"])
     @commands.has_permissions(administrator=True)
     async def update_raffle_board(self, ctx):
         """
         [ADMIN] Manually update the auto-leaderboard
-        Usage: !raffleupdateboard
+        Usage: /raffleupdateboard
         """
         try:
             # Get the auto_leaderboard instance from bot
@@ -1447,12 +1483,12 @@ Use `!rafflestats @user` to see individual stats
             logger.error(f"Error manually updating leaderboard: {e}")
             await ctx.send(f"❌ Error updating leaderboard: {str(e)}")
 
-    @commands.command(name="rafflecleartickets", aliases=["cleartickets", "resettickets"])
+    @commands.hybrid_command(name="rafflecleartickets", aliases=["cleartickets", "resettickets"])
     @commands.has_permissions(administrator=True)
     async def clear_all_tickets(self, ctx):
         """
         [ADMIN] Manually clear ALL tickets from the database for this guild
-        Usage: !rafflecleartickets
+        Usage: /rafflecleartickets
 
         WARNING: This will delete all tickets, watchtime conversions, gifted subs, and shuffle wagers for this guild!
         """
@@ -1519,13 +1555,16 @@ Use `!rafflestats @user` to see individual stats
             logger.error(f"Error clearing tickets: {e}")
             await ctx.send(f"❌ Error: {str(e)}")
 
-    @commands.command(name="rafflecleanup", aliases=["cleanupwatchtime"])
+    @commands.hybrid_command(name="rafflecleanup", aliases=["cleanupwatchtime"])
     @commands.has_permissions(administrator=True)
     async def cleanup_watchtime_tickets(self, ctx):
         """
         Manually reset watchtime tickets only (keeps wager and gifted sub tickets)
         This marks all existing watchtime as "already converted" to prevent re-awarding
         """
+        # Reads the database before its first reply — acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
             from sqlalchemy import text
@@ -1634,13 +1673,16 @@ Use `!rafflestats @user` to see individual stats
 
             traceback.print_exc()
 
-    @commands.command(name="rafflerestoresubs", aliases=["restoresubs"])
+    @commands.hybrid_command(name="rafflerestoresubs", aliases=["restoresubs"])
     @commands.has_permissions(administrator=True)
     async def restore_gifted_sub_tickets(self, ctx):
         """
         Restore gifted sub tickets from the raffle_gifted_subs event log
         Use this if gifted sub tickets were accidentally deleted
         """
+        # Reads the database before its first reply — acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
             from sqlalchemy import text
@@ -1712,7 +1754,7 @@ Use `!rafflestats @user` to see individual stats
                 f"✅ **Gifted Sub Tickets Restored!**\n"
                 f"• Restored tickets for {restored_count} gifted sub events\n"
                 f"• Total tickets restored: {total_tickets}\n\n"
-                f"Run `!raffleleaderboard` to see updated standings."
+                f"Run `/raffleboard` to see updated standings."
             )
 
             # Update leaderboard
@@ -1726,13 +1768,16 @@ Use `!rafflestats @user` to see individual stats
 
             traceback.print_exc()
 
-    @commands.command(name="rafflechecktables", aliases=["checktables"])
+    @commands.hybrid_command(name="rafflechecktables", aliases=["checktables"])
     @commands.has_permissions(administrator=True)
     async def check_raffle_tables(self, ctx):
         """
         Check the current state of all raffle database tables
         Shows row counts and sample data to verify table states
         """
+        # Reads the database before its first reply — acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
             from sqlalchemy import text
@@ -1842,14 +1887,17 @@ Use `!rafflestats @user` to see individual stats
 
             traceback.print_exc()
 
-    @commands.command(name="raffleclearwatchtime", aliases=["clearwatchtimetickets"])
+    @commands.hybrid_command(name="raffleclearwatchtime", aliases=["clearwatchtimetickets"])
     @commands.has_permissions(administrator=True)
     async def clear_watchtime_tickets_only(self, ctx):
         """
         Clear ONLY watchtime tickets, keeping gifted sub and shuffle wager tickets
         Use this when watchtime tickets were incorrectly awarded
-        Usage: !raffleclearwatchtime
+        Usage: /raffleclearwatchtime
         """
+        # Reads the database before its first reply — acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
             from sqlalchemy import text
@@ -1926,7 +1974,7 @@ Use `!rafflestats @user` to see individual stats
                     f"⏱️ All watchtime tickets cleared\n"
                     f"🗑️ Deleted {deleted_conversions} conversion records\n"
                     f"✅ Gifted sub & wager tickets preserved\n\n"
-                    f"**Next Step:** Run `!raffleresetwatchtime` to set baseline"
+                    f"**Next Step:** Run `/raffleresetwatchtime` to set baseline"
                 ),
                 color=discord.Color.green(),
             )
@@ -1939,7 +1987,7 @@ Use `!rafflestats @user` to see individual stats
 
             traceback.print_exc()
 
-    @commands.command(name="rafflestatus", aliases=["rafflechecksystems"])
+    @commands.hybrid_command(name="rafflestatus", aliases=["rafflechecksystems"])
     @commands.has_permissions(administrator=True)
     async def check_raffle_systems(self, ctx):
         """
@@ -1968,7 +2016,7 @@ Use `!rafflestats @user` to see individual stats
             checks.append("✅ **Shuffle Wager Tracking** (every 15 minutes)")
             checks.append("   • Polls Shuffle affiliate API")
             checks.append("   • $1,000 wagered = 20 tickets")
-            checks.append("   • Requires admin verification (!raffleverify)\n")
+            checks.append("   • Requires admin verification (/verifyshuffle)\n")
 
             # 4. Auto Leaderboard (runs every 5 minutes)
             checks.append("✅ **Auto-Updating Leaderboard** (every 5 minutes)")
@@ -2001,13 +2049,16 @@ Use `!rafflestats @user` to see individual stats
             logger.error(f"Error checking systems: {e}")
             await ctx.send(f"❌ Error: {str(e)}")
 
-    @commands.command(name="raffledebugwatchtime", aliases=["debugwatchtime"])
+    @commands.hybrid_command(name="raffledebugwatchtime", aliases=["debugwatchtime"])
     @commands.has_permissions(administrator=True)
     async def debug_watchtime_conversion(self, ctx, kick_name: str = None):
         """
         Debug watchtime conversion issues
         Shows watchtime vs converted amounts for users
         """
+        # Reads the database before its first reply — acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
             from sqlalchemy import text
@@ -2118,13 +2169,16 @@ Use `!rafflestats @user` to see individual stats
 
             traceback.print_exc()
 
-    @commands.command(name="raffleresetwatchtime", aliases=["resetwatchtimebase"])
+    @commands.hybrid_command(name="raffleresetwatchtime", aliases=["resetwatchtimebase"])
     @commands.has_permissions(administrator=True)
     async def reset_watchtime_baseline(self, ctx):
         """
         Reset watchtime baseline - mark ALL current watchtime as "already converted"
         Use this at the START of a raffle period to only award tickets for NEW watchtime
         """
+        # Reads the database before its first reply — acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         try:
             guild_id = ctx.guild.id
             from sqlalchemy import text

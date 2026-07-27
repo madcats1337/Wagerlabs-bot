@@ -11,6 +11,7 @@ from discord.ext import commands, tasks
 from discord.ui import Button, Modal, TextInput, View
 from sqlalchemy import text
 
+from features.discord_app_commands import defer_slash_response
 from features.games.guess_the_balance import gtb_rank_marker, parse_amount
 
 logger = logging.getLogger(__name__)
@@ -469,10 +470,13 @@ async def setup_gtb_panel(bot, engine, gtb_manager, kick_send_callback=None):
     panel = GTBPanel(bot, engine, gtb_manager, kick_send_callback)
 
     # Add command to create the panel
-    @bot.command(name="creategtbpanel")
+    @bot.hybrid_command(name="creategtbpanel")
     @commands.has_permissions(administrator=True)
     async def create_gtb_panel_cmd(ctx):
         """[ADMIN] Create the GTB panel in this channel"""
+        # Reads the database before its first reply — acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         success = await panel.create_panel(ctx.channel)
         if success:
             await ctx.send("✅ GTB panel created!")

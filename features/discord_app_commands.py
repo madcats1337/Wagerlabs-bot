@@ -15,6 +15,50 @@ WAGERLABS_YELLOW = 0xFACC15
 WAGERLABS_LANDING_URL = "https://wagerlabs.app/"
 
 
+def command_invocation_id(ctx) -> int:
+    """Return the stable Discord snowflake for a prefix or slash invocation."""
+
+    interaction = getattr(ctx, "interaction", None)
+    if interaction is not None:
+        return interaction.id
+    return ctx.message.id
+
+
+async def defer_slash_response(ctx, *, ephemeral: bool = False) -> bool:
+    """Acknowledge a slash invocation before slow work. No-op for prefix commands.
+
+    Discord closes an interaction that is not acknowledged within 3 seconds, and
+    the user sees "The application did not respond" even when the command later
+    succeeds. Hybrid commands that hit the database, a third-party API, or a bulk
+    Discord operation before their first ``ctx.send`` must call this first.
+
+    Prefix invocations have no interaction and no deadline, so they are left
+    untouched — behaviour there is unchanged.
+
+    Returns ``True`` when this call deferred the interaction.
+    """
+
+    interaction = getattr(ctx, "interaction", None)
+    if interaction is None:
+        return False
+
+    response = getattr(interaction, "response", None)
+    if response is None:
+        return False
+
+    try:
+        if response.is_done():
+            return False
+        await response.defer(ephemeral=ephemeral)
+    except Exception as exc:
+        # A failed defer must never take the command down with it; the command
+        # body can still try to respond and discord.py surfaces the real error.
+        logger.warning("Could not defer slash interaction for %s: %s", getattr(ctx, "command", None), exc)
+        return False
+
+    return True
+
+
 def _link_view(*buttons: tuple[str, str]) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     for label, url in buttons:
@@ -23,7 +67,12 @@ def _link_view(*buttons: tuple[str, str]) -> discord.ui.View:
 
 
 def register_wagerlabs_slash_commands(bot: commands.Bot, engine) -> None:
-    """Register the global, read-only slash commands once on the local tree."""
+    """Register application-only commands once on the local command tree.
+
+    Legacy ``commands`` handlers are registered as hybrid commands by their
+    owning modules. Keeping this module limited to application-only commands
+    avoids duplicate tree entries when those cogs are loaded.
+    """
 
     if bot.tree.get_command("wagerlabs") is None:
 
@@ -58,30 +107,6 @@ def register_wagerlabs_slash_commands(bot: commands.Bot, engine) -> None:
                 )
                 await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
                 logger.debug("Handled /wagerlabs")
-
-    if bot.tree.get_command("fair") is None:
-
-        @bot.tree.command(
-            name="fair",
-            description=("Open this server's public verifier for provably fair draws."),
-        )
-        @app_commands.guild_only()
-        async def fair(interaction: discord.Interaction) -> None:
-            guild_id = interaction.guild_id
-            guild_name = interaction.guild.name if interaction.guild else None
-            with server_context(guild_id, guild_name):
-                fair_url = get_server_public_page_url(engine, guild_id, "/provably-fair")
-                embed = discord.Embed(
-                    title="Provably Fair Draws",
-                    description=(
-                        "Wagerlabs records the commitment, seeds, nonce, and "
-                        "result needed to independently verify supported draws."
-                    ),
-                    color=WAGERLABS_YELLOW,
-                )
-                view = _link_view(("Open verifier", fair_url))
-                await interaction.response.send_message(embed=embed, view=view)
-                logger.debug("Handled /fair")
 
 
 async def sync_global_slash_commands(bot: commands.Bot) -> bool:

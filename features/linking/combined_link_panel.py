@@ -489,7 +489,7 @@ async def setup_combined_link_panel_system(bot, engine, kick_url_generator, twit
     except Exception as e:
         logger.warning(f"[CombinedLink] add_view failed (non-fatal): {e}")
 
-    @bot.command(name="createlinkpanel")
+    @bot.hybrid_command(name="createlinkpanel")
     @commands.has_permissions(administrator=True)
     async def create_link_panel_cmd(ctx):
         """[ADMIN] Create the combined link panel in this channel."""

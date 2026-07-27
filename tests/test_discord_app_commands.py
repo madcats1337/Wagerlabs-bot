@@ -20,8 +20,9 @@ def test_registers_global_chat_input_commands_once():
     register_wagerlabs_slash_commands(bot, engine=None)
 
     commands_by_name = {command.name: command for command in bot.tree.get_commands()}
-    assert set(commands_by_name) == {"fair", "wagerlabs"}
-    assert isinstance(commands_by_name["fair"], app_commands.Command)
+    # /fair moved to the raffle cog as a hybrid command; this module now
+    # registers only the application-only commands.
+    assert set(commands_by_name) == {"wagerlabs"}
     assert isinstance(commands_by_name["wagerlabs"], app_commands.Command)
 
 
@@ -50,7 +51,6 @@ def test_wagerlabs_command_uses_safe_public_links():
 
 def test_syncs_once_and_sets_guard_only_after_success():
     synced_commands = [
-        SimpleNamespace(name="fair"),
         SimpleNamespace(name="wagerlabs"),
     ]
     bot = SimpleNamespace(tree=SimpleNamespace(sync=AsyncMock(return_value=synced_commands)))

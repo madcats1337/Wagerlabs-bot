@@ -50,7 +50,12 @@ from core.kick_api import USER_AGENTS, KickAPI, check_stream_live, fetch_chatroo
 
 # Custom commands import
 from features.custom_commands import CustomCommandsManager
-from features.discord_app_commands import register_wagerlabs_slash_commands, sync_global_slash_commands
+from features.discord_app_commands import (
+    command_invocation_id,
+    defer_slash_response,
+    register_wagerlabs_slash_commands,
+    sync_global_slash_commands,
+)
 from features.games.gambling import setup_gambling
 from features.games.gtb_panel import setup_gtb_panel
 
@@ -1204,7 +1209,7 @@ class KickWebSocketManager:
                 # Anti-multi-account: require a link on the chatter's own platform when enabled.
                 if not require_link_ok(guild_id, username, platform):
                     await send_kick_message(
-                        f"@{display_username} Link your {platform.capitalize()} account (!link in Discord) to request slots.",
+                        f"@{display_username} Link your {platform.capitalize()} account with the Link Account panel in Discord to request slots.",
                         guild_id=guild_id,
                     )
                     return
@@ -1298,7 +1303,7 @@ class KickWebSocketManager:
                 # Anti-multi-account: require a link on the chatter's own platform when enabled.
                 if not require_link_ok(guild_id, username, platform):
                     await send_kick_message(
-                        f"@{display_username} Link your {platform.capitalize()} account (!link in Discord) to guess.",
+                        f"@{display_username} Link your {platform.capitalize()} account with the Link Account panel in Discord to guess.",
                         guild_id=guild_id,
                     )
                     return
@@ -1478,7 +1483,7 @@ class KickWebSocketManager:
 
                         if not link_result:
                             await send_kick_message(
-                                f"@{username}, You need to link your account first! Use !link in Discord.",
+                                f"@{username}, You need to link your account first! Use the Link Account panel in Discord.",
                                 guild_id=guild_id,
                             )
                         else:
@@ -2962,7 +2967,7 @@ async def deduplicate_command(ctx):
     proceeds, the second raises CheckFailure and is silently ignored.
     """
     # Tag all logging for this command with its guild. discord.py allows only one
-    # global before_invoke, so this single hook covers every @bot.command and cog
+    # global before_invoke, so this single hook covers every hybrid command and cog
     # command. It runs inside the command's asyncio Task, so the context is scoped
     # to this invocation and discarded when the Task ends (no manual clear needed).
     if ctx.guild:
@@ -2970,7 +2975,7 @@ async def deduplicate_command(ctx):
 
     if not redis_client:
         return  # Redis unavailable — allow command through
-    key = f"cmd_dedup:{ctx.message.id}"
+    key = f"cmd_dedup:{command_invocation_id(ctx)}"
     if not redis_client.set(key, "1", nx=True, ex=10):
         # Another instance already claimed this message ID — suppress this invocation
         raise commands.CheckFailure("duplicate_suppressed")
@@ -3833,7 +3838,7 @@ async def kick_chat_loop(channel_name: str, guild_id: int):
 
                                             if slot_call and not require_link_ok(guild_id, username, "kick"):
                                                 await send_kick_message(
-                                                    f"@{username} Link your Kick account (!link in Discord) to request slots.",
+                                                    f"@{username} Link your Kick account with the Link Account panel in Discord to request slots.",
                                                     guild_id=guild_id,
                                                 )
                                             elif slot_call:  # Only process if there's actually a call
@@ -3859,7 +3864,7 @@ async def kick_chat_loop(channel_name: str, guild_id: int):
                                         logger.info(f"[GTB] {username} issued !gtb command")
                                         if not require_link_ok(guild_id, username, "kick"):
                                             await _send_kick_message_raw(
-                                                f"@{username} Link your Kick account (!link in Discord) to guess.",
+                                                f"@{username} Link your Kick account with the Link Account panel in Discord to guess.",
                                                 guild_id=guild_id,
                                             )
                                             gtb_mgr = None
@@ -5642,7 +5647,7 @@ async def cleanup_pending_links_task():
             if user:
                 try:
                     await user.send(
-                        "⏰ Your Kick verification code expired. " "Use `!link <kick_username>` to generate a new one."
+                        "⏰ Your Kick verification code expired. " "Use the Link Account panel to generate a new one."
                     )
                 except discord.Forbidden:
                     pass
@@ -6405,18 +6410,20 @@ def dynamic_cooldown(cooldown_mapping):
 # Each guild has its own settings loaded dynamically
 
 
-@bot.command(name="unlink")
+@bot.hybrid_command(name="unlink")
 @commands.has_permissions(manage_guild=True)
 async def cmd_unlink(ctx, member: discord.Member = None):
     """Admin command to unlink a user's Kick account from Discord.
 
     Usage:
-    !unlink @user - Unlink another user's account (admin only)
+    /unlink @user - Unlink another user's account (admin only)
     """
+    # Reads the database before its first reply - acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
 
     # Admin must specify a user
     if member is None:
-        await ctx.send("❌ Usage: `!unlink @user`\n\nAdmins must specify which user to unlink.")
+        await ctx.send("❌ Usage: `/unlink @user`\n\nAdmins must specify which user to unlink.")
         return
 
     discord_id = member.id
@@ -6467,10 +6474,10 @@ async def unlink_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ This command is admin-only. Regular users cannot unlink accounts to prevent abuse.")
     elif isinstance(error, commands.BadArgument):
-        await ctx.send("❌ Invalid user. Usage: `!unlink @user`")
+        await ctx.send("❌ Invalid user. Usage: `/unlink @user`")
 
 
-@bot.command(name="updatekick")
+@bot.hybrid_command(name="updatekick")
 @commands.has_permissions(administrator=True)
 async def cmd_update_kick(ctx, member: discord.Member, new_kick_username: str):
     """[ADMIN] Update a user's linked Kick username.
@@ -6479,8 +6486,11 @@ async def cmd_update_kick(ctx, member: discord.Member, new_kick_username: str):
     to the new username to prevent data loss.
 
     Usage:
-    !updatekick @user newkickname - Update the Kick username for a linked user
+    /updatekick @user newkickname - Update the Kick username for a linked user
     """
+    # Reads the database before its first reply — acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
+
     discord_id = member.id
     guild_id = ctx.guild.id if ctx.guild else None
     new_kick_username = new_kick_username.lower().strip()
@@ -6810,20 +6820,23 @@ async def update_kick_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ This command requires Administrator permission.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("❌ Usage: `!updatekick @user newkickname`")
+        await ctx.send("❌ Usage: `/updatekick @user newkickname`")
     elif isinstance(error, commands.BadArgument):
-        await ctx.send("❌ Invalid user. Usage: `!updatekick @user newkickname`")
+        await ctx.send("❌ Invalid user. Usage: `/updatekick @user newkickname`")
 
 
-@bot.command(name="grantlinkrole", aliases=["synclinkedroles"])
+@bot.hybrid_command(name="grantlinkrole", aliases=["synclinkedroles"])
 @commands.has_permissions(administrator=True)
 async def cmd_grant_link_role(ctx, member: discord.Member = None):
     """[ADMIN] Grant the linked role to users who are already linked.
 
     Usage:
-    !grantlinkrole - Grant role to ALL linked users in this server
-    !grantlinkrole @user - Grant role to a specific linked user
+    /grantlinkrole - Grant role to ALL linked users in this server
+    /grantlinkrole @user - Grant role to a specific linked user
     """
+    # Reads the database before its first reply — acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
+
     guild_id = ctx.guild.id if ctx.guild else None
 
     # Get the configured linked role ID
@@ -6935,12 +6948,15 @@ async def grant_link_role_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("❌ This command requires Administrator permission.")
     elif isinstance(error, commands.BadArgument):
-        await ctx.send("❌ Invalid user. Usage: `!grantlinkrole` or `!grantlinkrole @user`")
+        await ctx.send("❌ Invalid user. Usage: `/grantlinkrole` or `/grantlinkrole @user`")
 
 
-@bot.command(name="leaderboard")
+@bot.hybrid_command(name="leaderboard")
 async def cmd_leaderboard(ctx, top: int = 10):
     """Show top viewers by watchtime."""
+    # Reads the database before its first reply — acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
+
     if top > 25:
         top = 25
 
@@ -6968,15 +6984,18 @@ async def cmd_leaderboard(ctx, top: int = 10):
     await ctx.send(embed=embed)
 
 
-@bot.command(name="watchtime")
+@bot.hybrid_command(name="watchtime")
 @dynamic_cooldown(CommandCooldowns.WATCHTIME_COOLDOWN)
 async def cmd_watchtime(ctx, target: str = None):
     """
     Check watchtime for yourself or another user.
-    Usage: !watchtime (check your own)
-           !watchtime @user (admins - lookup by Discord mention)
-           !watchtime <kick_username> (admins - lookup by Kick username)
+    Usage: /watchtime (check your own)
+           /watchtime @user (admins - lookup by Discord mention)
+           /watchtime <kick_username> (admins - lookup by Kick username)
     """
+    # Reads the database before its first reply — acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
+
     discord_id = ctx.author.id
     is_admin = ctx.guild and ctx.author.guild_permissions.administrator
 
@@ -7076,19 +7095,22 @@ async def cmd_watchtime(ctx, target: str = None):
 # -------------------------
 # Admin Commands
 # -------------------------
-@bot.command(name="tracking")
+@bot.hybrid_command(name="tracking")
 @commands.has_permissions(administrator=True)
 # 🔒 SECURITY: Ensure command only works in the configured guild
 async def toggle_tracking(ctx, action: str = None, subaction: str = None):
     """
     Admin command to control watchtime tracking.
-    Usage: !tracking on|off|status
-           !tracking force on|off|status
-           !tracking debug on|off|status
+    Usage: /tracking on|off|status
+           /tracking force on|off|status
+           /tracking debug on|off|status
     """
+    # Reads the database before its first reply - acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
+
     global stream_tracking_enabled, tracking_force_override, watchtime_debug_enabled
 
-    # Support a force subcommand: !tracking force on|off|status
+    # Support a force subcommand: /tracking force on|off|status
     if action is None or action.lower() == "status":
         status = "🟢 ENABLED" if stream_tracking_enabled else "🔴 DISABLED"
         force_status = "🟢 FORCE ON" if tracking_force_override else "🔴 FORCE OFF"
@@ -7148,7 +7170,7 @@ async def toggle_tracking(ctx, action: str = None, subaction: str = None):
             await ctx.send("🔓 **Watchtime FORCE override DISABLED**\nLive-detection checks will be enforced again.")
         else:
             await ctx.send(
-                "❌ Invalid force option. Use: `!tracking force on` or `!tracking force off` or `!tracking force status`"
+                "❌ Invalid force option. Use: `/tracking force on` or `/tracking force off` or `/tracking force status`"
             )
     elif action.lower() == "debug":
         if subaction is None or subaction.lower() == "status":
@@ -7164,11 +7186,11 @@ async def toggle_tracking(ctx, action: str = None, subaction: str = None):
             await ctx.send("🔇 **Watchtime DEBUG logging DISABLED**\nDebug messages will be suppressed.")
         else:
             await ctx.send(
-                "❌ Invalid debug option. Use: `!tracking debug on` or `!tracking debug off` or `!tracking debug status`"
+                "❌ Invalid debug option. Use: `/tracking debug on` or `/tracking debug off` or `/tracking debug status`"
             )
     else:
         await ctx.send(
-            "❌ Invalid option. Use: `!tracking on`, `!tracking off`, `!tracking status`, or `!tracking force/debug ...`"
+            "❌ Invalid option. Use: `/tracking on`, `/tracking off`, `/tracking status`, or `/tracking force/debug ...`"
         )
 
 
@@ -7178,16 +7200,19 @@ async def tracking_error(ctx, error):
         await ctx.send("❌ You need administrator permissions to use this command.")
 
 
-@bot.command(name="linklogs")
+@bot.hybrid_command(name="linklogs")
 @commands.has_permissions(administrator=True)
 async def link_logs_toggle(ctx, action: str = None):
     """
     Admin command to configure link attempt logging to Discord channel.
-    Usage: !linklogs on|off|status
+    Usage: /linklogs on|off|status
 
     When enabled, all account linking attempts (successful and failed) will be logged
     to the channel where this command is run.
     """
+    # Reads the database before its first reply — acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
+
     guild_id = ctx.guild.id
     channel_id = ctx.channel.id
 
@@ -7206,7 +7231,7 @@ async def link_logs_toggle(ctx, action: str = None):
 
             if not result:
                 await ctx.send(
-                    "📊 **Link Logging Status:** 🔴 NOT CONFIGURED\nUse `!linklogs on` to enable logging in this channel."
+                    "📊 **Link Logging Status:** 🔴 NOT CONFIGURED\nUse `/linklogs on` to enable logging in this channel."
                 )
                 return
 
@@ -7240,7 +7265,7 @@ async def link_logs_toggle(ctx, action: str = None):
             f"• Success/failure status\n"
             f"• Kick username\n"
             f"• Timestamp\n\n"
-            f"Use `!linklogs off` to disable logging."
+            f"Use `/linklogs off` to disable logging."
         )
 
     elif action.lower() == "off":
@@ -7260,7 +7285,7 @@ async def link_logs_toggle(ctx, action: str = None):
         await ctx.send("⏸️ **Link logging DISABLED**\nAccount linking attempts will no longer be logged.")
 
     else:
-        await ctx.send("❌ Invalid option. Use: `!linklogs on`, `!linklogs off`, or `!linklogs status`")
+        await ctx.send("❌ Invalid option. Use: `/linklogs on`, `/linklogs off`, or `/linklogs status`")
 
 
 @link_logs_toggle.error
@@ -7269,31 +7294,34 @@ async def link_logs_error(ctx, error):
         await ctx.send("❌ You need administrator permissions to use this command.")
 
 
-@bot.command(name="callblacklist", aliases=["srblacklist", "blockslotcall"])
+@bot.hybrid_command(name="callblacklist", aliases=["srblacklist", "blockslotcall"])
 @commands.has_permissions(administrator=True)
 async def slot_call_blacklist(ctx, action: str = None, kick_username: str = None, *, reason: str = None):
     """
     Admin command to blacklist Kick users from using !call/!sr commands.
     Usage:
-      !callblacklist add <kick_username> [reason]
-      !callblacklist remove <kick_username>
-      !callblacklist list
-      !callblacklist check <kick_username>
+      /callblacklist add <kick_username> [reason]
+      /callblacklist remove <kick_username>
+      /callblacklist list
+      /callblacklist check <kick_username>
     """
+    # Reads the database before its first reply - acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
+
     if action is None or action.lower() not in ["add", "remove", "list", "check"]:
         await ctx.send(
             "**Slot Call Blacklist Management**\n\n"
             "**Usage:**\n"
-            "• `!callblacklist add <kick_username> [reason]` - Block a user from using !call/!sr\n"
-            "• `!callblacklist remove <kick_username>` - Unblock a user\n"
-            "• `!callblacklist list` - Show all blacklisted users\n"
-            "• `!callblacklist check <kick_username>` - Check if a user is blacklisted"
+            "• `/callblacklist add <kick_username> [reason]` - Block a user from using !call/!sr\n"
+            "• `/callblacklist remove <kick_username>` - Unblock a user\n"
+            "• `/callblacklist list` - Show all blacklisted users\n"
+            "• `/callblacklist check <kick_username>` - Check if a user is blacklisted"
         )
         return
 
     if action.lower() == "add":
         if not kick_username:
-            await ctx.send("❌ Please provide a Kick username: `!callblacklist add <kick_username> [reason]`")
+            await ctx.send("❌ Please provide a Kick username: `/callblacklist add <kick_username> [reason]`")
             return
 
         kick_username_lower = kick_username.lower()
@@ -7338,7 +7366,7 @@ async def slot_call_blacklist(ctx, action: str = None, kick_username: str = None
 
     elif action.lower() == "remove":
         if not kick_username:
-            await ctx.send("❌ Please provide a Kick username: `!callblacklist remove <kick_username>`")
+            await ctx.send("❌ Please provide a Kick username: `/callblacklist remove <kick_username>`")
             return
 
         kick_username_lower = kick_username.lower()
@@ -7397,7 +7425,7 @@ async def slot_call_blacklist(ctx, action: str = None, kick_username: str = None
 
     elif action.lower() == "check":
         if not kick_username:
-            await ctx.send("❌ Please provide a Kick username: `!callblacklist check <kick_username>`")
+            await ctx.send("❌ Please provide a Kick username: `/callblacklist check <kick_username>`")
             return
 
         kick_username_lower = kick_username.lower()
@@ -7435,21 +7463,23 @@ async def slot_call_blacklist_error(ctx, error):
         await ctx.send("❌ You need administrator permissions to use this command.")
 
 
-@bot.command(name="roles")
+@bot.hybrid_command(name="roles")
 @commands.has_permissions(administrator=True)
 async def manage_roles(ctx, action: str = None, role_name: str = None, minutes: int = None):
     """
     Admin command to manage watchtime role thresholds.
     Usage:
-      !roles list - Show current role configuration
-      !roles add <role_name> <minutes> - Add a new role threshold
-      !roles update <role_name> <minutes> - Update existing role threshold
-      !roles remove <role_name> - Remove a role threshold
-      !roles enable <role_name> - Enable a role
-      !roles disable <role_name> - Disable a role
+      /roles list - Show current role configuration
+      /roles add <role_name> <minutes> - Add a new role threshold
+      /roles update <role_name> <minutes> - Update existing role threshold
+      /roles remove <role_name> - Remove a role threshold
+      /roles enable <role_name> - Enable a role
+      /roles disable <role_name> - Disable a role
 
-    Example: !roles add "Tier 4" 5000
+    Example: /roles add "Tier 4" 5000
     """
+    # Reads the database before its first reply — acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
 
     if action is None or action.lower() == "list":
         # Show current configuration
@@ -7486,13 +7516,13 @@ async def manage_roles(ctx, action: str = None, role_name: str = None, minutes: 
                 inline=False,
             )
 
-        embed.set_footer(text="Use !roles add/update/remove to modify • Changes take effect immediately")
+        embed.set_footer(text="Use /roles add/update/remove to modify • Changes take effect immediately")
         await ctx.send(embed=embed)
         return
 
     if action.lower() == "add":
         if not role_name or minutes is None:
-            await ctx.send('❌ Usage: `!roles add <role_name> <minutes>`\nExample: `!roles add "Tier 4" 5000`')
+            await ctx.send('❌ Usage: `/roles add <role_name> <minutes>`\nExample: `/roles add "Tier 4" 5000`')
             return
 
         try:
@@ -7523,7 +7553,7 @@ async def manage_roles(ctx, action: str = None, role_name: str = None, minutes: 
 
     elif action.lower() == "update":
         if not role_name or minutes is None:
-            await ctx.send('❌ Usage: `!roles update <role_name> <minutes>`\nExample: `!roles update "Tier 1" 180`')
+            await ctx.send('❌ Usage: `/roles update <role_name> <minutes>`\nExample: `/roles update "Tier 1" 180`')
             return
 
         try:
@@ -7551,7 +7581,7 @@ async def manage_roles(ctx, action: str = None, role_name: str = None, minutes: 
 
     elif action.lower() == "remove":
         if not role_name:
-            await ctx.send('❌ Usage: `!roles remove <role_name>`\nExample: `!roles remove "Tier 4"`')
+            await ctx.send('❌ Usage: `/roles remove <role_name>`\nExample: `/roles remove "Tier 4"`')
             return
 
         try:
@@ -7578,7 +7608,7 @@ async def manage_roles(ctx, action: str = None, role_name: str = None, minutes: 
 
     elif action.lower() in ["enable", "disable"]:
         if not role_name:
-            await ctx.send(f"❌ Usage: `!roles {action} <role_name>`")
+            await ctx.send(f"❌ Usage: `/roles {action} <role_name>`")
             return
 
         enabled = action.lower() == "enable"
@@ -7608,7 +7638,7 @@ async def manage_roles(ctx, action: str = None, role_name: str = None, minutes: 
 
     elif action.lower() == "members":
         if not role_name:
-            await ctx.send('❌ Usage: `!roles members <role_name>`\nExample: `!roles members "Tier 1"`')
+            await ctx.send('❌ Usage: `/roles members <role_name>`\nExample: `/roles members "Tier 1"`')
             return
 
         # Find the Discord role
@@ -7685,12 +7715,12 @@ async def manage_roles(ctx, action: str = None, role_name: str = None, minutes: 
     else:
         await ctx.send(
             "❌ Invalid action. Available actions:\n"
-            "• `!roles list` - Show current roles\n"
-            "• `!roles add <name> <minutes>` - Add new role\n"
-            "• `!roles update <name> <minutes>` - Update role threshold\n"
-            "• `!roles remove <name>` - Remove role\n"
-            "• `!roles enable/disable <name>` - Enable/disable role\n"
-            "• `!roles members <name>` - List members with a role"
+            "• `/roles list` - Show current roles\n"
+            "• `/roles add <name> <minutes>` - Add new role\n"
+            "• `/roles update <name> <minutes>` - Update role threshold\n"
+            "• `/roles remove <name>` - Remove role\n"
+            "• `/roles enable/disable <name>` - Enable/disable role\n"
+            "• `/roles members <name>` - List members with a role"
         )
 
 
@@ -7700,13 +7730,13 @@ async def manage_roles_error(ctx, error):
         await ctx.send("❌ You need administrator permissions to use this command.")
 
 
-@bot.command(name="testsub")
+@bot.hybrid_command(name="testsub")
 @commands.has_permissions(administrator=True)
 async def test_subscription(ctx, kick_username: str = None, sub_count: int = 1):
     """
     [ADMIN/DEBUG] Simulate a subscription event to test raffle ticket awarding
-    Usage: !testsub <kick_username> [sub_count]
-    Example: !testsub testuser123 5  (simulates 5 gifted subs)
+    Usage: /testsub <kick_username> [sub_count]
+    Example: /testsub testuser123 5  (simulates 5 gifted subs)
     """
     guild_id = ctx.guild.id if ctx.guild else None
     if not guild_id:
@@ -7727,7 +7757,7 @@ async def test_subscription(ctx, kick_username: str = None, sub_count: int = 1):
         return
 
     if not kick_username:
-        await ctx.send("❌ Usage: `!testsub <kick_username> [sub_count]`\nExample: `!testsub testuser123 5`")
+        await ctx.send("❌ Usage: `/testsub <kick_username> [sub_count]`\nExample: `/testsub testuser123 5`")
         return
 
     # Create a fake subscription event that matches Kick's structure
@@ -7763,7 +7793,10 @@ async def test_subscription(ctx, kick_username: str = None, sub_count: int = 1):
         embed.add_field(name="Discord ID", value=str(result["discord_id"]), inline=True)
         embed.description = f"Successfully awarded **{result['tickets_awarded']} tickets** to {result['gifter']}"
     elif result["status"] == "not_linked":
-        embed.description = f"❌ User `{kick_username}` is not linked to a Discord account.\nThey need to use `!link` to connect their accounts."
+        embed.description = (
+            f"❌ User `{kick_username}` is not linked to a Discord account.\n"
+            "They need to use this server's Link Account panel."
+        )
         embed.add_field(name="Note", value="Sub was logged but no tickets awarded", inline=False)
     elif result["status"] == "duplicate":
         embed.description = f"⚠️ This event was already processed (duplicate)"
@@ -7782,12 +7815,12 @@ async def test_subscription_error(ctx, error):
         await ctx.send("❌ You need administrator permissions to use this command.")
 
 
-@bot.command(name="convertwatchtime")
+@bot.hybrid_command(name="convertwatchtime")
 @commands.has_permissions(administrator=True)
 async def convert_watchtime_manual(ctx):
     """
     [ADMIN/DEBUG] Manually trigger watchtime to tickets conversion
-    Usage: !convertwatchtime
+    Usage: /convertwatchtime
     """
     if not engine:
         await ctx.send("❌ Database not initialized!")
@@ -7837,13 +7870,13 @@ async def convert_watchtime_manual_error(ctx, error):
         await ctx.send("❌ You need administrator permissions to use this command.")
 
 
-@bot.command(name="fixwatchtime")
+@bot.hybrid_command(name="fixwatchtime")
 @commands.has_permissions(administrator=True)
 async def fix_watchtime_for_current_period(ctx):
     """
     [ADMIN] Fix watchtime tracking for current period by snapshotting existing totals
     This prevents re-awarding tickets for old watchtime
-    Usage: !fixwatchtime
+    Usage: /fixwatchtime
     """
     if not engine:
         await ctx.send("❌ Database not initialized!")
@@ -7916,12 +7949,15 @@ async def fix_watchtime_for_current_period_error(ctx, error):
         await ctx.send("❌ You need administrator permissions to use this command.")
 
 
-@bot.command(name="checkwatchtime")
+@bot.hybrid_command(name="checkwatchtime")
 async def check_watchtime_conversion(ctx, kick_username: str = None):
     """
     Check watchtime conversion status for a user
-    Usage: !checkwatchtime [kick_username]
+    Usage: /checkwatchtime [kick_username]
     """
+    # Reads the database before its first reply - acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
+
     if not engine:
         await ctx.send("❌ Database not initialized!")
         return
@@ -7943,7 +7979,7 @@ async def check_watchtime_conversion(ctx, kick_username: str = None):
                 if row:
                     kick_username = row[0]
                 else:
-                    await ctx.send("❌ You need to link your account first using `!link <kick_username>`")
+                    await ctx.send("❌ You need to link your account first using this server's Link Account panel.")
                     return
         except Exception as e:
             await ctx.send(f"❌ Error looking up your linked account: {e}")
@@ -7991,11 +8027,11 @@ async def check_watchtime_conversion(ctx, kick_username: str = None):
         await ctx.send(f"❌ Error: {str(e)}")
 
 
-@bot.command(name="commandlist", aliases=["commands"])
+@bot.hybrid_command(name="commandlist", aliases=["commands"])
 async def command_list(ctx):
     """
     Show available bot commands for regular users
-    Usage: !commandlist or !commands
+    Usage: /commandlist
     """
     embed = discord.Embed(
         title="📋 User Commands",
@@ -8007,7 +8043,7 @@ async def command_list(ctx):
     # Account Linking
     embed.add_field(
         name="🔗 Account Linking",
-        value="`!link` - Link your Kick account via OAuth",
+        value="Use this server's Link Account panel to connect Kick or Twitch.",
         inline=False,
     )
 
@@ -8015,7 +8051,7 @@ async def command_list(ctx):
     embed.add_field(
         name="⏱️ Watchtime & Stats",
         value=(
-            "`!watchtime [user]` - Check your or someone's watchtime\n" "`!leaderboard` - View watchtime leaderboard"
+            "`/watchtime [user]` - Check your or someone's watchtime\n" "`/leaderboard` - View watchtime leaderboard"
         ),
         inline=False,
     )
@@ -8023,7 +8059,7 @@ async def command_list(ctx):
     # Points & Shop
     embed.add_field(
         name="💰 Points",
-        value=("`!points` / `!balance` - Check your points balance\n" "`!pointslb` - View points leaderboard"),
+        value=("`/points` - Check your points balance\n" "`/pointslb` - View points leaderboard"),
         inline=False,
     )
 
@@ -8031,12 +8067,12 @@ async def command_list(ctx):
     embed.add_field(
         name="🎰 Monthly Raffle",
         value=(
-            "`!tickets` - View your raffle tickets\n"
-            "`!raffleboard` - View ticket leaderboard\n"
-            "`!raffleinfo` - View raffle period information\n"
-            "`!fair` / `!pf` - How to verify a provably-fair draw\n"
-            "`!linkshuffle <username>` - Link Shuffle account for wager tracking\n"
-            "`!verifyshuffle` - Verify your Shuffle wagers for bonus tickets"
+            "`/tickets` - View your raffle tickets\n"
+            "`/raffleboard` - View ticket leaderboard\n"
+            "`/raffleinfo` - View raffle period information\n"
+            "`/fair` - How to verify a provably-fair draw\n"
+            "`/linkshuffle <username>` - Link Shuffle account for wager tracking\n"
+            "`/verifyshuffle` - Verify Shuffle wagers for bonus tickets"
         ),
         inline=False,
     )
@@ -8045,24 +8081,24 @@ async def command_list(ctx):
     embed.add_field(
         name="🎲 Gambling (Provably Fair)",
         value=(
-            "`!bj <amount>` - Play blackjack\n"
-            "`!roll <amount>` - Roll 1-100 for multiplied payout\n"
-            "`!double <amount>` - Double or nothing"
+            "`/bj <amount>` - Play blackjack\n"
+            "`/roll <amount>` - Roll 1-100 for multiplied payout\n"
+            "`/double <amount>` - Double or nothing"
         ),
         inline=False,
     )
 
-    embed.set_footer(text="Admins: Use !admincommands to see administrator commands")
+    embed.set_footer(text="Admins: Use /admincommands to see administrator commands")
 
     await ctx.send(embed=embed)
 
 
-@bot.command(name="admincommands", aliases=["adminhelp"])
+@bot.hybrid_command(name="admincommands", aliases=["adminhelp"])
 @commands.has_permissions(administrator=True)
 async def admin_command_list(ctx):
     """
     Show all available administrator commands
-    Usage: !admincommands or !adminhelp
+    Usage: /admincommands
     """
     embed = discord.Embed(
         title="🔧 Administrator Commands",
@@ -8075,10 +8111,10 @@ async def admin_command_list(ctx):
     embed.add_field(
         name="📡 Tracking Control",
         value=(
-            "`!tracking [on|off|status]` - Control watchtime tracking\n"
-            "`!tracking force [on|off]` - Force tracking override\n"
-            "`!tracking debug [on|off]` - Toggle debug mode\n"
-            "`!linklogs` - View recent account links"
+            "`/tracking [on|off|status]` - Control watchtime tracking\n"
+            "`/tracking force [on|off]` - Force tracking override\n"
+            "`/tracking debug [on|off]` - Toggle debug mode\n"
+            "`/linklogs` - View recent account links"
         ),
         inline=False,
     )
@@ -8087,9 +8123,9 @@ async def admin_command_list(ctx):
     embed.add_field(
         name="🔗 Account Management",
         value=(
-            "`!unlink @user` - Unlink a user's Kick account\n"
-            "`!updatekick @user <newname>` - Update linked Kick username\n"
-            "`!grantlinkrole [@user]` - Grant linked role (or sync all)"
+            "`/unlink @user` - Unlink a user's Kick account\n"
+            "`/updatekick @user <newname>` - Update linked Kick username\n"
+            "`/grantlinkrole [@user]` - Grant linked role (or sync all)"
         ),
         inline=False,
     )
@@ -8098,12 +8134,12 @@ async def admin_command_list(ctx):
     embed.add_field(
         name="👥 Role Management",
         value=(
-            "`!roles list` - Show role configuration\n"
-            "`!roles add <name> <minutes>` - Add role threshold\n"
-            "`!roles update <name> <minutes>` - Update threshold\n"
-            "`!roles remove <name>` - Remove role\n"
-            "`!roles enable/disable <name>` - Toggle role\n"
-            "`!roles members <name>` - List members with role"
+            "`/roles list` - Show role configuration\n"
+            "`/roles add <name> <minutes>` - Add role threshold\n"
+            "`/roles update <name> <minutes>` - Update threshold\n"
+            "`/roles remove <name>` - Remove role\n"
+            "`/roles enable/disable <name>` - Toggle role\n"
+            "`/roles members <name>` - List members with role"
         ),
         inline=False,
     )
@@ -8112,14 +8148,14 @@ async def admin_command_list(ctx):
     embed.add_field(
         name="🎲 Raffle Management",
         value=(
-            "`!rafflestart [start_day] [end_day]` - Start new raffle period\n"
-            "`!raffleend` - End current raffle period\n"
-            "`!raffledraw [prize]` - Draw raffle winner\n"
-            "`!rafflestats [@user]` - View raffle statistics\n"
-            "`!rafflegive <@user> <amount> [reason]` - Award tickets\n"
-            "`!raffleremove <@user> <amount> [reason]` - Remove tickets\n"
-            "`!convertwatchtime` - Manually convert watchtime\n"
-            "`!fixwatchtime` - Fix watchtime tracking"
+            "`/rafflestart [start_day] [end_day]` - Start new raffle period\n"
+            "`/raffleend` - End current raffle period\n"
+            "`/raffledraw [prize]` - Draw raffle winner\n"
+            "`/rafflestats [@user]` - View raffle statistics\n"
+            "`/rafflegive <@user> <amount> [reason]` - Award tickets\n"
+            "`/raffleremove <@user> <amount> [reason]` - Remove tickets\n"
+            "`/convertwatchtime` - Manually convert watchtime\n"
+            "`/fixwatchtime` - Fix watchtime tracking"
         ),
         inline=False,
     )
@@ -8128,10 +8164,10 @@ async def admin_command_list(ctx):
     embed.add_field(
         name="🎰 Slot Requests",
         value=(
-            "`!slotpanel` - Create/update slot request panel\n"
-            "`!callblacklist add <username> [reason]` - Block user from requests\n"
-            "`!callblacklist remove <username>` - Unblock user\n"
-            "`!callblacklist list` - View blacklisted users"
+            "`/slotpanel` - Create/update slot request panel\n"
+            "`/callblacklist add <username> [reason]` - Block user from requests\n"
+            "`/callblacklist remove <username>` - Unblock user\n"
+            "`/callblacklist list` - View blacklisted users"
         ),
         inline=False,
     )
@@ -8139,7 +8175,7 @@ async def admin_command_list(ctx):
     # Gambling Admin
     embed.add_field(
         name="🎲 Gambling",
-        value="`!setgamblechannel #channel` - Restrict gambling to a channel",
+        value="`/setgamblechannel #channel` - Restrict gambling to a channel",
         inline=False,
     )
 
@@ -8147,9 +8183,9 @@ async def admin_command_list(ctx):
     embed.add_field(
         name="🧪 Testing & Debug",
         value=(
-            "`!testsub <kick_username> [count]` - Test subscription event\n"
-            "`!systemstatus` - Check system initialization\n"
-            "`!health` - Bot health check"
+            "`/testsub <kick_username> [count]` - Test subscription event\n"
+            "`/systemstatus` - Check system initialization\n"
+            "`/health` - Bot health check"
         ),
         inline=False,
     )
@@ -8158,25 +8194,25 @@ async def admin_command_list(ctx):
     embed.add_field(
         name="⚙️ Setup",
         value=(
-            "`!setup_link_panel` - Create button-based linking panel\n"
-            "`!post_link_info` - Post linking instructions\n"
-            "`!creategtbpanel` - Create GTB control panel\n"
-            "`!postshop` - Post/update point shop embed"
+            "`/setup_link_panel` - Create button-based linking panel\n"
+            "`/post_link_info` - Post linking instructions\n"
+            "`/creategtbpanel` - Create GTB control panel\n"
+            "`/postshop` - Post/update point shop embed"
         ),
         inline=False,
     )
 
-    embed.set_footer(text="Regular users: Use !commandlist to see user commands")
+    embed.set_footer(text="Regular users: Use /commandlist to see user commands")
 
     await ctx.send(embed=embed)
 
 
-@bot.command(name="systemstatus")
+@bot.hybrid_command(name="systemstatus")
 @commands.has_permissions(administrator=True)
 async def raffle_system_info(ctx):
     """
     [ADMIN/DEBUG] Check raffle system initialization status
-    Usage: !systemstatus
+    Usage: /systemstatus
     """
     guild_id = ctx.guild.id if ctx.guild else None
     if not guild_id:
@@ -8230,12 +8266,12 @@ async def raffle_system_info_error(ctx, error):
         await ctx.send("❌ You need administrator permissions to use this command.")
 
 
-@bot.command(name="setup_link_panel")
+@bot.hybrid_command(name="setup_link_panel")
 @commands.has_permissions(manage_guild=True)
 async def setup_link_panel(ctx, emoji: str = "🔗"):
     """
     Admin command to create a pinned message for reaction-based OAuth linking.
-    Usage: !setup_link_panel [emoji]
+    Usage: /setup_link_panel [emoji]
     Default emoji: 🔗
 
     Users can react to the pinned message to link their Kick account via OAuth.
@@ -8303,12 +8339,12 @@ async def setup_link_panel_error(ctx, error):
         await ctx.send("❌ You need 'Manage Server' permission to use this command.")
 
 
-@bot.command(name="post_link_info")
+@bot.hybrid_command(name="post_link_info")
 @commands.has_permissions(manage_guild=True)
 async def post_link_info(ctx):
     """
     Admin command to post an informational embed explaining why users should link their accounts.
-    Usage: !post_link_info
+    Usage: /post_link_info
 
     This creates a detailed explanation of the benefits of linking Kick accounts.
     """
@@ -8351,13 +8387,14 @@ async def post_link_info(ctx):
     # Send the embed
     await ctx.send(embed=embed)
 
-    # Delete the command message to keep the channel clean
-    try:
-        await ctx.message.delete()
-    except discord.Forbidden:
-        pass  # If we can't delete, no big deal
-    except discord.HTTPException:
-        pass
+    # Prefix invocations leave a command message; slash interactions do not.
+    if ctx.interaction is None:
+        try:
+            await ctx.message.delete()
+        except discord.Forbidden:
+            pass  # If we can't delete, no big deal
+        except discord.HTTPException:
+            pass
 
 
 @post_link_info.error
@@ -8366,12 +8403,12 @@ async def post_link_info_error(ctx, error):
         await ctx.send("❌ You need 'Manage Server' permission to use this command.")
 
 
-@bot.command(name="health")
+@bot.hybrid_command(name="health")
 @commands.has_permissions(manage_guild=True)
 async def health_check(ctx):
     """
     Admin command to check if all bot systems are functioning correctly.
-    Usage: !health
+    Usage: /health
 
     Checks:
     - Discord connection
@@ -8826,11 +8863,6 @@ async def on_ready():
     # Cog registration, command registration, and task creation must only happen once.
     _first_ready = not hasattr(bot, "_bot_initialized")
 
-    # Global application commands are registered before login but must be synced
-    # over Discord's HTTP API. The helper guards successful syncs and leaves
-    # failures retryable on the next gateway ready event.
-    await sync_global_slash_commands(bot)
-
     # START KICKPYTHON WEBSOCKET (for chat messages)
     # NOTE: Subscription events are now handled via Kick webhooks (channel.subscription.*)
     if KICK_USE_KICKPYTHON_WS:
@@ -9058,7 +9090,16 @@ async def on_ready():
         # Initialize raffle system — skip cog/command registration on gateway reconnects.
         # (on_ready fires on every reconnect; cog/command re-registration would raise errors.)
         if not _first_ready:
-            logger.info("♻️  Gateway reconnect — background tasks checked, initialization skipped")
+            # The command tree is already built from the first pass, so a sync that
+            # failed then (HTTP 5xx, rate limit, transient network) is retried here.
+            # sync_global_slash_commands is a no-op once it has succeeded.
+            if await sync_global_slash_commands(bot):
+                logger.info("♻️  Gateway reconnect — background tasks checked, initialization skipped")
+            else:
+                logger.warning(
+                    "♻️  Gateway reconnect — background tasks checked, but global slash "
+                    "commands are still unsynced; will retry on the next reconnect"
+                )
             return
         bot._bot_initialized = True
 
@@ -9280,7 +9321,7 @@ async def on_ready():
                     logger.debug(f"✅ Slot request panel commands cog registered")
 
                     # Add GTB panel command (only once)
-                    @bot.command(name="creategtbpanel")
+                    @bot.hybrid_command(name="creategtbpanel")
                     @commands.has_permissions(administrator=True)
                     async def create_gtb_panel_cmd(ctx):
                         """[ADMIN] Create the GTB panel in this channel"""
@@ -9460,7 +9501,16 @@ async def on_ready():
             bot.slot_trackers = slot_call_trackers  # Also expose as slot_trackers
             logger.debug(f"✅ Backwards compatibility attributes set")
 
-    logger.info("🎉 Bot ready — commands enabled")
+    # Cogs and panel commands are registered lazily during the first on_ready
+    # pass. Sync only after that work so Discord receives the complete hybrid
+    # command tree. Failed syncs remain retryable on the next gateway reconnect.
+    if await sync_global_slash_commands(bot):
+        logger.info("🎉 Bot ready — slash commands enabled")
+    else:
+        logger.warning(
+            "🎉 Bot ready — but global slash commands could NOT be synced; prefix "
+            "commands still work and the sync retries on the next gateway reconnect"
+        )
     # ========== END MERGED CODE ==========
 
 
@@ -10964,7 +11014,7 @@ class PointShopItemSelect(discord.ui.Select):
 
             if not accounts:
                 await interaction.response.send_message(
-                    "❌ You need to link your account first! Use the link panel or `!link` command.",
+                    "❌ You need to link your account first! Use this server's Link Account panel.",
                     ephemeral=True,
                 )
                 return
@@ -11204,7 +11254,7 @@ class PointShopBalanceButton(discord.ui.Button):
 
             if not accounts:
                 await interaction.response.send_message(
-                    "❌ You need to link your account first! Use the link panel or `!link` command.",
+                    "❌ You need to link your account first! Use this server's Link Account panel.",
                     ephemeral=True,
                 )
                 return
@@ -11902,9 +11952,12 @@ async def update_point_shop_message(bot):
     return await post_point_shop_to_discord(bot, update_existing=True)
 
 
-@bot.command(name="points", aliases=["balance", "pts"])
+@bot.hybrid_command(name="points", aliases=["balance", "pts"])
 async def cmd_points(ctx):
     """Check your point balance"""
+    # Reads the database before its first reply — acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
+
     discord_id = ctx.author.id
 
     # Resolve the member's shared (cross-platform) balance under their canonical row
@@ -11912,7 +11965,7 @@ async def cmd_points(ctx):
         canonical, accounts = resolve_shop_identity(conn, discord_id, ctx.guild.id)
 
         if not accounts:
-            await ctx.send("❌ You need to link your account first! Use the link panel or `!link` command.")
+            await ctx.send("❌ You need to link your account first! Use this server's Link Account panel.")
             return
 
         # Get points balance
@@ -11941,9 +11994,12 @@ async def cmd_points(ctx):
     await ctx.send(embed=embed)
 
 
-@bot.command(name="pointslb", aliases=["pointsleaderboard", "ptslb"])
+@bot.hybrid_command(name="pointslb", aliases=["pointsleaderboard", "ptslb"])
 async def cmd_points_leaderboard(ctx, limit: int = 10):
     """Show the points leaderboard"""
+    # Reads the database before its first reply — acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
+
     if limit < 1:
         limit = 10
     if limit > 25:
@@ -11981,10 +12037,13 @@ async def cmd_points_leaderboard(ctx, limit: int = 10):
     await ctx.send(embed=embed)
 
 
-@bot.command(name="postshop")
+@bot.hybrid_command(name="postshop")
 @commands.has_permissions(administrator=True)
 async def cmd_post_shop(ctx, channel: discord.TextChannel = None):
     """[ADMIN] Post the point shop to a channel"""
+    # Writes a setting, then builds and posts the whole storefront message.
+    await defer_slash_response(ctx)
+
     target_channel = channel or ctx.channel
 
     # Save channel setting
@@ -12003,8 +12062,11 @@ async def cmd_post_shop(ctx, channel: discord.TextChannel = None):
     success = await post_point_shop_to_discord(bot, ctx.guild.id, target_channel.id)
 
     if success:
-        if channel:
-            await ctx.send(f"✅ Point shop posted to {target_channel.mention}!")
+        # Always confirm. Without an explicit channel the shop lands in the
+        # current channel, which used to be treated as confirmation enough — but
+        # a slash invocation still needs its own response or Discord reports the
+        # command as failed.
+        await ctx.send(f"✅ Point shop posted to {target_channel.mention}!")
     else:
         await ctx.send("❌ Failed to post point shop. Check that there are active items.")
 

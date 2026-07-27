@@ -11,6 +11,8 @@ import discord
 from discord.ext import commands
 from sqlalchemy import text
 
+from features.discord_app_commands import defer_slash_response
+
 logger = logging.getLogger(__name__)
 
 
@@ -980,12 +982,12 @@ class SlotCallCommands(commands.Cog):
         # Fallback to default tracker
         return self.default_tracker
 
-    @commands.command(name="slotcalls")
+    @commands.hybrid_command(name="slotcalls")
     @commands.has_permissions(administrator=True)
     async def toggle_slot_calls(self, ctx, action: str = None):
         """
         [ADMIN] Toggle slot call tracking on/off or check status
-        Usage: !slotcalls [on|off|status]
+        Usage: /slotcalls [on|off|status]
         """
         tracker = self._get_tracker_for_guild(ctx.guild.id)
         if not tracker:
@@ -1028,15 +1030,18 @@ class SlotCallCommands(commands.Cog):
             await tracker.set_enabled(False)
             await ctx.send("❌ Slot call tracking **disabled**. `!call` and `!sr` commands will be ignored.")
         else:
-            await ctx.send("❌ Invalid action. Use `!slotcalls on`, `!slotcalls off`, or `!slotcalls status`")
+            await ctx.send("❌ Invalid action. Use `/slotcalls on`, `/slotcalls off`, or `/slotcalls status`")
 
-    @commands.command(name="pickslot", aliases=["randomslot", "slotpick"])
+    @commands.hybrid_command(name="pickslot", aliases=["randomslot", "slotpick"])
     @commands.has_permissions(administrator=True)
     async def pick_random_slot(self, ctx):
         """
         [ADMIN] Pick a random slot request from the list
-        Usage: !pickslot
+        Usage: /pickslot
         """
+        # Reads the database before its first reply - acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         tracker = self._get_tracker_for_guild(ctx.guild.id)
         if not tracker:
             await ctx.send("❌ Slot call tracker not initialized for this server")
@@ -1133,13 +1138,16 @@ class SlotCallCommands(commands.Cog):
             logger.error(f"Failed to pick random slot: {e}")
             await ctx.send(f"❌ Error picking random slot: {e}")
 
-    @commands.command(name="slotlist", aliases=["listslots", "slots"])
+    @commands.hybrid_command(name="slotlist", aliases=["listslots", "slots"])
     @commands.has_permissions(administrator=True)
     async def list_slot_requests(self, ctx):
         """
         [ADMIN] Show statistics about slot requests
-        Usage: !slotlist
+        Usage: /slotlist
         """
+        # Reads the database before its first reply - acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         tracker = self._get_tracker_for_guild(ctx.guild.id)
         if not tracker:
             await ctx.send("❌ Slot call tracker not initialized for this server")
@@ -1193,7 +1201,7 @@ class SlotCallCommands(commands.Cog):
                 embed.add_field(name="Already Picked", value=str(picked), inline=True)
 
                 if unpicked > 0:
-                    embed.set_footer(text=f"Use !pickslot to pick a random slot from {unpicked} available requests")
+                    embed.set_footer(text=f"Use /pickslot to pick a random slot from {unpicked} available requests")
                 else:
                     embed.set_footer(text="No unpicked requests available")
 
@@ -1203,13 +1211,16 @@ class SlotCallCommands(commands.Cog):
             logger.error(f"Failed to get slot request stats: {e}")
             await ctx.send(f"❌ Error getting slot list: {e}")
 
-    @commands.command(name="clearslots", aliases=["clearrequests", "resetslots"])
+    @commands.hybrid_command(name="clearslots", aliases=["clearrequests", "resetslots"])
     @commands.has_permissions(administrator=True)
     async def clear_slot_requests(self, ctx):
         """
         [ADMIN] Clear all slot requests (useful when starting a new hunt)
-        Usage: !clearslots
+        Usage: /clearslots
         """
+        # Reads the database before its first reply - acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         tracker = self._get_tracker_for_guild(ctx.guild.id)
         if not tracker:
             await ctx.send("❌ Slot call tracker not initialized for this server")

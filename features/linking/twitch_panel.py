@@ -208,7 +208,7 @@ async def setup_twitch_link_panel_system(bot, engine, oauth_url_generator):
         panels[guild.id] = TwitchLinkPanel(bot, engine, oauth_url_generator, guild_id=guild.id)
         logger.debug("✅ Twitch link panel initialized")
 
-    @bot.command(name="createtwitchpanel")
+    @bot.hybrid_command(name="createtwitchpanel")
     @commands.has_permissions(administrator=True)
     async def create_twitch_panel_cmd(ctx):
         """[ADMIN] Create the Twitch link panel in this channel."""

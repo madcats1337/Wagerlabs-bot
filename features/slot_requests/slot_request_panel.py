@@ -814,12 +814,12 @@ class SlotRequestPanelCommands(commands.Cog):
         """Wait for bot to be ready"""
         await self.bot.wait_until_ready()
 
-    @commands.command(name="slotpanel")
+    @commands.hybrid_command(name="slotpanel")
     @commands.has_permissions(administrator=True)
     async def create_slot_panel(self, ctx):
         """
         [ADMIN] Create a slot request panel in this channel
-        Usage: !slotpanel
+        Usage: /slotpanel
         """
         panel = self._get_panel_for_guild(ctx.guild.id)
         if not panel:

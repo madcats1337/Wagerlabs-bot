@@ -626,7 +626,7 @@ async def setup_shuffle_panel_system(bot, engine, settings_getter):
         panels[guild.id] = panel
         logger.debug(f"✅ Shuffle verify panel initialized")
 
-    @bot.command(name="createshufflepanel")
+    @bot.hybrid_command(name="createshufflepanel")
     @commands.has_permissions(administrator=True)
     async def create_shuffle_panel_cmd(ctx):
         """[ADMIN] Create the Shuffle verify panel in this channel"""

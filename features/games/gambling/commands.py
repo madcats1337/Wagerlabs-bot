@@ -1,6 +1,6 @@
 """
 Gambling commands Cog for Discord bot.
-Provides !bj, !roll, !double commands with provably fair outcomes.
+Provides /bj, /roll, /double commands with provably fair outcomes.
 """
 
 import json
@@ -10,6 +10,8 @@ import traceback
 import discord
 from discord.ext import commands
 from sqlalchemy import text
+
+from features.discord_app_commands import defer_slash_response
 
 from .blackjack import format_hand_with_value, is_blackjack, is_bust, play_dealer, resolve_hand
 from .double import WIN_CHANCE, calculate_double_payout
@@ -188,14 +190,17 @@ class GamblingCog(commands.Cog, name="Gambling"):
             return None
 
     # -------------------------------------------------------
-    # !bj <amount> — Blackjack
+    # /bj <amount> — Blackjack
     # -------------------------------------------------------
-    @commands.command(name="bj", aliases=["blackjack"])
+    @commands.hybrid_command(name="bj", aliases=["blackjack"])
     @commands.guild_only()
     async def cmd_blackjack(self, ctx: commands.Context, amount: str = None):
-        """Play blackjack! Usage: !bj <bet_amount>"""
+        """Play blackjack! Usage: /bj <bet_amount>"""
+        # Several DB round-trips run before the first reply - acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         if not amount:
-            await ctx.reply("Usage: `!bj <amount>` — e.g. `!bj 100`", delete_after=15)
+            await ctx.reply("Usage: `/bj <amount>` — e.g. `/bj 100`", delete_after=15)
             return
 
         if not await self._check_gambling_channel(ctx):
@@ -343,15 +348,18 @@ class GamblingCog(commands.Cog, name="Gambling"):
         await ctx.reply(embed=embed, view=view, ephemeral=True)
 
     # -------------------------------------------------------
-    # !roll <amount> — Roll 1-100
+    # /roll <amount> — Roll 1-100
     # -------------------------------------------------------
-    @commands.command(name="roll")
+    @commands.hybrid_command(name="roll")
     @commands.guild_only()
     async def cmd_roll(self, ctx: commands.Context, amount: str = None):
-        """Roll 1-100 for a multiplier! Usage: !roll <bet_amount>"""
+        """Roll 1-100 for a multiplier! Usage: /roll <bet_amount>"""
+        # Several DB round-trips run before the first reply - acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         if not amount:
             await ctx.reply(
-                "Usage: `!roll <amount>` — e.g. `!roll 100`\n"
+                "Usage: `/roll <amount>` — e.g. `/roll 100`\n"
                 "🎯 1 or 100 = **5x** | 🔥 2-5/96-99 = **3x** | ⭐ 6-15/86-95 = **2x**\n"
                 "✅ 16-25/76-85 = **1.5x** | 📉 26-39/62-75 = **0.5x** | 💀 40-61 = **0x**",
                 delete_after=20,
@@ -435,15 +443,18 @@ class GamblingCog(commands.Cog, name="Gambling"):
         await ctx.reply(embed=embed, ephemeral=True)
 
     # -------------------------------------------------------
-    # !double <amount> — 20% chance to double
+    # /double <amount> — 20% chance to double
     # -------------------------------------------------------
-    @commands.command(name="double")
+    @commands.hybrid_command(name="double")
     @commands.guild_only()
     async def cmd_double(self, ctx: commands.Context, amount: str = None):
-        """20% chance to double your bet! Usage: !double <bet_amount>"""
+        """20% chance to double your bet! Usage: /double <bet_amount>"""
+        # Several DB round-trips run before the first reply - acknowledge the slash interaction first.
+        await defer_slash_response(ctx)
+
         if not amount:
             await ctx.reply(
-                f"Usage: `!double <amount>` — e.g. `!double 100`\n"
+                f"Usage: `/double <amount>` — e.g. `/double 100`\n"
                 f"**{WIN_CHANCE:.0f}%** chance to **double** your bet!",
                 delete_after=15,
             )
@@ -528,13 +539,13 @@ class GamblingCog(commands.Cog, name="Gambling"):
         await ctx.reply(embed=embed, ephemeral=True)
 
     # -------------------------------------------------------
-    # !setgamblechannel — Set gambling channel (admin only)
+    # /setgamblechannel — Set gambling channel (admin only)
     # -------------------------------------------------------
-    @commands.command(name="setgamblechannel", aliases=["setgambling"])
+    @commands.hybrid_command(name="setgamblechannel", aliases=["setgambling"])
     @commands.guild_only()
     @commands.has_permissions(manage_guild=True)
     async def cmd_set_gamble_channel(self, ctx: commands.Context, channel: discord.TextChannel = None):
-        """Set the channel for gambling commands. Usage: !setgamblechannel #channel (or no arg to clear)"""
+        """Set the channel for gambling commands. Usage: /setgamblechannel #channel (or no arg to clear)"""
         settings = self._get_guild_settings(ctx.guild.id)
 
         if channel is None:

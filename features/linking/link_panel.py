@@ -225,7 +225,7 @@ async def setup_link_panel_system(bot, engine, oauth_url_generator):
         logger.debug(f"✅ Link panel initialized")
 
     # Add command only once
-    @bot.command(name="createlinkpanel")
+    @bot.hybrid_command(name="createlinkpanel")
     @commands.has_permissions(administrator=True)
     async def create_link_panel_cmd(ctx):
         """[ADMIN] Create the link panel in this channel"""
