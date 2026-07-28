@@ -2143,27 +2143,26 @@ Congratulations! Please contact an admin to claim your prize! 🎊
     async def handle_clips_event(self, action, data):
         """Post a clip uploaded from the dashboard into its configured Discord channel.
 
-        Discord only renders its inline video player for real ATTACHMENTS — a bare
-        link to an .mp4 posts as a plain URL, and a bot cannot set `embed.video`
-        (the same constraint the go-live notification works around). So the bot
-        pulls the bytes back from the dashboard and re-uploads them here.
+        The clip stays hosted on the dashboard; the bot only posts the
+        /clips/watch permalink. That page carries og:video, so Discord unfurls it
+        into an inline player using the poster frame as artwork — the file is
+        never uploaded to Discord and the guild's attachment limit never applies.
 
-        Falls back to posting the link when the file is over the guild's
-        attachment limit, when the download fails, or when the bot lacks
-        Attach Files — a link is worse than a player but better than silence.
+        This MUST stay a plain-content message. Attaching a bot-authored embed
+        suppresses the URL unfurl, which would replace the player with a static
+        card. Same reason the go-live alert posts plain content + a link button.
         """
         if action != "uploaded":
             return
 
         channel_id = data.get("channel_id")
-        clip_url = data.get("clip_url")
-        filename = data.get("filename") or "clip.mp4"
+        watch_url = data.get("watch_url")
+        filename = data.get("filename") or "clip"
         title = (data.get("title") or "").strip()
-        size_bytes = data.get("size_bytes") or 0
         uploaded_by = data.get("uploaded_by")
 
-        if not channel_id or not clip_url:
-            logger.warning("⚠️ Clip upload event missing channel_id or clip_url")
+        if not channel_id or not watch_url:
+            logger.warning("⚠️ Clip upload event missing channel_id or watch_url")
             return
 
         try:
@@ -2174,54 +2173,15 @@ Congratulations! Please contact an admin to claim your prize! 🎊
             logger.error(f"❌ Clip channel {channel_id} unavailable: {e}")
             return
 
-        header = f"**{title}**" if title else "**New clip**"
+        # The bare URL goes on its own line so Discord unfurls it. Subtext (-#)
+        # keeps the attribution from competing with the player.
+        lines = [f"**{title}**" if title else "**New clip**", watch_url]
         if uploaded_by:
-            header += f"\n-# Uploaded by {uploaded_by}"
-
-        # Guild-specific cap (10MB default, higher on boosted servers). Attaching
-        # a file over it fails the whole send, so check before downloading.
-        guild = getattr(channel, "guild", None)
-        size_limit = getattr(guild, "filesize_limit", None) or 10 * 1024 * 1024
-
-        payload = None
-        if 0 < size_bytes <= size_limit:
-            try:
-                import io
-
-                import aiohttp
-
-                timeout = aiohttp.ClientTimeout(total=120)
-                async with aiohttp.ClientSession(timeout=timeout) as http:
-                    async with http.get(clip_url) as resp:
-                        if resp.status == 200:
-                            body = await resp.read()
-                            if 0 < len(body) <= size_limit:
-                                payload = io.BytesIO(body)
-                            else:
-                                logger.warning(f"⚠️ Clip {filename} is {len(body)}B, over the guild limit")
-                        else:
-                            logger.warning(f"⚠️ Failed to fetch clip {clip_url}: HTTP {resp.status}")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not download clip {clip_url}: {e}")
-        elif size_bytes > size_limit:
-            logger.info(
-                f"📎 Clip {filename} ({round(size_bytes / 1024 / 1024, 1)}MB) exceeds this "
-                f"guild's {round(size_limit / 1024 / 1024)}MB attachment limit - posting a link"
-            )
-
-        if payload is not None:
-            try:
-                await channel.send(content=header, file=discord.File(payload, filename=filename))
-                logger.info(f"✅ Clip {filename} attached to channel {channel_id}")
-                return
-            except discord.Forbidden:
-                logger.warning(f"⚠️ Missing Attach Files in channel {channel_id} - falling back to a link")
-            except discord.HTTPException as e:
-                logger.warning(f"⚠️ Discord rejected clip attachment ({e}) - falling back to a link")
+            lines.append(f"-# Uploaded by {uploaded_by}")
 
         try:
-            await channel.send(content=f"{header}\n{clip_url}")
-            logger.info(f"✅ Clip {filename} posted as a link to channel {channel_id}")
+            await channel.send(content="\n".join(lines))
+            logger.info(f"✅ Clip {filename} posted to channel {channel_id}")
         except Exception as e:
             logger.error(f"❌ Failed to post clip to channel {channel_id}: {e}")
 

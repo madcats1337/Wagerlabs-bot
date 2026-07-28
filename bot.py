@@ -2113,6 +2113,24 @@ try:
         except Exception:
             pass  # Columns may already exist
 
+        # Clip hosting columns. Mirrors the dashboard's run_migrations() — the
+        # two Railway services deploy independently and either may boot first.
+        try:
+            conn.execute(
+                text(
+                    """
+                ALTER TABLE clips
+                ADD COLUMN IF NOT EXISTS filename TEXT,
+                ADD COLUMN IF NOT EXISTS file_size BIGINT,
+                ADD COLUMN IF NOT EXISTS thumbnail_url TEXT,
+                ADD COLUMN IF NOT EXISTS video_width INTEGER,
+                ADD COLUMN IF NOT EXISTS video_height INTEGER;
+            """
+                )
+            )
+        except Exception:
+            pass  # Columns may already exist
+
         # Ensure the per-server column exists on the OAuth token tables the BOT
         # READS (twitch_oauth_tokens / kick_oauth_tokens). These tables are created
         # by the dashboard's run_migrations(), but the bot must not depend on the
