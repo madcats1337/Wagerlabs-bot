@@ -114,9 +114,10 @@ USER_AGENTS = [
 # Buffer a quality-efficient rendition instead of blindly taking the highest
 # bitrate offered by the stream. Video remains stream-copied, so the bot avoids
 # a permanent CPU-heavy transcode while retaining a full-HD 1080p default.
-# Operators can opt back into best or choose another
-# yt-dlp selector without a deploy.
-CLIP_BUFFER_FORMAT = os.getenv("CLIP_BUFFER_FORMAT", "best[height<=1080]/best")
+# Resolve one exact full-HD rendition. Falling back to another format can hand
+# FFmpeg the 284x160 first variant from Kick's master playlist.
+CLIP_BUFFER_HEIGHT = 1080
+CLIP_BUFFER_FORMAT = f"best[height={CLIP_BUFFER_HEIGHT}]"
 CLIP_BUFFER_AUDIO_BITRATE = os.getenv("CLIP_BUFFER_AUDIO_BITRATE", "96k")
 CLIP_OUTPUT_CRF = os.getenv("CLIP_OUTPUT_CRF", "24")
 CLIP_OUTPUT_PRESET = os.getenv("CLIP_OUTPUT_PRESET", "fast")
@@ -168,6 +169,8 @@ class StreamBuffer:
         self.ffmpeg_process: Optional[asyncio.subprocess.Process] = None
         self.is_recording = False
         self.stream_url: Optional[str] = None
+        self.input_width: Optional[int] = None
+        self.input_height: Optional[int] = None
         self.started_at: Optional[datetime] = None
         self._monitor_task: Optional[asyncio.Task] = None
         self._clip_create_lock = asyncio.Lock()
@@ -281,13 +284,18 @@ class StreamBuffer:
         # Clean old buffer files
         await self._cleanup_buffer()
 
-        # Use yt-dlp to extract the actual stream URL (handles authentication, format selection, etc.)
+        # Resolve the master playlist to one concrete rendition before handing
+        # it to FFmpeg. Passing the master URL through and mapping 0:v:0 picks
+        # the first variant, which is commonly the 284x160 fallback stream.
         try:
             ytdlp_process = await asyncio.create_subprocess_exec(
                 "yt-dlp",
+                "--ignore-config",
                 "-f",
                 CLIP_BUFFER_FORMAT,
-                "--get-url",
+                "--dump-single-json",
+                "--skip-download",
+                "--no-playlist",
                 "--quiet",
                 "--no-warnings",
                 stream_url,
@@ -295,22 +303,51 @@ class StreamBuffer:
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            stdout, stderr = await asyncio.wait_for(ytdlp_process.communicate(), timeout=15.0)
+            stdout, _ = await asyncio.wait_for(ytdlp_process.communicate(), timeout=15.0)
 
             if ytdlp_process.returncode != 0:
-                logger.info(f"[Buffer] yt-dlp failed, using direct URL")
-                actual_stream_url = stream_url
-            else:
-                actual_stream_url = stdout.decode("utf-8").strip()
+                logger.error(
+                    "[Buffer] yt-dlp could not select a 1080p stream rendition (exit %s)",
+                    ytdlp_process.returncode,
+                )
+                return False
+
+            stream_info = json.loads(stdout)
+            actual_stream_url = (stream_info.get("url") or "").strip()
+            self.input_width = int(stream_info.get("width") or 0) or None
+            self.input_height = int(stream_info.get("height") or 0) or None
+            if not actual_stream_url or not self.input_height:
+                logger.error("[Buffer] yt-dlp returned a rendition without a URL or resolution")
+                return False
+            if self.input_height != CLIP_BUFFER_HEIGHT:
+                logger.error(
+                    "[Buffer] Refusing %sx%s rendition; the clip buffer requires %sp",
+                    self.input_width or "?",
+                    self.input_height,
+                    CLIP_BUFFER_HEIGHT,
+                )
+                return False
+            logger.info(
+                "[Buffer] Selected %sx%s input rendition with %s",
+                self.input_width or "?",
+                self.input_height,
+                CLIP_BUFFER_FORMAT,
+            )
         except asyncio.TimeoutError:
-            logger.info(f"[Buffer] yt-dlp timed out, using direct URL")
-            actual_stream_url = stream_url
+            if ytdlp_process.returncode is None:
+                ytdlp_process.kill()
+                await ytdlp_process.wait()
+            logger.error("[Buffer] yt-dlp timed out while selecting a stream rendition")
+            return False
         except FileNotFoundError:
-            logger.info(f"[Buffer] yt-dlp not found, using direct URL")
-            actual_stream_url = stream_url
+            logger.error("[Buffer] yt-dlp is not installed; refusing an unselected master playlist")
+            return False
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            logger.error("[Buffer] Invalid yt-dlp rendition metadata: %s", e)
+            return False
         except Exception as e:
-            logger.info(f"[Buffer] yt-dlp error: {e}, using direct URL")
-            actual_stream_url = stream_url
+            logger.error("[Buffer] yt-dlp rendition selection failed: %s", e)
+            return False
 
         # Stream-copy the selected video rendition: re-encoding a live buffer
         # continuously is expensive and generationally degrades the image. AAC
@@ -796,6 +833,8 @@ class StreamBuffer:
             "segments_count": len(segments),
             "buffer_seconds": len(segments) * self.segment_duration,
             "started_at": self.started_at.isoformat() if self.started_at else None,
+            "input_width": self.input_width,
+            "input_height": self.input_height,
             "stream_url": self.stream_url[:50] + "..." if self.stream_url else None,
         }
 
