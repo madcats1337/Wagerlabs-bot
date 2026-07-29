@@ -157,13 +157,22 @@ Use `/leaderboard` to see top participants!
             logger.error(f"Error in /fair command: {e}")
             await ctx.send("❌ Could not build the verification link. Please try again.")
 
+    @commands.hybrid_command(name="leaderboard")
+    async def leaderboard(self, ctx, limit: int = 10):
+        """View the raffle ticket leaderboard."""
+        await self._send_raffle_leaderboard(ctx, limit)
+
     @commands.hybrid_command(name="raffleboard", aliases=["raffletop", "rafflerankings"])
     async def raffle_leaderboard(self, ctx, limit: int = 10):
         """
-        View raffle ticket leaderboard
+        Legacy alias for the raffle ticket leaderboard.
         Usage: /raffleboard [limit]
         Example: /raffleboard 20
         """
+        await self._send_raffle_leaderboard(ctx, limit)
+
+    async def _send_raffle_leaderboard(self, ctx, limit: int = 10):
+        """Build and send the raffle ticket leaderboard for either public command."""
         try:
             if limit < 1 or limit > 50:
                 limit = 10
@@ -314,7 +323,7 @@ Get ready to participate when the period starts!
 
 **Commands**:
 • `/tickets` - Check your ticket balance
-• `/raffleboard` - View top participants
+• `/leaderboard` - View top participants
 • **Shuffle Verification** - Create a ticket to link your Shuffle account
                 """
 
@@ -1411,7 +1420,7 @@ Use `/rafflestats @user` to see individual stats
                 f"✅ **Gifted Sub Tickets Restored!**\n"
                 f"• Restored tickets for {restored_count} gifted sub events\n"
                 f"• Total tickets restored: {total_tickets}\n\n"
-                f"Run `/raffleboard` to see updated standings."
+                f"Run `/leaderboard` to see updated standings."
             )
 
             # Update leaderboard

@@ -6952,8 +6952,8 @@ async def grant_link_role_error(ctx, error):
         await ctx.send("❌ Invalid user. Usage: `/grantlinkrole` or `/grantlinkrole @user`")
 
 
-@bot.hybrid_command(name="leaderboard")
-async def cmd_leaderboard(ctx, top: int = 10):
+@bot.hybrid_command(name="watchtimeleaderboard", aliases=["watchtimeboard"])
+async def cmd_watchtime_leaderboard(ctx, top: int = 10):
     """Show top viewers by watchtime."""
     # Reads the database before its first reply — acknowledge the slash interaction first.
     await defer_slash_response(ctx)
@@ -8059,7 +8059,8 @@ async def command_list(ctx):
     embed.add_field(
         name="⏱️ Watchtime & Stats",
         value=(
-            "`/watchtime [user]` - Check your or someone's watchtime\n" "`/leaderboard` - View watchtime leaderboard"
+            "`/watchtime [user]` - Check your or someone's watchtime\n"
+            "`/watchtimeleaderboard` - View watchtime leaderboard"
         ),
         inline=False,
     )
@@ -8076,7 +8077,8 @@ async def command_list(ctx):
         name="🎰 Monthly Raffle",
         value=(
             "`/tickets` - View your raffle tickets\n"
-            "`/raffleboard` - View ticket leaderboard\n"
+            "`/leaderboard` - View ticket leaderboard\n"
+            "`/raffleboard` - View ticket leaderboard (legacy command)\n"
             "`/raffleinfo` - View raffle period information\n"
             "`/fair` - How to verify a provably-fair draw"
         ),
