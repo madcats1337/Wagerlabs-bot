@@ -2140,29 +2140,119 @@ Congratulations! Please contact an admin to claim your prize! 🎊
 
             traceback.print_exc()
 
+    # ------------------------------------------------------------------
+    # Clip buffer ownership
+    #
+    # The bot is the single owner of every rolling buffer. The dashboard cannot
+    # hold one: it runs four gunicorn workers, so an in-process registry meant a
+    # buffer started by one worker was invisible to the other three (status read
+    # "inactive" 3 times in 4, clip creation failed just as often), and worker
+    # recycling killed the ffmpeg process mid-recording.
+    #
+    # The dashboard drives this over Redis and reads state back from
+    # `clip_buffer_status:<server_id>`; results for a clip request come back on
+    # `clip_create_result:<request_id>`, mirroring the raffle-draw pattern.
+    # ------------------------------------------------------------------
+
+    BUFFER_STATUS_TTL = 120
+
+    def _publish_buffer_status(self, server_id, channel_name=None):
+        """Mirror a server's buffer state into Redis for the dashboard to read."""
+        if not server_id:
+            return
+        try:
+            from utils.clip_service import get_clip_manager
+
+            manager = get_clip_manager()
+            buf = manager.get_buffer(channel_name) if channel_name else None
+            payload = {
+                "active": bool(buf and buf.is_recording),
+                "channel": channel_name,
+                "clip_count": buf.get_segment_count() if buf else 0,
+                "updated_at": time.time(),
+            }
+            self.client.setex(
+                f"clip_buffer_status:{server_id}",
+                self.BUFFER_STATUS_TTL,
+                json.dumps(payload),
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Could not publish buffer status for {server_id}: {e}")
+
+    async def _start_buffer(self, server_id, channel_name):
+        """Start (or adopt) the rolling buffer for a channel. Idempotent."""
+        from utils.clip_service import get_clip_manager
+
+        manager = get_clip_manager()
+        existing = manager.get_buffer(channel_name)
+        if existing and existing.is_recording:
+            logger.info(f"🎬 Buffer already recording for {channel_name}")
+            self._publish_buffer_status(server_id, channel_name)
+            return True, "already_running"
+
+        buffer = manager.create_buffer(channel_name)
+        started = await buffer.start()
+        self._publish_buffer_status(server_id, channel_name)
+        if started:
+            logger.info(f"🎬 Buffer started for {channel_name}")
+            return True, "started"
+        logger.warning(f"⚠️ Buffer failed to start for {channel_name} (stream offline?)")
+        return False, "not_live"
+
     async def handle_clips_event(self, action, data):
-        """Post a clip uploaded from the dashboard into its configured Discord channel.
+        """Own the clip buffer and post finished clips to Discord."""
+        server_id = data.get("discord_server_id")
+        channel_name = (data.get("channel") or "").strip() or None
 
-        The clip stays hosted on the dashboard; the bot only posts the
-        /clips/watch permalink. That page carries og:video, so Discord unfurls it
-        into an inline player using the poster frame as artwork — the file is
-        never uploaded to Discord and the guild's attachment limit never applies.
+        if action == "buffer_start":
+            if not channel_name:
+                logger.warning("⚠️ buffer_start without a channel")
+                return
+            with server_context(server_id, None):
+                await self._start_buffer(server_id, channel_name)
+            return
 
-        This MUST stay a plain-content message. Attaching a bot-authored embed
-        suppresses the URL unfurl, which would replace the player with a static
-        card. Same reason the go-live alert posts plain content + a link button.
-        """
+        if action == "buffer_stop":
+            from utils.clip_service import get_clip_manager
+
+            manager = get_clip_manager()
+            buffer = manager.get_buffer(channel_name) if channel_name else None
+            if buffer:
+                await buffer.stop()
+                manager.remove_buffer(channel_name)
+                logger.info(f"🛑 Buffer stopped for {channel_name}")
+            self._publish_buffer_status(server_id, channel_name)
+            return
+
+        if action == "buffer_status":
+            # Refresh on demand so a dashboard poll never reads a stale key.
+            self._publish_buffer_status(server_id, channel_name)
+            return
+
+        if action == "create":
+            await self._handle_clip_create(data)
+            return
+
         if action != "uploaded":
             return
 
-        channel_id = data.get("channel_id")
-        watch_url = data.get("watch_url")
-        filename = data.get("filename") or "clip"
-        title = (data.get("title") or "").strip()
-        uploaded_by = data.get("uploaded_by")
+        await self._post_clip_to_discord(
+            channel_id=data.get("channel_id"),
+            watch_url=data.get("watch_url"),
+            filename=data.get("filename") or "clip",
+            title=(data.get("title") or "").strip(),
+            uploaded_by=data.get("uploaded_by"),
+        )
 
+    async def _post_clip_to_discord(self, *, channel_id, watch_url, filename, title, uploaded_by=None):
+        """Post a clip permalink so Discord unfurls it into a preview.
+
+        MUST stay a plain-content message. Attaching a bot-authored embed
+        suppresses the URL unfurl and replaces the preview with a static card —
+        the same reason the go-live alert posts plain content plus a link button.
+        """
         if not channel_id or not watch_url:
-            logger.warning("⚠️ Clip upload event missing channel_id or watch_url")
+            logger.warning("⚠️ Clip post missing channel_id or watch_url")
             return
 
         try:
@@ -2174,16 +2264,208 @@ Congratulations! Please contact an admin to claim your prize! 🎊
             return
 
         # The bare URL goes on its own line so Discord unfurls it. Subtext (-#)
-        # keeps the attribution from competing with the player.
+        # keeps the attribution from competing with the preview.
         lines = [f"**{title}**" if title else "**New clip**", watch_url]
         if uploaded_by:
-            lines.append(f"-# Uploaded by {uploaded_by}")
+            lines.append(f"-# Clipped by {uploaded_by}")
 
         try:
             await channel.send(content="\n".join(lines))
             logger.info(f"✅ Clip {filename} posted to channel {channel_id}")
         except Exception as e:
             logger.error(f"❌ Failed to post clip to channel {channel_id}: {e}")
+
+    def _store_clip(self, filename, local_path):
+        """Move a finished clip into object storage. Blocking — call in a thread.
+
+        The bot has no Railway volume, so local files are scratch: the clip is
+        only reachable once the bucket holds it, and the dashboard serves it from
+        there. The local copy is dropped afterwards to keep the container disk
+        from filling up over a long stream.
+        """
+        from utils import object_storage
+
+        if not object_storage.is_enabled():
+            logger.error("❌ Object storage not configured on the bot - clip cannot be served")
+            return False
+        if not local_path or not os.path.exists(local_path):
+            logger.error(f"❌ Clip file missing at {local_path}")
+            return False
+
+        ok = object_storage.put_file(object_storage.clip_key(filename), local_path, "video/mp4")
+        if ok:
+            try:
+                os.remove(local_path)
+            except OSError as e:
+                logger.warning(f"⚠️ Could not delete local clip {local_path}: {e}")
+        return ok
+
+    def _server_base_url(self, server_id):
+        """Public origin for a server's dashboard, used to build clip links."""
+        try:
+            from utils.server_urls import get_server_base_url
+
+            return (get_server_base_url(engine, server_id) or "").rstrip("/")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not resolve base URL for {server_id}: {e}")
+            return ""
+
+    def _clip_channel_id(self, server_id):
+        """The Discord channel configured to receive clips, or None."""
+        if not engine or not server_id:
+            return None
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT value FROM bot_settings "
+                        "WHERE key = 'clip_channel_id' AND discord_server_id = :guild_id"
+                    ),
+                    {"guild_id": server_id},
+                ).fetchone()
+            return (row[0] or "").strip() if row and row[0] else None
+        except Exception as e:
+            logger.warning(f"⚠️ Could not read clip_channel_id for {server_id}: {e}")
+            return None
+
+    def _record_clip_row(self, *, server_id, username, title, duration, clip_url, channel_name, filename, file_size):
+        """Insert the clips row that backs the library listing and watch page."""
+        if not engine:
+            return
+        try:
+            with engine.connect() as conn:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO clips (kick_username, clip_title, clip_duration, clip_url,
+                                           discord_server_id, kick_channel, filename, file_size,
+                                           created_at)
+                        VALUES (:username, :title, :duration, :url, :guild_id, :channel,
+                                :filename, :file_size, CURRENT_TIMESTAMP)
+                        """
+                    ),
+                    {
+                        "username": username,
+                        "title": title or None,
+                        "duration": duration,
+                        "url": clip_url,
+                        "guild_id": server_id,
+                        "channel": channel_name,
+                        "filename": filename,
+                        "file_size": file_size,
+                    },
+                )
+                conn.commit()
+        except Exception as e:
+            # The clip is stored and playable; losing the row only costs the
+            # library listing, so this must not fail the request.
+            logger.warning(f"⚠️ Could not record clip {filename}: {e}")
+
+    async def _handle_clip_create(self, data):
+        """Cut a clip from the live buffer, store it, and announce it.
+
+        The reply goes back on a Redis key rather than the pub/sub channel: the
+        dashboard request is still blocked waiting for a concrete result, and
+        pub/sub has no addressing for that. Mirrors the raffle-draw handshake.
+        """
+        request_id = data.get("request_id")
+        server_id = data.get("discord_server_id")
+        channel_name = (data.get("channel") or "").strip()
+        duration = int(data.get("duration") or 30)
+        username = data.get("username") or "dashboard"
+        title = (data.get("title") or "").strip()
+
+        def reply(payload):
+            if not request_id:
+                return
+            try:
+                self.client.setex(f"clip_create_result:{request_id}", 60, json.dumps(payload))
+            except Exception as e:
+                logger.warning(f"⚠️ Could not publish clip result {request_id}: {e}")
+
+        from utils.clip_service import get_clip_manager
+
+        manager = get_clip_manager()
+        buffer = manager.get_buffer(channel_name) if channel_name else None
+
+        if not buffer:
+            reply({"success": False, "error": "no_buffer", "message": f"No buffer running for {channel_name}."})
+            return
+        if not buffer.is_recording:
+            reply(
+                {
+                    "success": False,
+                    "error": "not_recording",
+                    "message": "Buffer is not recording. The stream may have gone offline.",
+                }
+            )
+            return
+        segments = buffer.get_segment_count()
+        if segments < 3:
+            reply(
+                {
+                    "success": False,
+                    "error": "no_segments",
+                    "message": f"Buffer still filling ({segments} segments). Try again in 30 seconds.",
+                }
+            )
+            return
+
+        try:
+            result = await buffer.create_clip(duration, username, title)
+        except Exception as e:
+            logger.error(f"❌ Clip creation failed for {channel_name}: {e}")
+            reply({"success": False, "error": "clip_failed", "message": str(e)})
+            return
+
+        if not result or not result.get("success"):
+            reply(result or {"success": False, "error": "clip_failed", "message": "Failed to create clip"})
+            return
+
+        filename = result.get("filename")
+        local_path = result.get("filepath")
+        stored = await asyncio.to_thread(self._store_clip, filename, local_path)
+        if not stored:
+            reply({"success": False, "error": "storage_failed", "message": "Clip made but could not be stored."})
+            return
+
+        base_url = self._server_base_url(server_id)
+        watch_url = f"{base_url}/clips/watch/{filename}"
+        clip_url = f"{base_url}/clips/file/{filename}"
+        actual_duration = result.get("duration", duration)
+
+        self._record_clip_row(
+            server_id=server_id,
+            username=username,
+            title=title,
+            duration=actual_duration,
+            clip_url=clip_url,
+            channel_name=channel_name,
+            filename=filename,
+            file_size=result.get("file_size", 0),
+        )
+
+        reply(
+            {
+                "success": True,
+                "filename": filename,
+                "clip_url": clip_url,
+                "watch_url": watch_url,
+                "duration": actual_duration,
+            }
+        )
+
+        clip_channel_id = self._clip_channel_id(server_id)
+        if clip_channel_id:
+            await self._post_clip_to_discord(
+                channel_id=clip_channel_id,
+                watch_url=watch_url,
+                filename=filename,
+                title=title,
+                uploaded_by=username,
+            )
+
+        self._publish_buffer_status(server_id, channel_name)
 
     async def handle_subscriptions_event(self, action, data):
         """Handle subscription tier changes from the dashboard.

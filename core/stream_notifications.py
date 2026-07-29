@@ -16,8 +16,6 @@ import logging
 import os
 from typing import Optional
 
-from utils.clip_auth import get_clip_api_key
-
 logger = logging.getLogger(__name__)
 
 
@@ -400,12 +398,19 @@ async def _post_discord_notification(discord_server_id, streamer, title, categor
 
 
 async def _control_clip_buffer(discord_server_id, streamer, is_live, platform):
-    """Start/stop the dashboard clip buffer on go-live/offline. Clips currently
-    target Kick HLS only; for Twitch this is a no-op until clip support lands."""
+    """Start/stop the rolling clip buffer on go-live/offline.
+
+    The buffer now lives in this process, so this drives it directly instead of
+    POSTing to the dashboard's clip API. That round-trip was both redundant and
+    fragile: it depended on resolving a per-server dashboard URL and on the
+    clip API key, and any hiccup in either silently meant no recording. Clips
+    target Kick HLS only; Twitch is a no-op until clip support lands.
+    """
     if platform != "kick":
         return
     try:
-        import aiohttp
+        import os
+
         from sqlalchemy import create_engine, text
 
         db_url = os.getenv("DATABASE_URL")
@@ -418,49 +423,40 @@ async def _control_clip_buffer(discord_server_id, streamer, is_live, platform):
                     """
                     SELECT key, value FROM bot_settings
                     WHERE discord_server_id = :guild_id
-                    AND key IN ('kick_channel', 'dashboard_url', 'bot_api_key', 'clips_auto_start_on_live')
+                    AND key IN ('kick_channel', 'clips_auto_start_on_live')
                     """
                 ),
                 {"guild_id": discord_server_id},
             ).fetchall()
         settings = {key: value for key, value in rows}
-        kick_channel = settings.get("kick_channel")
-        # Prefer the derived per-server base (servers.subdomain + public
-        # domain); the stored dashboard_url is only a stale-prone fallback.
-        from utils.server_urls import get_server_base_url
+        kick_channel = (settings.get("kick_channel") or "").strip()
+        if not kick_channel:
+            return
 
-        dashboard_url = get_server_base_url(engine, discord_server_id) or settings.get("dashboard_url")
-        # Env-controlled system secret first; DB value is a legacy fallback.
-        api_key = get_clip_api_key(settings.get("bot_api_key"))
         auto_start_buffer = str(settings.get("clips_auto_start_on_live", "true")).lower() != "false"
 
-        if not (dashboard_url and api_key and kick_channel):
-            return
-        async with aiohttp.ClientSession() as session:
-            if is_live:
-                if not auto_start_buffer:
-                    logger.info(f"[StreamNotify] ⏸️ Auto-start disabled — skipping clip buffer for {streamer}")
-                    return
-                async with session.post(
-                    f"{dashboard_url}/api/clips/buffer/start",
-                    headers={"X-API-Key": api_key, "Content-Type": "application/json"},
-                    json={"channel": kick_channel, "buffer_minutes": 4},
-                    timeout=30,
-                ) as resp:
-                    if resp.status == 200:
-                        logger.info(f"[StreamNotify] ✅ Clip buffer started for {streamer}")
-                    else:
-                        logger.info(f"[StreamNotify] ⚠️ Failed to start clip buffer: {resp.status}")
+        from utils.clip_service import get_clip_manager
+
+        manager = get_clip_manager()
+
+        if is_live:
+            if not auto_start_buffer:
+                logger.info(f"[StreamNotify] ⏸️ Auto-start disabled — skipping clip buffer for {streamer}")
+                return
+            existing = manager.get_buffer(kick_channel)
+            if existing and existing.is_recording:
+                logger.info(f"[StreamNotify] 🎬 Clip buffer already running for {streamer}")
+                return
+            buffer = manager.create_buffer(kick_channel, buffer_minutes=4)
+            if await buffer.start():
+                logger.info(f"[StreamNotify] ✅ Clip buffer started for {streamer}")
             else:
-                async with session.post(
-                    f"{dashboard_url}/api/clips/buffer/stop",
-                    headers={"X-API-Key": api_key, "Content-Type": "application/json"},
-                    json={"channel": kick_channel},
-                    timeout=10,
-                ) as resp:
-                    if resp.status == 200:
-                        logger.info(f"[StreamNotify] ✅ Clip buffer stopped for {streamer}")
-                    else:
-                        logger.info(f"[StreamNotify] ⚠️ Failed to stop clip buffer: {resp.status}")
+                logger.info(f"[StreamNotify] ⚠️ Clip buffer failed to start for {streamer}")
+        else:
+            buffer = manager.get_buffer(kick_channel)
+            if buffer:
+                await buffer.stop()
+                manager.remove_buffer(kick_channel)
+                logger.info(f"[StreamNotify] ✅ Clip buffer stopped for {streamer}")
     except Exception as e:
         logger.info(f"[StreamNotify] ⚠️ Failed to control clip buffer: {e}")
