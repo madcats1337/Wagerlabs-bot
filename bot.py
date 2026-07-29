@@ -2128,6 +2128,8 @@ try:
                 ADD COLUMN IF NOT EXISTS source_metadata JSONB,
                 ADD COLUMN IF NOT EXISTS optimized_metadata JSONB,
                 ADD COLUMN IF NOT EXISTS optimization_status TEXT NOT NULL DEFAULT 'not_requested',
+                ADD COLUMN IF NOT EXISTS optimization_progress INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS optimization_started_at TIMESTAMPTZ,
                 ADD COLUMN IF NOT EXISTS was_optimized BOOLEAN NOT NULL DEFAULT FALSE;
             """
                 )

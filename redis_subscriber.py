@@ -2300,8 +2300,7 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                     if not await asyncio.to_thread(
                         object_storage.download_file, object_storage.clip_key(filename), source_path
                     ):
-                        await announce(original_watch_url, filename)
-                        return
+                        raise RuntimeError("source clip download failed")
 
                     probe = await asyncio.create_subprocess_exec(
                         "ffprobe",
@@ -2358,7 +2357,8 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                         source_update = conn.execute(
                             text(
                                 "UPDATE clips SET source_metadata = CAST(:metadata AS JSONB), "
-                                "optimization_status = 'processing' "
+                                "optimization_status = 'processing', optimization_progress = 0, "
+                                "optimization_started_at = COALESCE(optimization_started_at, CURRENT_TIMESTAMP) "
                                 "WHERE id = :clip_id AND discord_server_id = :server_id"
                             ),
                             {
@@ -2383,7 +2383,8 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                             conn.execute(
                                 text(
                                     "UPDATE clips SET optimization_status = 'skipped_efficient', "
-                                    "was_optimized = FALSE WHERE id = :clip_id AND discord_server_id = :server_id"
+                                    "optimization_progress = 100, was_optimized = FALSE "
+                                    "WHERE id = :clip_id AND discord_server_id = :server_id"
                                 ),
                                 {"clip_id": int(data["clip_id"]), "server_id": int(server_id)},
                             )
@@ -2419,19 +2420,60 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                         os.getenv("CLIP_BUFFER_AUDIO_BITRATE", "96k"),
                         "-movflags",
                         "+faststart",
+                        "-progress",
+                        "pipe:1",
+                        "-nostats",
                         output_path,
                     ]
                     process = await asyncio.create_subprocess_exec(
                         *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                     )
+                    stderr_task = asyncio.create_task(process.stderr.read())
+
+                    async def monitor_encode_progress():
+                        last_progress = 0
+                        last_update_at = 0.0
+                        while True:
+                            line = await process.stdout.readline()
+                            if not line:
+                                break
+                            key, separator, value = line.decode(errors="replace").strip().partition("=")
+                            if not separator or key not in {"out_time_us", "out_time_ms"} or not duration:
+                                continue
+                            try:
+                                progress = min(99, max(0, int((int(value) / 1_000_000) / duration * 100)))
+                            except (TypeError, ValueError, ZeroDivisionError):
+                                continue
+                            now = time.monotonic()
+                            if progress <= last_progress or now - last_update_at < 1:
+                                continue
+                            with engine.begin() as conn:
+                                conn.execute(
+                                    text(
+                                        "UPDATE clips SET optimization_progress = :progress "
+                                        "WHERE id = :clip_id AND discord_server_id = :server_id "
+                                        "AND optimization_status = 'processing'"
+                                    ),
+                                    {
+                                        "progress": progress,
+                                        "clip_id": int(data["clip_id"]),
+                                        "server_id": int(server_id),
+                                    },
+                                )
+                            last_progress = progress
+                            last_update_at = now
+                        await process.wait()
+                        return await stderr_task
+
                     try:
-                        _, stderr = await asyncio.wait_for(
-                            process.communicate(),
+                        stderr = await asyncio.wait_for(
+                            monitor_encode_progress(),
                             timeout=max(60, int(os.getenv("CLIP_UPLOAD_ENCODE_TIMEOUT_SECONDS", "600"))),
                         )
                     except asyncio.TimeoutError:
                         process.kill()
                         await process.wait()
+                        await stderr_task
                         raise RuntimeError("ffmpeg timed out")
                     if process.returncode != 0:
                         raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')[-500:]}")
@@ -2444,7 +2486,8 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                             conn.execute(
                                 text(
                                     "UPDATE clips SET optimization_status = 'skipped_not_smaller', "
-                                    "was_optimized = FALSE WHERE id = :clip_id AND discord_server_id = :server_id"
+                                    "optimization_progress = 100, was_optimized = FALSE "
+                                    "WHERE id = :clip_id AND discord_server_id = :server_id"
                                 ),
                                 {"clip_id": int(data["clip_id"]), "server_id": int(server_id)},
                             )
@@ -2476,7 +2519,8 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                                 "file_size = :size, video_width = COALESCE(:width, video_width), "
                                 "video_height = COALESCE(:height, video_height), "
                                 "optimized_metadata = CAST(:metadata AS JSONB), "
-                                "optimization_status = 'completed', was_optimized = TRUE "
+                                "optimization_status = 'completed', optimization_progress = 100, "
+                                "was_optimized = TRUE "
                                 "WHERE id = :clip_id AND discord_server_id = :server_id"
                             ),
                             {
