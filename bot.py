@@ -5741,13 +5741,15 @@ async def clip_buffer_management_task():
             # DB value (covers both the live-start and offline-stop calls below).
             bot_api_key = get_clip_api_key(bot_api_key)
 
-            # Skip guilds without required configuration
+            # Skip guilds without required configuration. dashboard_url and
+            # bot_api_key are no longer needed: the buffer lives in this process,
+            # so this loop drives it directly instead of calling the dashboard.
             if not kick_channel:
                 continue
-            if not dashboard_url or not bot_api_key:
-                if guild_id not in clip_buffer_active_by_guild:  # Only log once
-                    logger.info(f"[Clip Buffer] ⚠️ Missing dashboard_url or bot_api_key")
-                continue
+
+            from utils.clip_service import get_clip_manager
+
+            clip_manager = get_clip_manager()
 
             # Get per-guild state
             clip_buffer_active = clip_buffer_active_by_guild.get(guild_id, False)
@@ -5778,51 +5780,32 @@ async def clip_buffer_management_task():
                 else:
                     logger.info(f"[Clip Buffer] 📴 Stream is offline on startup")
 
-            # If stream is live but buffer is not active, check if we need to start it
+            # If stream is live but buffer is not active, check if we need to start it.
+            # The buffer object is right here, so this is a direct read rather
+            # than an HTTP round-trip through the dashboard.
             if is_live and not clip_buffer_active and not should_start_buffer:
-                # Verify buffer status with dashboard
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            f"{dashboard_url}/api/clips/buffer/status?channel={kick_channel}",
-                            timeout=aiohttp.ClientTimeout(total=10),
-                        ) as response:
-                            if response.status == 404:
-                                # No buffer exists, need to start it
-                                logger.info(f"[Clip Buffer] 🔄 Stream is live but no buffer running, starting...")
-                                should_start_buffer = True
-                            elif response.status == 200:
-                                status = await response.json()
-                                if status.get("is_recording"):
-                                    clip_buffer_active_by_guild[guild_id] = True
-                                    logger.info(f"[Clip Buffer] ℹ️ Buffer already running")
-                                else:
-                                    logger.info(f"[Clip Buffer] ⚠️ Buffer exists but not recording, restarting...")
-                                    should_start_buffer = True
-                except Exception as e:
-                    logger.info(f"[Clip Buffer] ⚠️ Error checking buffer status: {e}")
+                buf = clip_manager.get_buffer(kick_channel)
+                if not buf:
+                    logger.info(f"[Clip Buffer] 🔄 Stream is live but no buffer running, starting...")
+                    should_start_buffer = True
+                elif buf.is_recording:
+                    clip_buffer_active_by_guild[guild_id] = True
+                    logger.info(f"[Clip Buffer] ℹ️ Buffer already running")
+                else:
+                    logger.info(f"[Clip Buffer] ⚠️ Buffer exists but not recording, restarting...")
+                    should_start_buffer = True
 
-            # Periodic verification: Even if we think buffer is active, verify with dashboard
+            # Periodic verification: ffmpeg can die without the buffer being removed.
             elif is_live and clip_buffer_active:
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            f"{dashboard_url}/api/clips/buffer/status?channel={kick_channel}",
-                            timeout=aiohttp.ClientTimeout(total=10),
-                        ) as response:
-                            if response.status == 404:
-                                # Buffer disappeared (dashboard restarted?)
-                                logger.info(f"[Clip Buffer] ⚠️ Buffer disappeared! Restarting...")
-                                clip_buffer_active_by_guild[guild_id] = False
-                                should_start_buffer = True
-                            elif response.status == 200:
-                                status = await response.json()
-                                if not status.get("is_recording"):
-                                    logger.info(f"[Clip Buffer] ⚠️ Buffer stopped recording! Restarting...")
-                                    clip_buffer_active_by_guild[guild_id] = False
-                                    should_start_buffer = True
-                except Exception as e:
-                    logger.info(f"[Clip Buffer] ⚠️ Error verifying buffer status: {e}")
+                buf = clip_manager.get_buffer(kick_channel)
+                if not buf:
+                    logger.info(f"[Clip Buffer] ⚠️ Buffer disappeared! Restarting...")
+                    clip_buffer_active_by_guild[guild_id] = False
+                    should_start_buffer = True
+                elif not buf.is_recording:
+                    logger.info(f"[Clip Buffer] ⚠️ Buffer stopped recording! Restarting...")
+                    clip_buffer_active_by_guild[guild_id] = False
+                    should_start_buffer = True
 
             # Handle transition: OFFLINE -> LIVE (or first run while live)
             if ((is_live and not last_stream_live_state) or should_start_buffer) and not auto_start_buffer:
@@ -5854,27 +5837,13 @@ async def clip_buffer_management_task():
                     logger.info(f"[Clip Buffer] ⚠️ Error fetching playback URL: {e}")
 
                 try:
-                    async with aiohttp.ClientSession() as session:
-                        headers = {"X-API-Key": bot_api_key, "Content-Type": "application/json"}
-                        payload = {"channel": kick_channel}
-                        if playback_url:
-                            payload["playback_url"] = playback_url
-
-                        async with session.post(
-                            f"{dashboard_url}/api/clips/buffer/start",
-                            headers=headers,
-                            json=payload,
-                            timeout=aiohttp.ClientTimeout(total=30),
-                        ) as response:
-                            if response.status == 200:
-                                result = await response.json()
-                                clip_buffer_active_by_guild[guild_id] = True
-                                logger.info(f"[Clip Buffer] ✅ Buffer started: {result.get('message', 'OK')}")
-                            else:
-                                response_text = await response.text()
-                                logger.info(
-                                    f"[Clip Buffer] ❌ Failed to start buffer: HTTP {response.status} - {response_text}"
-                                )
+                    buffer = clip_manager.create_buffer(kick_channel, buffer_minutes=4)
+                    if await buffer.start(playback_url):
+                        clip_buffer_active_by_guild[guild_id] = True
+                        logger.info(f"[Clip Buffer] ✅ Buffer started for {kick_channel}")
+                    else:
+                        clip_buffer_active_by_guild[guild_id] = False
+                        logger.info(f"[Clip Buffer] ❌ Failed to start buffer for {kick_channel}")
                 except Exception as e:
                     logger.info(f"[Clip Buffer] ❌ Error starting buffer: {e}")
 
@@ -5882,27 +5851,16 @@ async def clip_buffer_management_task():
             elif not is_live and last_stream_live_state:
                 logger.info(f"[Clip Buffer] 🔴 Stream went OFFLINE! Stopping clip buffer...")
                 try:
-                    async with aiohttp.ClientSession() as session:
-                        headers = {"X-API-Key": bot_api_key, "Content-Type": "application/json"}
-                        async with session.post(
-                            f"{dashboard_url}/api/clips/buffer/stop",
-                            headers=headers,
-                            json={"channel": kick_channel},
-                            timeout=aiohttp.ClientTimeout(total=30),
-                        ) as response:
-                            if response.status == 200:
-                                result = await response.json()
-                                clip_buffer_active_by_guild[guild_id] = False
-                                logger.info(f"[Clip Buffer] ✅ Buffer stopped: {result.get('message', 'OK')}")
-                            elif response.status == 404:
-                                # No buffer was running (auto-start off, start had
-                                # failed, or the dashboard restarted and lost it).
-                                # The desired end state — stopped — already holds.
-                                clip_buffer_active_by_guild[guild_id] = False
-                                logger.info(f"[Clip Buffer] ℹ️ No buffer was running — nothing to stop")
-                            else:
-                                error = await response.text()
-                                logger.info(f"[Clip Buffer] ⚠️ Failed to stop buffer: HTTP {response.status} - {error}")
+                    buffer = clip_manager.get_buffer(kick_channel)
+                    if buffer:
+                        await buffer.stop()
+                        clip_manager.remove_buffer(kick_channel)
+                        logger.info(f"[Clip Buffer] ✅ Buffer stopped for {kick_channel}")
+                    else:
+                        # Auto-start off, or the start had failed. The desired end
+                        # state — stopped — already holds.
+                        logger.info(f"[Clip Buffer] ℹ️ No buffer was running — nothing to stop")
+                    clip_buffer_active_by_guild[guild_id] = False
                 except Exception as e:
                     logger.info(f"[Clip Buffer] ⚠️ Error stopping buffer: {e}")
 
