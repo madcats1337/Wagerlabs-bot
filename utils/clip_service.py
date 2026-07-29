@@ -23,6 +23,7 @@ Architecture:
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -169,6 +170,7 @@ class StreamBuffer:
         self.stream_url: Optional[str] = None
         self.started_at: Optional[datetime] = None
         self._monitor_task: Optional[asyncio.Task] = None
+        self._clip_create_lock = asyncio.Lock()
 
         # Segment tracking
         self.segment_list_file = BUFFER_DIR / f"segments_{channel_name}.txt"
@@ -541,7 +543,20 @@ class StreamBuffer:
 
         return paths
 
-    async def create_clip(self, duration: int = 30, username: str = "", title: str = "") -> Optional[Dict[str, Any]]:
+    async def create_clip(
+        self,
+        duration: int = 30,
+        username: str = "",
+        title: str = "",
+        fast_remux: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Serialize clip cuts so concurrent requests cannot compete for buffer segments."""
+        async with self._clip_create_lock:
+            return await self._create_clip(duration, username, title, fast_remux)
+
+    async def _create_clip(
+        self, duration: int, username: str, title: str, fast_remux: bool
+    ) -> Optional[Dict[str, Any]]:
         """
         Create a clip from the rolling buffer.
 
@@ -549,6 +564,7 @@ class StreamBuffer:
             duration: Clip duration in seconds (max = buffer_minutes * 60)
             username: Who requested the clip
             title: Optional clip title
+            fast_remux: Return a stream-copy clip quickly for later background optimization
 
         Returns:
             Dict with clip info or None if failed
@@ -571,7 +587,9 @@ class StreamBuffer:
         logger.info(f"[Buffer] Creating clip from {len(segments)} segments ({duration}s requested)")
 
         # Generate clip filename with sanitized title
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Include microseconds because the remux path can finish multiple saves
+        # within one second; second-only names could overwrite a prior clip.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
         # Sanitize title for filename (remove special chars, replace spaces with hyphens)
         if title:
@@ -597,9 +615,6 @@ class StreamBuffer:
                 for seg in segments:
                     f.write(f"file '{seg.absolute()}'\n")
 
-            # Re-encode only the finished clip. The rolling buffer remains a
-            # cheap 1080p stream copy, while CRF gives saved clips a materially
-            # smaller variable bitrate without reducing their resolution.
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -609,29 +624,51 @@ class StreamBuffer:
                 "0",
                 "-i",
                 str(concat_file),
-                "-c:v",
-                "libx264",
-                "-preset",
-                CLIP_OUTPUT_PRESET,
-                "-crf",
-                CLIP_OUTPUT_CRF,
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "copy",
-                "-movflags",
-                "+faststart",
-                str(output_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
             ]
+            if fast_remux:
+                # Extension saves prioritize time-to-link. The buffer rendition
+                # is already H.264/AAC at up to 1080p, so remux it without a
+                # generational encode; CRF 24 optimization runs after the clip
+                # is safely stored and no longer blocks the extension UI.
+                cmd.extend(["-c", "copy", "-bsf:a", "aac_adtstoasc"])
+            else:
+                # Dashboard-created clips retain the synchronous CRF path.
+                cmd.extend(
+                    [
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        CLIP_OUTPUT_PRESET,
+                        "-crf",
+                        CLIP_OUTPUT_CRF,
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "copy",
+                    ]
+                )
+            cmd.extend(
+                [
+                    "-movflags",
+                    "+faststart",
+                    str(output_path),
+                ]
+            )
 
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
 
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=CLIP_ENCODE_TIMEOUT_SECONDS)
-
-            # Clean up concat file
-            concat_file.unlink()
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=CLIP_ENCODE_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                raise
 
             if process.returncode != 0:
                 logger.info(f"[Buffer] FFmpeg concat error: {stderr.decode()[:300]}")
@@ -643,6 +680,11 @@ class StreamBuffer:
 
             file_size = output_path.stat().st_size
             actual_duration = len(segments) * self.segment_duration
+            media_details = await self._probe_clip_details(
+                output_path,
+                file_size=file_size,
+                duration=actual_duration,
+            )
 
             # Build clip URL
             base_url = get_clips_base_url()
@@ -663,6 +705,8 @@ class StreamBuffer:
                 "created_at": datetime.now().isoformat(),
                 "file_size": file_size,
                 "file_size_mb": round(file_size / 1024 / 1024, 2),
+                "optimizing": fast_remux,
+                "media_details": media_details,
             }
 
         except asyncio.TimeoutError:
@@ -671,6 +715,57 @@ class StreamBuffer:
         except Exception as e:
             logger.info(f"[Buffer] Error creating clip: {e}")
             return {"error": "exception", "message": str(e)}
+        finally:
+            concat_file.unlink(missing_ok=True)
+
+    async def _probe_clip_details(self, path: Path, *, file_size: int, duration: int) -> Dict[str, Any]:
+        """Read display metadata without delaying the save if ffprobe is unavailable."""
+        details: Dict[str, Any] = {
+            "size_bytes": file_size,
+            "codec": None,
+            "fps": None,
+            "quality": "Original stream",
+            "width": None,
+            "height": None,
+            "duration": duration,
+        }
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,width,height,avg_frame_rate,r_frame_rate",
+                "-of",
+                "json",
+                str(path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
+            if process.returncode != 0:
+                return details
+            payload = json.loads(stdout)
+            video = (payload.get("streams") or [{}])[0]
+            frame_rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1"
+            try:
+                numerator, denominator = frame_rate.split("/", 1)
+                fps = round(float(numerator) / float(denominator), 3) if float(denominator) else None
+            except (AttributeError, TypeError, ValueError):
+                fps = None
+            details.update(
+                {
+                    "codec": video.get("codec_name"),
+                    "fps": fps,
+                    "width": video.get("width"),
+                    "height": video.get("height"),
+                }
+            )
+        except (asyncio.TimeoutError, FileNotFoundError, json.JSONDecodeError, OSError):
+            logger.warning("[Buffer] Could not probe clip details for %s", path.name)
+        return details
 
     def get_segment_count(self) -> int:
         """Get the number of segments currently in the buffer."""

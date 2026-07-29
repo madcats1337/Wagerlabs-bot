@@ -102,7 +102,14 @@ class RedisSubscriber:
         # (with a backstop timeout) so the chat/Discord announcement fires in
         # sync with the on-stream reveal instead of on a fixed timer.
         self._slot_reveal_events = {}
+        self._clip_create_tasks = set()
         self._clip_optimization_tasks = set()
+        try:
+            clip_optimization_concurrency = max(1, int(os.getenv("CLIP_OPTIMIZATION_CONCURRENCY", "1")))
+        except ValueError:
+            logger.warning("Invalid CLIP_OPTIMIZATION_CONCURRENCY; defaulting to 1")
+            clip_optimization_concurrency = 1
+        self._clip_optimization_semaphore = asyncio.Semaphore(clip_optimization_concurrency)
 
         # Ensure point_sales has columns for tracking Discord order notification messages
         try:
@@ -1490,9 +1497,7 @@ class RedisSubscriber:
                             },
                         )
                     if updated.rowcount != 1:
-                        await asyncio.to_thread(object_storage.delete_object, new_key)
-                        logger.warning("Clip %s disappeared before optimization completed", filename)
-                        return
+                        logger.warning("Point sale %s disappeared before notification mapping", sale_id)
             except Exception as e:
                 logger.info(f"[Notifications] WARN: failed to store sale->message mapping: {e}")
         except Exception as e:
@@ -2238,11 +2243,13 @@ Congratulations! Please contact an admin to claim your prize! 🎊
             return
 
         if action == "create":
-            await self._handle_clip_create(data)
+            task = asyncio.create_task(self._handle_clip_create(data))
+            self._clip_create_tasks.add(task)
+            task.add_done_callback(self._clip_create_tasks.discard)
             return
 
         if action == "optimize_uploaded":
-            task = asyncio.create_task(self._handle_uploaded_clip_optimization(data))
+            task = asyncio.create_task(self._run_uploaded_clip_optimization(data))
             self._clip_optimization_tasks.add(task)
             task.add_done_callback(self._clip_optimization_tasks.discard)
             return
@@ -2257,6 +2264,11 @@ Congratulations! Please contact an admin to claim your prize! 🎊
             title=(data.get("title") or "").strip(),
             uploaded_by=data.get("uploaded_by"),
         )
+
+    async def _run_uploaded_clip_optimization(self, data):
+        """Bound CPU-heavy clip encodes so concurrent saves do not starve the bot."""
+        async with self._clip_optimization_semaphore:
+            await self._handle_uploaded_clip_optimization(data)
 
     async def _handle_uploaded_clip_optimization(self, data):
         """Conditionally shrink a manual upload without blocking Redis delivery."""
@@ -2378,7 +2390,8 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                         or width > 1920
                         or height > 1080
                     )
-                    if not compatibility_required and bit_rate and bit_rate <= 5_000_000:
+                    force_optimization = bool(data.get("force_optimization"))
+                    if not force_optimization and not compatibility_required and bit_rate and bit_rate <= 5_000_000:
                         with engine.begin() as conn:
                             conn.execute(
                                 text(
@@ -2481,7 +2494,8 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                     original_size = source_size
                     optimized_size = os.path.getsize(output_path)
                     savings = 1 - (optimized_size / original_size)
-                    if not compatibility_required and savings < 0.15:
+                    minimum_savings = 0 if force_optimization else 0.15
+                    if not compatibility_required and savings <= minimum_savings:
                         with engine.begin() as conn:
                             conn.execute(
                                 text(
@@ -2649,20 +2663,38 @@ Congratulations! Please contact an admin to claim your prize! 🎊
             logger.warning(f"⚠️ Could not read clip_channel_id for {server_id}: {e}")
             return None
 
-    def _record_clip_row(self, *, server_id, username, title, duration, clip_url, channel_name, filename, file_size):
+    def _record_clip_row(
+        self,
+        *,
+        server_id,
+        username,
+        title,
+        duration,
+        clip_url,
+        channel_name,
+        filename,
+        file_size,
+        optimize_async=False,
+    ):
         """Insert the clips row that backs the library listing and watch page."""
         if not engine:
-            return
+            return None
         try:
-            with engine.connect() as conn:
-                conn.execute(
+            with engine.begin() as conn:
+                row = conn.execute(
                     text(
                         """
                         INSERT INTO clips (kick_username, clip_title, clip_duration, clip_url,
                                            discord_server_id, kick_channel, filename, file_size,
-                                           created_at)
+                                           source_metadata, optimization_status,
+                                           optimization_progress, optimization_started_at,
+                                           was_optimized, created_at)
                         VALUES (:username, :title, :duration, :url, :guild_id, :channel,
-                                :filename, :file_size, CURRENT_TIMESTAMP)
+                                :filename, :file_size, CAST(:source_metadata AS JSONB),
+                                :optimization_status, 0,
+                                CASE WHEN :optimize_async THEN CURRENT_TIMESTAMP ELSE NULL END,
+                                FALSE, CURRENT_TIMESTAMP)
+                        RETURNING id
                         """
                     ),
                     {
@@ -2674,13 +2706,24 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                         "channel": channel_name,
                         "filename": filename,
                         "file_size": file_size,
+                        "source_metadata": json.dumps(
+                            {
+                                "size_bytes": file_size,
+                                "codec": "h264",
+                                "quality": "Original stream",
+                                "duration": duration,
+                            }
+                        ),
+                        "optimization_status": "pending" if optimize_async else "not_requested",
+                        "optimize_async": optimize_async,
                     },
-                )
-                conn.commit()
+                ).fetchone()
+                return row[0] if row else None
         except Exception as e:
             # The clip is stored and playable; losing the row only costs the
             # library listing, so this must not fail the request.
             logger.warning(f"⚠️ Could not record clip {filename}: {e}")
+            return None
 
     async def _handle_clip_create(self, data):
         """Cut a clip from the live buffer, store it, and announce it.
@@ -2695,6 +2738,7 @@ Congratulations! Please contact an admin to claim your prize! 🎊
         duration = int(data.get("duration") or 30)
         username = data.get("username") or "dashboard"
         title = (data.get("title") or "").strip()
+        optimize_async = bool(data.get("optimize_async"))
 
         def reply(payload):
             if not request_id:
@@ -2744,7 +2788,12 @@ Congratulations! Please contact an admin to claim your prize! 🎊
             return
 
         try:
-            result = await buffer.create_clip(duration, username, title)
+            result = await buffer.create_clip(
+                duration,
+                username,
+                title,
+                fast_remux=optimize_async,
+            )
         except Exception as e:
             logger.error(f"❌ Clip creation failed for {channel_name}: {e}")
             reply({"success": False, "error": "clip_failed", "message": str(e)})
@@ -2766,7 +2815,7 @@ Congratulations! Please contact an admin to claim your prize! 🎊
         clip_url = f"{base_url}/clips/file/{filename}"
         actual_duration = result.get("duration", duration)
 
-        self._record_clip_row(
+        clip_id = self._record_clip_row(
             server_id=server_id,
             username=username,
             title=title,
@@ -2775,6 +2824,7 @@ Congratulations! Please contact an admin to claim your prize! 🎊
             channel_name=channel_name,
             filename=filename,
             file_size=result.get("file_size", 0),
+            optimize_async=optimize_async,
         )
 
         reply(
@@ -2784,8 +2834,28 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                 "clip_url": clip_url,
                 "watch_url": watch_url,
                 "duration": actual_duration,
+                "optimizing": bool(optimize_async and clip_id),
+                "media_details": result.get("media_details"),
             }
         )
+
+        if optimize_async and clip_id:
+            task = asyncio.create_task(
+                self._run_uploaded_clip_optimization(
+                    {
+                        "clip_id": clip_id,
+                        "filename": filename,
+                        "watch_url": watch_url,
+                        "title": title,
+                        "uploaded_by": username,
+                        "discord_server_id": server_id,
+                        "channel_id": None,
+                        "force_optimization": True,
+                    }
+                )
+            )
+            self._clip_optimization_tasks.add(task)
+            task.add_done_callback(self._clip_optimization_tasks.discard)
 
         clip_channel_id = self._clip_channel_id(server_id)
         if clip_channel_id:
