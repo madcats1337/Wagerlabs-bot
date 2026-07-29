@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 from datetime import datetime
 
@@ -101,6 +102,7 @@ class RedisSubscriber:
         # (with a backstop timeout) so the chat/Discord announcement fires in
         # sync with the on-stream reveal instead of on a fixed timer.
         self._slot_reveal_events = {}
+        self._clip_optimization_tasks = set()
 
         # Ensure point_sales has columns for tracking Discord order notification messages
         try:
@@ -1469,8 +1471,10 @@ class RedisSubscriber:
             # Store message mapping so we can edit it on status changes
             try:
                 if sale_id is not None and engine is not None:
+                    if engine is None:
+                        raise RuntimeError("database unavailable")
                     with engine.begin() as conn:
-                        conn.execute(
+                        updated = conn.execute(
                             text(
                                 """
                             UPDATE point_sales
@@ -1485,6 +1489,11 @@ class RedisSubscriber:
                                 "sale_id": int(sale_id),
                             },
                         )
+                    if updated.rowcount != 1:
+                        if optimized_filename != filename:
+                            await asyncio.to_thread(object_storage.delete_object, new_key)
+                        logger.warning("Clip %s disappeared before optimization completed", filename)
+                        return
             except Exception as e:
                 logger.info(f"[Notifications] WARN: failed to store sale->message mapping: {e}")
         except Exception as e:
@@ -2233,6 +2242,12 @@ Congratulations! Please contact an admin to claim your prize! 🎊
             await self._handle_clip_create(data)
             return
 
+        if action == "optimize_uploaded":
+            task = asyncio.create_task(self._handle_uploaded_clip_optimization(data))
+            self._clip_optimization_tasks.add(task)
+            task.add_done_callback(self._clip_optimization_tasks.discard)
+            return
+
         if action != "uploaded":
             return
 
@@ -2243,6 +2258,182 @@ Congratulations! Please contact an admin to claim your prize! 🎊
             title=(data.get("title") or "").strip(),
             uploaded_by=data.get("uploaded_by"),
         )
+
+    async def _handle_uploaded_clip_optimization(self, data):
+        """Conditionally shrink a manual upload without blocking Redis delivery."""
+        server_id = data.get("discord_server_id")
+        filename = os.path.basename(data.get("filename") or "")
+        original_watch_url = data.get("watch_url")
+
+        async def announce(watch_url, announced_filename):
+            await self._post_clip_to_discord(
+                channel_id=data.get("channel_id"),
+                watch_url=watch_url,
+                filename=announced_filename,
+                title=(data.get("title") or "").strip(),
+                uploaded_by=data.get("uploaded_by"),
+            )
+
+        if not filename or not data.get("clip_id"):
+            logger.warning("Clip optimization event missing clip id or filename")
+            await announce(original_watch_url, filename or "clip")
+            return
+
+        lock_key = f"clip_optimize:{server_id}:{data['clip_id']}"
+        try:
+            if self.client and not self.client.set(lock_key, "1", nx=True, ex=600):
+                logger.info("Clip optimization already claimed for %s", filename)
+                return
+        except Exception as e:
+            logger.warning("Could not claim clip optimization lock for %s: %s", filename, e)
+
+        from utils import object_storage
+
+        with server_context(server_id, None):
+            try:
+                with tempfile.TemporaryDirectory(prefix="wagerlabs-clip-") as temp_dir:
+                    source_path = os.path.join(temp_dir, filename)
+                    if not await asyncio.to_thread(
+                        object_storage.download_file, object_storage.clip_key(filename), source_path
+                    ):
+                        await announce(original_watch_url, filename)
+                        return
+
+                    probe = await asyncio.create_subprocess_exec(
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "stream=codec_type,codec_name,pix_fmt,width,height:format=bit_rate,duration",
+                        "-of",
+                        "json",
+                        source_path,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    try:
+                        stdout, stderr = await asyncio.wait_for(probe.communicate(), timeout=30)
+                    except asyncio.TimeoutError:
+                        probe.kill()
+                        await probe.wait()
+                        raise RuntimeError("ffprobe timed out")
+                    if probe.returncode != 0:
+                        raise RuntimeError(f"ffprobe failed: {stderr.decode(errors='replace')[:300]}")
+
+                    metadata = json.loads(stdout)
+                    streams = metadata.get("streams") or []
+                    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+                    audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
+                    width = int(video.get("width") or 0)
+                    height = int(video.get("height") or 0)
+                    scale_factor = min(1.0, 1920 / width, 1080 / height) if width and height else 1.0
+                    output_width = max(2, int(width * scale_factor) // 2 * 2) if width else None
+                    output_height = max(2, int(height * scale_factor) // 2 * 2) if height else None
+                    bit_rate = int((metadata.get("format") or {}).get("bit_rate") or 0)
+                    compatibility_required = (
+                        filename.lower().endswith(".webm")
+                        or video.get("codec_name") != "h264"
+                        or video.get("pix_fmt") != "yuv420p"
+                        or audio.get("codec_name") not in {None, "aac"}
+                        or width > 1920
+                        or height > 1080
+                    )
+                    if not compatibility_required and bit_rate and bit_rate <= 5_000_000:
+                        logger.info("Clip %s already uses an efficient compatible encoding", filename)
+                        await announce(original_watch_url, filename)
+                        return
+
+                    stem = os.path.splitext(filename)[0]
+                    optimized_filename = f"{stem}.mp4"
+                    output_path = os.path.join(temp_dir, f"{stem}-optimized.mp4")
+                    command = [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        source_path,
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "0:a:0?",
+                        "-vf",
+                        "scale=min(1920\\,iw):min(1080\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        os.getenv("CLIP_OUTPUT_PRESET", "fast"),
+                        "-crf",
+                        os.getenv("CLIP_OUTPUT_CRF", "24"),
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        os.getenv("CLIP_BUFFER_AUDIO_BITRATE", "96k"),
+                        "-movflags",
+                        "+faststart",
+                        output_path,
+                    ]
+                    process = await asyncio.create_subprocess_exec(
+                        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                    )
+                    try:
+                        _, stderr = await asyncio.wait_for(
+                            process.communicate(),
+                            timeout=max(60, int(os.getenv("CLIP_UPLOAD_ENCODE_TIMEOUT_SECONDS", "600"))),
+                        )
+                    except asyncio.TimeoutError:
+                        process.kill()
+                        await process.wait()
+                        raise RuntimeError("ffmpeg timed out")
+                    if process.returncode != 0:
+                        raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')[-500:]}")
+
+                    original_size = os.path.getsize(source_path)
+                    optimized_size = os.path.getsize(output_path)
+                    savings = 1 - (optimized_size / original_size)
+                    if not compatibility_required and savings < 0.15:
+                        logger.info("Keeping original %s; optimization saved only %.1f%%", filename, savings * 100)
+                        await announce(original_watch_url, filename)
+                        return
+
+                    new_key = object_storage.clip_key(optimized_filename)
+                    if not await asyncio.to_thread(object_storage.put_file, new_key, output_path, "video/mp4"):
+                        raise RuntimeError("optimized upload failed")
+
+                    base_url = self._server_base_url(server_id)
+                    clip_url = f"{base_url}/clips/file/{optimized_filename}"
+                    watch_url = f"{base_url}/clips/watch/{optimized_filename}"
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                "UPDATE clips SET filename = :filename, clip_url = :clip_url, "
+                                "file_size = :size, video_width = COALESCE(:width, video_width), "
+                                "video_height = COALESCE(:height, video_height) "
+                                "WHERE id = :clip_id AND discord_server_id = :server_id"
+                            ),
+                            {
+                                "filename": optimized_filename,
+                                "clip_url": clip_url,
+                                "size": optimized_size,
+                                "width": output_width,
+                                "height": output_height,
+                                "clip_id": int(data["clip_id"]),
+                                "server_id": int(server_id),
+                            },
+                        )
+                    if optimized_filename != filename:
+                        await asyncio.to_thread(object_storage.delete_object, object_storage.clip_key(filename))
+                    logger.info(
+                        "Optimized clip %s: %.1fMB -> %.1fMB (%.1f%% smaller)",
+                        filename,
+                        original_size / 1024 / 1024,
+                        optimized_size / 1024 / 1024,
+                        savings * 100,
+                    )
+                    await announce(watch_url, optimized_filename)
+            except Exception as e:
+                logger.error("Clip optimization failed for %s: %s", filename, e, exc_info=True)
+                await announce(original_watch_url, filename)
 
     async def _post_clip_to_discord(self, *, channel_id, watch_url, filename, title, uploaded_by=None):
         """Post a clip permalink so Discord unfurls it into a preview.

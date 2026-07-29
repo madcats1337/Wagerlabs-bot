@@ -235,6 +235,25 @@ def put_file(key, path, content_type):
     client = get_client()
     if client is None:
         return False
+    try:
+        client.upload_file(path, _BUCKET, key, ExtraArgs={"ContentType": content_type})
+        return True
+    except Exception as e:
+        logger.error(f"[ObjectStorage] upload failed for {key}: {e}")
+        return False
+
+
+def download_file(key, path):
+    """Stream an object to a local scratch path for background processing."""
+    client = get_client()
+    if client is None:
+        return False
+    try:
+        client.download_file(_BUCKET, key, path)
+        return True
+    except Exception as e:
+        logger.error(f"[ObjectStorage] download failed for {key}: {e}")
+        return False
 
 
 def delete_object(key):
