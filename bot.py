@@ -2124,7 +2124,11 @@ try:
                 ADD COLUMN IF NOT EXISTS file_size BIGINT,
                 ADD COLUMN IF NOT EXISTS thumbnail_url TEXT,
                 ADD COLUMN IF NOT EXISTS video_width INTEGER,
-                ADD COLUMN IF NOT EXISTS video_height INTEGER;
+                ADD COLUMN IF NOT EXISTS video_height INTEGER,
+                ADD COLUMN IF NOT EXISTS source_metadata JSONB,
+                ADD COLUMN IF NOT EXISTS optimized_metadata JSONB,
+                ADD COLUMN IF NOT EXISTS optimization_status TEXT NOT NULL DEFAULT 'not_requested',
+                ADD COLUMN IF NOT EXISTS was_optimized BOOLEAN NOT NULL DEFAULT FALSE;
             """
                 )
             )

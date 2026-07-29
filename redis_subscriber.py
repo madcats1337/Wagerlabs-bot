@@ -1490,8 +1490,7 @@ class RedisSubscriber:
                             },
                         )
                     if updated.rowcount != 1:
-                        if optimized_filename != filename:
-                            await asyncio.to_thread(object_storage.delete_object, new_key)
+                        await asyncio.to_thread(object_storage.delete_object, new_key)
                         logger.warning("Clip %s disappeared before optimization completed", filename)
                         return
             except Exception as e:
@@ -2304,7 +2303,7 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                         "-v",
                         "error",
                         "-show_entries",
-                        "stream=codec_type,codec_name,pix_fmt,width,height:format=bit_rate,duration",
+                        "stream=codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,r_frame_rate:format=bit_rate,duration",
                         "-of",
                         "json",
                         source_path,
@@ -2330,6 +2329,42 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                     output_width = max(2, int(width * scale_factor) // 2 * 2) if width else None
                     output_height = max(2, int(height * scale_factor) // 2 * 2) if height else None
                     bit_rate = int((metadata.get("format") or {}).get("bit_rate") or 0)
+                    duration = float((metadata.get("format") or {}).get("duration") or 0)
+                    frame_rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1"
+                    try:
+                        numerator, denominator = frame_rate.split("/", 1)
+                        fps = round(float(numerator) / float(denominator), 3) if float(denominator) else None
+                    except (TypeError, ValueError):
+                        fps = None
+                    source_size = os.path.getsize(source_path)
+                    source_metadata = {
+                        "size_bytes": source_size,
+                        "codec": video.get("codec_name"),
+                        "fps": fps,
+                        "quality": "Original",
+                        "width": width or None,
+                        "height": height or None,
+                        "duration": round(duration, 3) if duration else None,
+                        "bitrate": bit_rate or None,
+                    }
+                    if engine is None:
+                        raise RuntimeError("database unavailable")
+                    with engine.begin() as conn:
+                        source_update = conn.execute(
+                            text(
+                                "UPDATE clips SET source_metadata = CAST(:metadata AS JSONB), "
+                                "optimization_status = 'processing' "
+                                "WHERE id = :clip_id AND discord_server_id = :server_id"
+                            ),
+                            {
+                                "metadata": json.dumps(source_metadata),
+                                "clip_id": int(data["clip_id"]),
+                                "server_id": int(server_id),
+                            },
+                        )
+                    if source_update.rowcount != 1:
+                        logger.warning("Clip %s disappeared before it could be inspected", filename)
+                        return
                     compatibility_required = (
                         filename.lower().endswith(".webm")
                         or video.get("codec_name") != "h264"
@@ -2339,6 +2374,14 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                         or height > 1080
                     )
                     if not compatibility_required and bit_rate and bit_rate <= 5_000_000:
+                        with engine.begin() as conn:
+                            conn.execute(
+                                text(
+                                    "UPDATE clips SET optimization_status = 'skipped_efficient', "
+                                    "was_optimized = FALSE WHERE id = :clip_id AND discord_server_id = :server_id"
+                                ),
+                                {"clip_id": int(data["clip_id"]), "server_id": int(server_id)},
+                            )
                         logger.info("Clip %s already uses an efficient compatible encoding", filename)
                         await announce(original_watch_url, filename)
                         return
@@ -2388,10 +2431,18 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                     if process.returncode != 0:
                         raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')[-500:]}")
 
-                    original_size = os.path.getsize(source_path)
+                    original_size = source_size
                     optimized_size = os.path.getsize(output_path)
                     savings = 1 - (optimized_size / original_size)
                     if not compatibility_required and savings < 0.15:
+                        with engine.begin() as conn:
+                            conn.execute(
+                                text(
+                                    "UPDATE clips SET optimization_status = 'skipped_not_smaller', "
+                                    "was_optimized = FALSE WHERE id = :clip_id AND discord_server_id = :server_id"
+                                ),
+                                {"clip_id": int(data["clip_id"]), "server_id": int(server_id)},
+                            )
                         logger.info("Keeping original %s; optimization saved only %.1f%%", filename, savings * 100)
                         await announce(original_watch_url, filename)
                         return
@@ -2403,12 +2454,24 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                     base_url = self._server_base_url(server_id)
                     clip_url = f"{base_url}/clips/file/{optimized_filename}"
                     watch_url = f"{base_url}/clips/watch/{optimized_filename}"
+                    optimized_metadata = {
+                        "size_bytes": optimized_size,
+                        "codec": "h264",
+                        "fps": fps,
+                        "quality": f"CRF {os.getenv('CLIP_OUTPUT_CRF', '24')}",
+                        "width": output_width,
+                        "height": output_height,
+                        "duration": round(duration, 3) if duration else None,
+                        "bitrate": round(optimized_size * 8 / duration) if duration else None,
+                    }
                     with engine.begin() as conn:
-                        conn.execute(
+                        updated = conn.execute(
                             text(
                                 "UPDATE clips SET filename = :filename, clip_url = :clip_url, "
                                 "file_size = :size, video_width = COALESCE(:width, video_width), "
-                                "video_height = COALESCE(:height, video_height) "
+                                "video_height = COALESCE(:height, video_height), "
+                                "optimized_metadata = CAST(:metadata AS JSONB), "
+                                "optimization_status = 'completed', was_optimized = TRUE "
                                 "WHERE id = :clip_id AND discord_server_id = :server_id"
                             ),
                             {
@@ -2417,10 +2480,16 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                                 "size": optimized_size,
                                 "width": output_width,
                                 "height": output_height,
+                                "metadata": json.dumps(optimized_metadata),
                                 "clip_id": int(data["clip_id"]),
                                 "server_id": int(server_id),
                             },
                         )
+                    if updated.rowcount != 1:
+                        if optimized_filename != filename:
+                            await asyncio.to_thread(object_storage.delete_object, new_key)
+                        logger.warning("Clip %s disappeared before optimization completed", filename)
+                        return
                     if optimized_filename != filename:
                         await asyncio.to_thread(object_storage.delete_object, object_storage.clip_key(filename))
                     logger.info(
@@ -2433,6 +2502,18 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                     await announce(watch_url, optimized_filename)
             except Exception as e:
                 logger.error("Clip optimization failed for %s: %s", filename, e, exc_info=True)
+                if engine is not None and data.get("clip_id") and server_id:
+                    try:
+                        with engine.begin() as conn:
+                            conn.execute(
+                                text(
+                                    "UPDATE clips SET optimization_status = 'failed' "
+                                    "WHERE id = :clip_id AND discord_server_id = :server_id"
+                                ),
+                                {"clip_id": int(data["clip_id"]), "server_id": int(server_id)},
+                            )
+                    except Exception as update_error:
+                        logger.warning("Could not mark clip optimization failed: %s", update_error)
                 await announce(original_watch_url, filename)
 
     async def _post_clip_to_discord(self, *, channel_id, watch_url, filename, title, uploaded_by=None):
