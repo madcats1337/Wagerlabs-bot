@@ -2265,6 +2265,11 @@ Congratulations! Please contact an admin to claim your prize! 🎊
         original_watch_url = data.get("watch_url")
 
         async def announce(watch_url, announced_filename):
+            # New uploads are stored and optimized independently from Discord
+            # delivery. Retain support for older events that explicitly included
+            # a channel, without producing a misleading missing-channel warning.
+            if not data.get("channel_id"):
+                return
             await self._post_clip_to_discord(
                 channel_id=data.get("channel_id"),
                 watch_url=watch_url,
