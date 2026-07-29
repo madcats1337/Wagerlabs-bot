@@ -110,6 +110,17 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
 
+# Buffer a quality-efficient rendition instead of blindly taking the highest
+# bitrate offered by the stream. Video remains stream-copied, so the bot avoids
+# a permanent CPU-heavy transcode while retaining a full-HD 1080p default.
+# Operators can opt back into best or choose another
+# yt-dlp selector without a deploy.
+CLIP_BUFFER_FORMAT = os.getenv("CLIP_BUFFER_FORMAT", "best[height<=1080]/best")
+CLIP_BUFFER_AUDIO_BITRATE = os.getenv("CLIP_BUFFER_AUDIO_BITRATE", "96k")
+CLIP_OUTPUT_CRF = os.getenv("CLIP_OUTPUT_CRF", "24")
+CLIP_OUTPUT_PRESET = os.getenv("CLIP_OUTPUT_PRESET", "fast")
+CLIP_ENCODE_TIMEOUT_SECONDS = max(30, int(os.getenv("CLIP_ENCODE_TIMEOUT_SECONDS", "120")))
+
 
 # Base URL for serving clips (set from environment)
 def get_clips_base_url():
@@ -273,7 +284,7 @@ class StreamBuffer:
             ytdlp_process = await asyncio.create_subprocess_exec(
                 "yt-dlp",
                 "-f",
-                "best",
+                CLIP_BUFFER_FORMAT,
                 "--get-url",
                 "--quiet",
                 "--no-warnings",
@@ -299,8 +310,10 @@ class StreamBuffer:
             logger.info(f"[Buffer] yt-dlp error: {e}, using direct URL")
             actual_stream_url = stream_url
 
-        # Build FFmpeg command for rolling buffer
-        # Based on working Kick.com recorder: ffmpeg -i "$URL" -map '0' -tune 'zerolatency' -y -c:v copy "$output"
+        # Stream-copy the selected video rendition: re-encoding a live buffer
+        # continuously is expensive and generationally degrades the image. AAC
+        # is already transcoded for compatibility, so use a speech/music-safe
+        # 96 kbps stereo target rather than FFmpeg's larger default.
         segment_pattern = str(BUFFER_DIR / f"seg_{self.channel_name}_%04d.ts")
 
         cmd = [
@@ -309,13 +322,17 @@ class StreamBuffer:
             "-i",
             actual_stream_url,
             "-map",
-            "0",  # Map all streams
-            "-tune",
-            "zerolatency",  # Low latency tuning for live streams
+            "0:v:0",
+            "-map",
+            "0:a:0?",
             "-c:v",
             "copy",  # Copy video (no re-encode)
             "-c:a",
             "aac",  # Re-encode audio to AAC
+            "-b:a",
+            CLIP_BUFFER_AUDIO_BITRATE,
+            "-ac",
+            "2",
             "-f",
             "segment",
             "-segment_time",
@@ -580,7 +597,9 @@ class StreamBuffer:
                 for seg in segments:
                     f.write(f"file '{seg.absolute()}'\n")
 
-            # Concatenate segments into MP4
+            # Re-encode only the finished clip. The rolling buffer remains a
+            # cheap 1080p stream copy, while CRF gives saved clips a materially
+            # smaller variable bitrate without reducing their resolution.
             cmd = [
                 "ffmpeg",
                 "-y",
@@ -590,7 +609,15 @@ class StreamBuffer:
                 "0",
                 "-i",
                 str(concat_file),
-                "-c",
+                "-c:v",
+                "libx264",
+                "-preset",
+                CLIP_OUTPUT_PRESET,
+                "-crf",
+                CLIP_OUTPUT_CRF,
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
                 "copy",
                 "-movflags",
                 "+faststart",
@@ -601,7 +628,7 @@ class StreamBuffer:
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
 
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=CLIP_ENCODE_TIMEOUT_SECONDS)
 
             # Clean up concat file
             concat_file.unlink()

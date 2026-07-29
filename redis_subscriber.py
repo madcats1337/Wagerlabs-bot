@@ -2379,7 +2379,18 @@ Congratulations! Please contact an admin to claim your prize! 🎊
             if not request_id:
                 return
             try:
-                self.client.setex(f"clip_create_result:{request_id}", 60, json.dumps(payload))
+                # Pushed onto a list, not SET: the dashboard waits with BLPOP, so
+                # it wakes the instant this lands instead of polling for it. The
+                # expiry covers the case where the caller already timed out.
+                key = f"clip_create_result_v2:{request_id}"
+                legacy_key = f"clip_create_result:{request_id}"
+                pipe = self.client.pipeline()
+                pipe.rpush(key, json.dumps(payload))
+                pipe.expire(key, 120)
+                # Keep the old string response during the rolling-deploy
+                # window. Older dashboard workers still GET this key.
+                pipe.setex(legacy_key, 60, json.dumps(payload))
+                pipe.execute()
             except Exception as e:
                 logger.warning(f"⚠️ Could not publish clip result {request_id}: {e}")
 
@@ -2492,6 +2503,25 @@ Congratulations! Please contact an admin to claim your prize! 🎊
         handler so watchtime/points/!commands/bonus-hunt/slot/GTB work for Twitch."""
         event_type = payload.get("type")
         data = payload.get("data", {}) or {}
+
+        if event_type == "oauth_notification":
+            # The OAuth server runs in its own gunicorn process and publishes here
+            # after committing a link row. Replaces a 5-second poll of the table;
+            # bot.py keeps a slow sweep in case this event is missed.
+            try:
+                import sys as _sys
+
+                _main = _sys.modules.get("__main__")
+                process = getattr(_main, "process_oauth_notifications", None)
+                if process is None:
+                    from bot import process_oauth_notifications as process
+                # Discord and database work can take seconds. Keep the shared
+                # bot_events subscriber free to consume Twitch chat and other
+                # realtime events while the drain runs in the background.
+                asyncio.create_task(process())
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to process oauth notification event: {e}")
+            return
 
         if event_type != "twitch_chat_message":
             logger.debug(f"[bot_events] Ignoring unknown type: {event_type}")

@@ -5002,9 +5002,14 @@ async def before_update_discord_usernames():
 # -------------------------
 # Cleanup expired verification codes and old chat data
 # -------------------------
-@tasks.loop(seconds=5)  # Check every 5 seconds for fast response
-async def check_oauth_notifications_task():
-    """Check for OAuth link success notifications and send Discord messages."""
+async def process_oauth_notifications():
+    """Send Discord messages for any pending OAuth link notifications.
+
+    Called two ways: immediately when the OAuth server publishes an
+    `oauth_notification` event over Redis (the normal path), and by the slow
+    sweep below as a backstop. Draining is idempotent — rows are marked
+    processed inside the same transaction — so overlapping calls are safe.
+    """
     try:
         with engine.begin() as conn:
             # Get unprocessed notifications
@@ -5016,6 +5021,7 @@ async def check_oauth_notifications_task():
                 WHERE processed = FALSE AND kick_username != ''
                 ORDER BY created_at ASC
                 LIMIT 10
+                FOR UPDATE SKIP LOCKED
             """
                 )
             ).fetchall()
@@ -5242,8 +5248,23 @@ async def check_oauth_notifications_task():
                         {"id": notification_id},
                     )
 
+            return len(notifications)
     except Exception as e:
         logger.error(f"⚠️ Error in OAuth notifications task: {e}")
+        return 0
+
+
+# Backstop only. Links are delivered by the Redis `oauth_notification` event, so
+# this exists purely to catch rows published while the bot was restarting —
+# pub/sub has no delivery guarantee. It used to run every 5 seconds, which meant
+# ~17,000 queries a day against the database for an event that fires a handful of
+# times.
+@tasks.loop(minutes=5)
+async def check_oauth_notifications_task():
+    # Drain every missed batch in one recovery run. Yield between batches so a
+    # restart backlog cannot monopolize the event loop.
+    while await process_oauth_notifications() == 10:
+        await asyncio.sleep(0)
 
 
 @tasks.loop(minutes=60)  # Twitch requires hourly validation; also refresh proactively

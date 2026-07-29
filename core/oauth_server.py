@@ -68,6 +68,35 @@ else:
     logger.info(f"[OAuth] WARNING: FLASK_SECRET_KEY not set, using random key!")
 
 
+def notify_oauth_link_written():
+    """Tell the bot an oauth_notifications row is waiting.
+
+    This runs in the OAuth gunicorn process; the bot is a separate process, so
+    the two are bridged by Redis. Without this the bot only learned about a link
+    by polling the table every 5 seconds forever — a constant query against the
+    database for an event that happens a handful of times a day.
+
+    Fire-and-forget: pub/sub has no delivery guarantee, so the bot keeps a slow
+    sweep as a backstop for anything published while it was restarting. Failures
+    here are logged and ignored — the sweep will still pick the row up.
+    """
+    try:
+        import json
+
+        import redis
+
+        redis_url = os.getenv("REDIS_URL")
+        if not redis_url:
+            return
+        if "://" not in redis_url:
+            redis_url = f"redis://{redis_url}"
+
+        client = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
+        client.publish("bot_events", json.dumps(sign_payload({"type": "oauth_notification", "data": {}})))
+    except Exception as e:
+        logger.info(f"[OAuth] ⚠️ Could not notify bot of link (sweep will catch it): {e}")
+
+
 def sign_discord_id(discord_id: str, timestamp: int, guild_id: str = "0") -> str:
     """
     Create HMAC signature for Discord ID to prevent OAuth initiation spoofing.
@@ -1263,7 +1292,8 @@ def auth_kick_callback():
         logger.error(f"❌ State not found or expired")
 
         # Debug: Check if state exists at all and show recent states
-        with engine.connect() as conn:
+        failed_notification_written = False
+        with engine.begin() as conn:
             count = conn.execute(text("SELECT COUNT(*) FROM oauth_states")).fetchone()[0]
             recent_states = conn.execute(
                 text(
@@ -1487,9 +1517,13 @@ def handle_user_linking_callback(code, code_verifier, state, discord_id, created
                     ),
                     {"d": discord_id, "k": f"FAILED:{kick_username}:already_linked"},
                 )
-                return redirect_oauth_error(
-                    f"Kick account '{kick_username}' is already linked to another Discord user on this server."
-                )
+                failed_notification_written = True
+
+        if failed_notification_written:
+            notify_oauth_link_written()
+            return redirect_oauth_error(
+                f"Kick account '{kick_username}' is already linked to another Discord user on this server."
+            )
 
         # Link accounts in database
         with engine.begin() as conn:
@@ -1575,6 +1609,7 @@ def handle_user_linking_callback(code, code_verifier, state, discord_id, created
                     {"d": discord_id, "k": kick_username, "g": guild_id},
                 )
 
+        notify_oauth_link_written()
         logger.info(f"✅ OAuth link successful: Discord {discord_id} -> Kick {kick_username}")
         return redirect_oauth_success(kick_username)
 
@@ -1741,6 +1776,7 @@ def auth_twitch_link_callback():
                 {"d": discord_id, "k": twitch_login, "g": guild_id},
             )
 
+        notify_oauth_link_written()
         logger.info(f"✅ Twitch link successful: Discord {discord_id} -> Twitch {twitch_login}")
         return redirect_oauth_success(twitch_login, platform="twitch")
     except Exception as e:
