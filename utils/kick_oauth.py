@@ -1,17 +1,29 @@
 """
-Utility functions for fetching Kick OAuth tokens from database
+Utility functions for fetching Kick OAuth tokens from database.
+
+`kick_oauth_tokens` is the ONE canonical home for Kick access/refresh tokens.
+The legacy duplicates in `bot_settings` ('kick_oauth_token' /
+'kick_refresh_token') are no longer read anywhere — every lookup is scoped by
+`discord_server_id`, which is part of that table's primary key.
 """
 
 import logging
 
 from sqlalchemy import text
 
+from utils.secret_settings import SecretConfigError, SecretDecryptError, decrypt_secret
+
 logger = logging.getLogger(__name__)
 
 
 def get_kick_token_for_server(engine, discord_server_id):
     """
-    Fetch OAuth access token for a Discord server from kick_oauth_tokens table
+    Fetch the canonical Kick OAuth token for a Discord server.
+
+    Scoped by discord_server_id — NOT resolved via kick_channel -> kick_username.
+    The old username join was both fragile (a renamed Kick channel silently
+    orphaned the token) and unscoped (any server whose kick_channel matched a
+    username got that token, regardless of which server authorized it).
 
     Args:
         engine: SQLAlchemy engine
@@ -19,53 +31,44 @@ def get_kick_token_for_server(engine, discord_server_id):
 
     Returns:
         dict with 'access_token', 'refresh_token', etc., or None if not found
+
+    Raises:
+        SecretConfigError / SecretDecryptError when a stored credential exists but
+        cannot be decrypted. Deliberately NOT swallowed: "cannot read it" must
+        never be reported to callers as "not configured".
     """
     if not discord_server_id:
-        logger.info(f"[Kick OAuth] No discord_server_id provided")
+        logger.info("[Kick OAuth] No discord_server_id provided")
         return None
 
     try:
         with engine.connect() as conn:
-            # First, get the configured kick_channel (streamer username) for this server
-            result = conn.execute(
+            row = conn.execute(
                 text(
                     """
-                    SELECT value FROM bot_settings
-                    WHERE key = 'kick_channel' AND discord_server_id = :server_id
-                """
-                ),
-                {"server_id": discord_server_id},
-            )
-            row = result.fetchone()
-
-            if not row or not row[0]:
-                logger.info(f"[Kick OAuth] No kick_channel found for server {discord_server_id}")
-                return None
-
-            kick_channel = row[0].lower()
-            logger.info(f"[Kick OAuth] Looking for token for kick_channel: {kick_channel}")
-
-            # Now fetch the OAuth token for that Kick username
-            result = conn.execute(
-                text(
-                    """
-                    SELECT access_token, refresh_token, expires_at, kick_username
+                    SELECT access_token, refresh_token, expires_at, kick_username, user_id
                     FROM kick_oauth_tokens
-                    WHERE LOWER(kick_username) = :kick_username
+                    WHERE discord_server_id = :server_id
+                    ORDER BY updated_at DESC NULLS LAST
                     LIMIT 1
                 """
                 ),
-                {"kick_username": kick_channel},
-            )
-            row = result.fetchone()
+                {"server_id": int(discord_server_id)},
+            ).fetchone()
 
-            if row:
-                logger.info(f"[Kick OAuth] Found token for {row[3]}")
-                return {"access_token": row[0], "refresh_token": row[1], "expires_at": row[2], "kick_username": row[3]}
+            if not row:
+                logger.info(f"[Kick OAuth] No canonical token row for server {discord_server_id}")
+                return None
 
-            logger.info(f"[Kick OAuth] No token found for username: {kick_channel}")
-            return None
+            return {
+                "access_token": decrypt_secret(row[0], key_name="kick_oauth_tokens.access_token", row_id=row[4]),
+                "refresh_token": decrypt_secret(row[1], key_name="kick_oauth_tokens.refresh_token", row_id=row[4]),
+                "expires_at": row[2],
+                "kick_username": row[3],
+            }
 
+    except (SecretConfigError, SecretDecryptError):
+        raise
     except Exception as e:
         logger.info(f"[Kick OAuth] Error fetching token: {e}")
         return None

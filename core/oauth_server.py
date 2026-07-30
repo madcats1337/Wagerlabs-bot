@@ -26,6 +26,7 @@ from sqlalchemy import create_engine, text
 # in combined_server.py, a separate process from bot.py, so it must install the root
 # handler + server-context filter itself or its logs fall to the default lastResort format.
 from utils.logging_config import setup_logging  # noqa: E402
+from utils.secret_settings import decrypt_secret, encrypt_secret  # noqa: E402
 
 from .oauth_results import redirect_oauth_error, redirect_oauth_success, redirect_service_page
 
@@ -1324,14 +1325,22 @@ def auth_kick_callback():
     # Check if this is a bot authorization (discord_id == 0) or regular user linking
     if discord_id == 0:
         logger.info(f"🤖 Detected bot authorization flow")
-        return handle_bot_authorization_callback(code, code_verifier, state)
+        return handle_bot_authorization_callback(code, code_verifier, state, guild_id)
     else:
         logger.info(f"👤 Detected user linking flow")
         return handle_user_linking_callback(code, code_verifier, state, discord_id, created_at, guild_id)
 
 
-def handle_bot_authorization_callback(code, code_verifier, state):
-    """Handle bot authorization callback."""
+def handle_bot_authorization_callback(code, code_verifier, state, guild_id=0):
+    """Handle bot authorization callback.
+
+    `guild_id` scopes the canonical `kick_oauth_tokens` row. It used to be
+    omitted entirely, so the row fell to the column default (0) and the upsert
+    named `ON CONFLICT (user_id)` — which does not match the live primary key
+    `(user_id, discord_server_id)` and therefore raised at runtime instead of
+    updating. Every canonical lookup is scoped by discord_server_id, so the
+    write must be too.
+    """
     logger.info(f"🤖 [BOT AUTH] Starting bot authorization callback handler")
     logger.info(f"🤖 [BOT AUTH] Code: {sanitize_for_logs(code, 'code')}")
     logger.info(f"🤖 [BOT AUTH] State: {sanitize_for_logs(state, 'state')}")
@@ -1386,21 +1395,26 @@ def handle_bot_authorization_callback(code, code_verifier, state):
             conn.execute(
                 text(
                     """
-                INSERT INTO kick_oauth_tokens (user_id, kick_username, access_token, refresh_token, scopes, expires_at)
-                VALUES (:user_id, :username, :access_token, :refresh_token, :scopes, :expires_at)
-                ON CONFLICT (user_id) DO UPDATE SET
+                INSERT INTO kick_oauth_tokens (
+                    user_id, discord_server_id, kick_username,
+                    access_token, refresh_token, scopes, expires_at
+                )
+                VALUES (:user_id, :guild_id, :username, :access_token, :refresh_token, :scopes, :expires_at)
+                ON CONFLICT (user_id, discord_server_id) DO UPDATE SET
                     access_token = EXCLUDED.access_token,
                     refresh_token = EXCLUDED.refresh_token,
                     scopes = EXCLUDED.scopes,
                     expires_at = EXCLUDED.expires_at,
+                    needs_reauth = FALSE,
                     updated_at = CURRENT_TIMESTAMP
             """
                 ),
                 {
                     "user_id": kick_user_id,
+                    "guild_id": int(guild_id or 0),
                     "username": kick_username,
-                    "access_token": access_token,
-                    "refresh_token": token_data.get("refresh_token", ""),
+                    "access_token": encrypt_secret(access_token),
+                    "refresh_token": encrypt_secret(token_data.get("refresh_token", "")),
                     "scopes": token_data.get("scope", ""),
                     "expires_at": expires_at,
                 },

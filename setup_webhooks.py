@@ -26,6 +26,7 @@ Usage:
 
 import argparse
 import asyncio
+import logging
 import os
 import secrets
 import sys
@@ -38,6 +39,11 @@ load_dotenv()
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(__file__))
+
+from utils.secret_settings import decrypt_secret, encrypt_secret  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 try:
     from core.kick_official_api import KickOfficialAPI
@@ -80,82 +86,50 @@ async def get_oauth_tokens(engine, discord_server_id: str):
     Checks both bot_settings and kick_oauth_tokens tables for OAuth data
     """
     with engine.connect() as conn:
-        # OPTION 1: Try bot_settings table (key-value store)
-        result = conn.execute(
+        # Canonical, server-scoped. The previous version tried bot_settings FIRST
+        # (the legacy plaintext duplicates) and only fell back to kick_oauth_tokens
+        # via an unscoped LOWER(kick_username) match. Both are gone: the tokens no
+        # longer live in bot_settings, and a username match could return another
+        # workspace's credentials.
+        oauth_result = conn.execute(
             text(
                 """
-            SELECT key, value
-            FROM bot_settings
+            SELECT user_id, kick_username, access_token, refresh_token
+            FROM kick_oauth_tokens
             WHERE discord_server_id = :server_id
-            AND key IN ('kick_channel', 'kick_broadcaster_user_id', 'kick_oauth_token', 'kick_access_token', 'kick_refresh_token')
+            ORDER BY updated_at DESC NULLS LAST
+            LIMIT 1
         """
             ),
-            {"server_id": discord_server_id},
-        ).fetchall()
+            {"server_id": int(discord_server_id)},
+        ).fetchone()
 
-        if result:
-            # Parse key-value pairs from bot_settings
-            data = {}
-            for row in result:
-                key = row[0]
-                value = row[1]
+        if not oauth_result:
+            logger.error(f"No canonical Kick OAuth row for server {discord_server_id}")
+            return None
 
-                if key == "kick_channel":
-                    data["username"] = value
-                elif key == "kick_broadcaster_user_id":
-                    data["broadcaster_user_id"] = value
-                elif key == "kick_oauth_token" or key == "kick_access_token":
-                    data["access_token"] = value
-                elif key == "kick_refresh_token":
-                    data["refresh_token"] = value
-
-            if data.get("username"):
-                print(f"✅ Found OAuth data in bot_settings for: {data.get('username')}")
-                return data
-
-        # OPTION 2: Try kick_oauth_tokens table (dedicated OAuth table)
-        # First get the kick_channel to look up in oauth tokens table
-        channel_result = conn.execute(
+        # broadcaster_user_id is ordinary (non-secret) config and stays in bot_settings.
+        broadcaster = conn.execute(
             text(
                 """
             SELECT value FROM bot_settings
-            WHERE discord_server_id = :server_id AND key = 'kick_channel'
+            WHERE discord_server_id = :server_id AND key = 'kick_broadcaster_user_id'
         """
             ),
             {"server_id": discord_server_id},
         ).fetchone()
 
-        if channel_result and channel_result[0]:
-            kick_username = channel_result[0].lower()
-
-            # Look up in kick_oauth_tokens table
-            oauth_result = conn.execute(
-                text(
-                    """
-                SELECT
-                    user_id,
-                    kick_username,
-                    access_token,
-                    refresh_token
-                FROM kick_oauth_tokens
-                WHERE LOWER(kick_username) = :username
-                LIMIT 1
-            """
-                ),
-                {"username": kick_username},
-            ).fetchone()
-
-            if oauth_result:
-                print(f"✅ Found OAuth data in kick_oauth_tokens for: {oauth_result[1]}")
-                return {
-                    "broadcaster_user_id": oauth_result[0],  # user_id is the broadcaster ID
-                    "username": oauth_result[1],
-                    "access_token": oauth_result[2],
-                    "refresh_token": oauth_result[3],
-                }
-
-        print(f"❌ No OAuth data found for server {discord_server_id}")
-        return None
+        logger.info(f"Found canonical OAuth data for: {oauth_result[1]}")
+        return {
+            "broadcaster_user_id": (broadcaster[0] if broadcaster and broadcaster[0] else oauth_result[0]),
+            "username": oauth_result[1],
+            "access_token": decrypt_secret(
+                oauth_result[2], key_name="kick_oauth_tokens.access_token", row_id=oauth_result[0]
+            ),
+            "refresh_token": decrypt_secret(
+                oauth_result[3], key_name="kick_oauth_tokens.refresh_token", row_id=oauth_result[0]
+            ),
+        }
 
 
 async def setup_webhooks_for_server(discord_server_id: str):
@@ -238,9 +212,11 @@ async def setup_webhooks_for_server(discord_server_id: str):
         else:
             print(f"ℹ️  No webhooks found for broadcaster {broadcaster_user_id}")
 
-        # Generate ONE webhook secret for this streamer (used for ALL events)
+        # Generate ONE webhook secret for this streamer (used for ALL events).
+        # The value is never printed — not even a truncated prefix/suffix, which
+        # still narrows a brute force and tends to end up in shared terminal logs.
         webhook_secret = secrets.token_hex(32)  # 256-bit secret
-        print(f"\n🔐 Generated webhook secret for {username}: {webhook_secret[:8]}...{webhook_secret[-8:]}")
+        logger.info(f"Generated a new webhook secret for {username} (value not shown)")
 
         # Register new webhooks - ALL use the SAME secret
         print(f"\n📨 Registering webhooks for events: {', '.join(WEBHOOK_EVENTS)}")
@@ -314,7 +290,7 @@ async def setup_webhooks_for_server(discord_server_id: str):
                                     "broadcaster_id": broadcaster_user_id,
                                     "event": event,
                                     "url": WEBHOOK_URL,
-                                    "secret": webhook_secret,
+                                    "secret": encrypt_secret(webhook_secret),
                                 },
                             )
                         print(f"   ✅ Stored in database")

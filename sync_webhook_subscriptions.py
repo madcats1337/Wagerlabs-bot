@@ -26,6 +26,8 @@ load_dotenv()
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(__file__))
 
+from utils.secret_settings import decrypt_secret  # noqa: E402
+
 try:
     from core.kick_official_api import KickOfficialAPI
 except ImportError:
@@ -51,34 +53,48 @@ def get_database_engine():
 
 
 async def get_oauth_tokens(engine, discord_server_id: str):
-    """Get OAuth tokens from database"""
+    """Get this server's canonical Kick OAuth tokens.
+
+    Reads kick_oauth_tokens (scoped by discord_server_id) instead of the legacy
+    plaintext bot_settings copies, which are no longer written.
+    """
     with engine.connect() as conn:
-        result = conn.execute(
+        row = conn.execute(
             text(
                 """
-            SELECT key, value
-            FROM bot_settings
+            SELECT user_id, kick_username, access_token, refresh_token
+            FROM kick_oauth_tokens
             WHERE discord_server_id = :server_id
-            AND key IN ('kick_channel', 'kick_broadcaster_user_id', 'kick_access_token', 'kick_refresh_token')
+            ORDER BY updated_at DESC NULLS LAST
+            LIMIT 1
         """
             ),
-            {"server_id": discord_server_id},
-        ).fetchall()
+            {"server_id": int(discord_server_id)},
+        ).fetchone()
 
-        if result:
-            data = {}
-            for row in result:
-                key, value = row[0], row[1]
-                if key == "kick_channel":
-                    data["username"] = value
-                elif key == "kick_broadcaster_user_id":
-                    data["broadcaster_user_id"] = value
-                elif key == "kick_access_token":
-                    data["access_token"] = value
-                elif key == "kick_refresh_token":
-                    data["refresh_token"] = value
-            return data
-        return None
+        if not row:
+            return None
+
+        # Non-secret channel/broadcaster config still lives in bot_settings.
+        cfg = dict(
+            conn.execute(
+                text(
+                    """
+                SELECT key, value FROM bot_settings
+                WHERE discord_server_id = :server_id
+                  AND key IN ('kick_channel', 'kick_broadcaster_user_id')
+            """
+                ),
+                {"server_id": discord_server_id},
+            ).fetchall()
+        )
+
+        return {
+            "username": cfg.get("kick_channel") or row[1],
+            "broadcaster_user_id": cfg.get("kick_broadcaster_user_id") or row[0],
+            "access_token": decrypt_secret(row[2], key_name="kick_oauth_tokens.access_token", row_id=row[0]),
+            "refresh_token": decrypt_secret(row[3], key_name="kick_oauth_tokens.refresh_token", row_id=row[0]),
+        }
 
 
 async def sync_webhooks_for_server(discord_server_id: str):
@@ -159,6 +175,9 @@ async def sync_webhooks_for_server(discord_server_id: str):
                             ).fetchone()
 
                             if fallback_entry:
+                                # Carried across rows AS STORED (still encrypted).
+                                # It is never used for signature verification here,
+                                # so there is no reason to decrypt it.
                                 webhook_secret = fallback_entry[1]
                                 print(f"   🔄 Found fallback entry, updating to real ID...")
 
@@ -208,10 +227,9 @@ async def sync_all_servers():
             text(
                 """
             SELECT DISTINCT discord_server_id
-            FROM bot_settings
-            WHERE key = 'kick_access_token'
-            AND value IS NOT NULL
-            AND value != ''
+            FROM kick_oauth_tokens
+            WHERE access_token IS NOT NULL
+            AND access_token != ''
         """
             )
         ).fetchall()

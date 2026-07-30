@@ -93,7 +93,9 @@ class ShuffleWagerTracker:
             self.platform_name = platform
 
             if platform == "howl":
-                self.howl_api_key = (self.bot_settings.get("howl_api_key") or "").strip()
+                # Read fresh + decrypted (never from the settings cache), so a key
+                # rotated on the dashboard applies without a bot restart.
+                self.howl_api_key = (self.bot_settings.get_secret("howl_api_key") or "").strip()
                 # Strip first so a blank-but-not-empty stored value falls back to
                 # the default endpoint instead of fetching a whitespace URL.
                 self.affiliate_url = (

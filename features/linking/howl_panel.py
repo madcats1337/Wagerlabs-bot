@@ -112,7 +112,8 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
 
     # Resolve per-guild settings
     settings = settings_getter(guild_id) if guild_id is not None else None
-    api_key = settings.get("howl_api_key") if settings else ""
+    # Fresh + decrypted at the point of use; never from the long-lived cache.
+    api_key = settings.get_secret("howl_api_key") if settings else ""
     affiliate_url = (settings.get("howl_affiliate_url") if settings else "") or HOWL_DEFAULT_LB_URL
 
     if not api_key:

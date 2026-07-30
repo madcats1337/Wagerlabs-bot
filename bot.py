@@ -28,9 +28,11 @@ from sqlalchemy import create_engine, text  # type: ignore
 # every log line (and converted print) is tagged "[BOT] [<server name>]". Must run
 # before the core/redis_subscriber imports below, which can log at import time.
 from utils.clip_auth import get_clip_api_key  # noqa: E402
+from utils.kick_oauth import get_kick_token_for_server  # noqa: E402
 from utils.log_context import clear_server, server_context, set_server  # noqa: E402
 from utils.logging_config import setup_logging  # noqa: E402
 from utils.redis_signing import sign_payload  # noqa: E402
+from utils.secret_settings import SecretConfigError, SecretDecryptError, decrypt_secret, encrypt_secret  # noqa: E402
 from utils.server_urls import get_server_base_url, get_server_public_page_url  # noqa: E402
 from utils.subscription_tier import server_has_feature, upgrade_message  # noqa: E402
 
@@ -560,126 +562,65 @@ class KickWebSocketManager:
                 del self.connected_channels[guild_id]
 
     async def _refresh_oauth_token(self, guild_id: int, guild_name: str) -> Optional[str]:
-        """Refresh OAuth token for a guild using canonical kick_oauth_tokens when available."""
+        """Refresh this guild's Kick OAuth token via the canonical table.
+
+        `kick_oauth_tokens` scoped by discord_server_id is the only source. The
+        previous implementation resolved the row through kick_channel ->
+        kick_username (unscoped, so a renamed channel orphaned the token) and, on
+        miss, fell through to a second refresh path that read AND wrote the legacy
+        `bot_settings` copies — keeping plaintext credentials alive in a table the
+        dashboard exposes as configuration. Both are gone.
+        """
         try:
-            # Prefer canonical token mapping via kick_channel -> kick_oauth_tokens
             with engine.connect() as conn:
-                mapped = conn.execute(
+                row = conn.execute(
                     text(
                         """
-                    SELECT kot.user_id, kot.kick_username, kot.refresh_token
-                    FROM bot_settings bs
-                    JOIN kick_oauth_tokens kot
-                      ON LOWER(kot.kick_username) = LOWER(bs.value)
-                    WHERE bs.key = 'kick_channel'
-                      AND bs.discord_server_id = :guild_id
-                      AND kot.refresh_token IS NOT NULL
-                    ORDER BY kot.updated_at DESC
+                    SELECT user_id, kick_username, refresh_token
+                    FROM kick_oauth_tokens
+                    WHERE discord_server_id = :guild_id
+                      AND refresh_token IS NOT NULL
+                      AND refresh_token <> ''
+                    ORDER BY updated_at DESC NULLS LAST
                     LIMIT 1
                 """
                     ),
-                    {"guild_id": guild_id},
+                    {"guild_id": int(guild_id)},
                 ).fetchone()
 
-                if mapped and mapped[0] and mapped[2]:
-                    user_id, kick_username, refresh_token = mapped
-                    logger.info(f"🔄 Refreshing via kick_oauth_tokens for {kick_username}...")
+            if not row:
+                logger.info("❌ No canonical refresh token for this guild")
+                return None
 
-                    if await refresh_kick_oauth_token_for_user(user_id, kick_username, refresh_token):
-                        latest = conn.execute(
-                            text("SELECT access_token FROM kick_oauth_tokens WHERE user_id = :uid LIMIT 1"),
-                            {"uid": user_id},
-                        ).fetchone()
-                        if latest and latest[0]:
-                            logger.info(f"✅ OAuth token refreshed successfully")
-                            return latest[0]
+            user_id, kick_username, stored_refresh = row
+            refresh_token = decrypt_secret(stored_refresh, key_name="kick_oauth_tokens.refresh_token", row_id=user_id)
 
-                    logger.info(f"❌ Token refresh failed via kick_oauth_tokens")
-                    return None
-
-            # Fallback: legacy servers that only have bot_settings tokens
-            import os
-
-            import aiohttp
+            logger.info(f"🔄 Refreshing via kick_oauth_tokens for {kick_username}...")
+            if not await refresh_kick_oauth_token_for_user(user_id, kick_username, refresh_token):
+                logger.info("❌ Token refresh failed via kick_oauth_tokens")
+                return None
 
             with engine.connect() as conn:
-                result = conn.execute(
+                latest = conn.execute(
                     text(
                         """
-                    SELECT value FROM bot_settings
-                    WHERE key = 'kick_refresh_token'
-                    AND discord_server_id = :guild_id
-                    LIMIT 1
-                """
+                        SELECT access_token FROM kick_oauth_tokens
+                        WHERE user_id = :uid AND discord_server_id = :guild_id
+                        LIMIT 1
+                        """
                     ),
-                    {"guild_id": guild_id},
+                    {"uid": user_id, "guild_id": int(guild_id)},
                 ).fetchone()
 
-                if not result or not result[0]:
-                    logger.info(f"❌ No refresh_token found for this guild")
-                    return None
-
-                refresh_token = result[0]
-
-            # Refresh the token
-            client_id = os.getenv("KICK_CLIENT_ID")
-            client_secret = os.getenv("KICK_CLIENT_SECRET")
-
-            data = {
-                "grant_type": "refresh_token",
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "refresh_token": refresh_token,
-            }
-
-            logger.info(f"🔄 Refreshing OAuth 2.1 token...")
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://id.kick.com/oauth/token",
-                    data=data,
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    timeout=10,
-                ) as resp:
-                    if resp.status == 200:
-                        token_data = await resp.json()
-                        new_access_token = token_data["access_token"]
-                        new_refresh_token = token_data.get("refresh_token", refresh_token)
-
-                        # Update both tokens in bot_settings
-                        with engine.begin() as conn:
-                            conn.execute(
-                                text(
-                                    """
-                                INSERT INTO bot_settings (discord_server_id, key, value)
-                                VALUES (:guild_id, 'kick_oauth_token', :token)
-                                ON CONFLICT (discord_server_id, key) DO UPDATE SET value = EXCLUDED.value
-                            """
-                                ),
-                                {"guild_id": guild_id, "token": new_access_token},
-                            )
-
-                            conn.execute(
-                                text(
-                                    """
-                                INSERT INTO bot_settings (discord_server_id, key, value)
-                                VALUES (:guild_id, 'kick_refresh_token', :token)
-                                ON CONFLICT (discord_server_id, key) DO UPDATE SET value = EXCLUDED.value
-                            """
-                                ),
-                                {"guild_id": guild_id, "token": new_refresh_token},
-                            )
-
-                        logger.info(f"✅ OAuth token refreshed successfully")
-                        return new_access_token
-                    else:
-                        error_text = await resp.text()
-                        logger.info(f"❌ Token refresh failed: HTTP {resp.status} - {error_text}")
-                        return None
+            if latest and latest[0]:
+                logger.info("✅ OAuth token refreshed successfully")
+                return decrypt_secret(latest[0], key_name="kick_oauth_tokens.access_token", row_id=user_id)
+            return None
+        except (SecretConfigError, SecretDecryptError):
+            logger.exception("❌ Kick token decryption failed during refresh")
+            return None
         except Exception as e:
             logger.info(f"❌ Error refreshing token: {e}")
-            import traceback
-
-            traceback.print_exc()
             return None
 
     async def _message_sender(self, guild_id: int, guild_name: str, api):
@@ -691,59 +632,21 @@ class KickWebSocketManager:
             # Load OAuth 2.1 token ONCE at startup for performance
             oauth_token = None
             try:
-                logger.debug(f"🔍 Loading kick_oauth_token from database...")
-                with engine.connect() as conn:
-                    result = conn.execute(
-                        text(
-                            """
-                        SELECT kot.access_token
-                        FROM bot_settings bs
-                        JOIN kick_oauth_tokens kot
-                          ON LOWER(kot.kick_username) = LOWER(bs.value)
-                        WHERE bs.key = 'kick_channel'
-                          AND bs.discord_server_id = :guild_id
-                        ORDER BY kot.updated_at DESC
-                        LIMIT 1
-                    """
-                        ),
-                        {"guild_id": guild_id},
-                    ).fetchone()
-
-                    if not result or not result[0]:
-                        # Legacy fallback if guild has not been mapped into kick_oauth_tokens yet
-                        result = conn.execute(
-                            text(
-                                """
-                            SELECT value FROM bot_settings
-                            WHERE key = 'kick_oauth_token'
-                              AND discord_server_id = :guild_id
-                            LIMIT 1
-                        """
-                            ),
-                            {"guild_id": guild_id},
-                        ).fetchone()
-
-                    if result and result[0]:
-                        oauth_token = result[0]
-                        api.access_token = oauth_token
-                        logger.debug(f"✅ OAuth token loaded successfully")
-                    else:
-                        logger.warning(f"⚠️ No kick_oauth_token found - messages will fail!")
-                        # Debug: Check what keys exist
-                        all_keys = conn.execute(
-                            text(
-                                """
-                            SELECT key FROM bot_settings WHERE discord_server_id = :guild_id
-                        """
-                            ),
-                            {"guild_id": guild_id},
-                        ).fetchall()
-                        logger.debug(f"🔍 Available keys: {[row[0] for row in all_keys]}")
+                logger.debug("🔍 Loading canonical Kick token from kick_oauth_tokens...")
+                token_data = get_kick_token_for_server(engine, guild_id)
+                if token_data and token_data.get("access_token"):
+                    oauth_token = token_data["access_token"]
+                    api.access_token = oauth_token
+                    logger.debug("✅ OAuth token loaded successfully")
+                else:
+                    logger.warning("⚠️ No canonical Kick token for this guild - messages will fail!")
+            except (SecretConfigError, SecretDecryptError):
+                # Fail loudly: a decryption problem is an operational incident, not
+                # an unconfigured integration. Never fall back to a legacy plaintext
+                # source here — that would silently mask a key misconfiguration.
+                logger.exception("❌ Kick token could not be decrypted for this guild")
             except Exception as e:
                 logger.info(f"❌ Error loading OAuth token: {e}")
-                import traceback
-
-                traceback.print_exc()
 
             logger.debug(f"🔄 Starting message processing loop...")
 
@@ -756,40 +659,14 @@ class KickWebSocketManager:
                         # No message in queue, keep waiting
                         continue
 
-                    # Reload token from database before each send (in case proactive refresh updated it)
+                    # Reload token before each send (in case a proactive refresh
+                    # updated it). Canonical, server-scoped, no legacy fallback.
                     try:
-                        with engine.connect() as conn:
-                            result = conn.execute(
-                                text(
-                                    """
-                                SELECT kot.access_token
-                                FROM bot_settings bs
-                                JOIN kick_oauth_tokens kot
-                                  ON LOWER(kot.kick_username) = LOWER(bs.value)
-                                WHERE bs.key = 'kick_channel'
-                                  AND bs.discord_server_id = :guild_id
-                                ORDER BY kot.updated_at DESC
-                                LIMIT 1
-                            """
-                                ),
-                                {"guild_id": guild_id},
-                            ).fetchone()
-
-                            if not result or not result[0]:
-                                result = conn.execute(
-                                    text(
-                                        """
-                                    SELECT value FROM bot_settings
-                                    WHERE key = 'kick_oauth_token'
-                                      AND discord_server_id = :guild_id
-                                    LIMIT 1
-                                """
-                                    ),
-                                    {"guild_id": guild_id},
-                                ).fetchone()
-
-                            if result and result[0]:
-                                api.access_token = result[0]
+                        fresh = get_kick_token_for_server(engine, guild_id)
+                        if fresh and fresh.get("access_token"):
+                            api.access_token = fresh["access_token"]
+                    except (SecretConfigError, SecretDecryptError):
+                        logger.exception("⚠️ Kick token decryption failed on reload; keeping current token")
                     except Exception as e:
                         logger.info(f"⚠️ Error reloading token: {e}")
 
@@ -1369,7 +1246,6 @@ class KickWebSocketManager:
 
                         # Get settings from bot_settings
                         dashboard_url = None
-                        api_key = None
                         clip_duration = 30
 
                         with engine.connect() as conn:
@@ -1378,7 +1254,7 @@ class KickWebSocketManager:
                                     """
                                 SELECT key, value FROM bot_settings
                                 WHERE discord_server_id = :guild_id
-                                AND key IN ('dashboard_url', 'bot_api_key', 'clip_duration')
+                                AND key IN ('dashboard_url', 'clip_duration')
                             """
                                 ),
                                 {"guild_id": guild_id},
@@ -1387,8 +1263,6 @@ class KickWebSocketManager:
                             for key, value in settings_result:
                                 if key == "dashboard_url":
                                     dashboard_url = value
-                                elif key == "bot_api_key":
-                                    api_key = value
                                 elif key == "clip_duration":
                                     clip_duration = int(value) if value else 30
 
@@ -1397,9 +1271,8 @@ class KickWebSocketManager:
                         # fallback and may be stale (pre-rebrand host).
                         dashboard_url = get_server_base_url(engine, guild_id) or dashboard_url
 
-                        # Env-controlled system secret takes precedence over the legacy
-                        # per-server bot_settings value.
-                        api_key = get_clip_api_key(api_key)
+                        # System secret, environment only — no bot_settings read.
+                        api_key = get_clip_api_key()
 
                         if not dashboard_url or not api_key:
                             logger.info(f"[Clip] ❌ Dashboard URL or API key not configured")
@@ -3255,7 +3128,8 @@ async def refresh_kick_oauth_token() -> bool:
             result = conn.execute(
                 text(
                     """
-                SELECT refresh_token, kick_username FROM kick_oauth_tokens
+                SELECT refresh_token, kick_username, user_id, discord_server_id
+                FROM kick_oauth_tokens
                 ORDER BY updated_at DESC LIMIT 1
             """
                 )
@@ -3265,8 +3139,9 @@ async def refresh_kick_oauth_token() -> bool:
                 logger.info("[Kick] ❌ No refresh token available in kick_oauth_tokens table")
                 return False
 
-            refresh_token = result[0]
+            refresh_token = decrypt_secret(result[0], key_name="kick_oauth_tokens.refresh_token", row_id=result[2])
             kick_username = result[1]
+            _row_server_id = result[3]
 
         logger.info(f"[Kick] 🔄 Attempting to refresh OAuth token for {kick_username}...")
 
@@ -3309,13 +3184,18 @@ async def refresh_kick_oauth_token() -> bool:
                                 expires_at = :expires_at,
                                 updated_at = CURRENT_TIMESTAMP
                             WHERE kick_username = :kick_username
+                              AND discord_server_id = :server_id
                         """
                             ),
                             {
-                                "access_token": new_access_token,
-                                "refresh_token": new_refresh_token,
+                                "access_token": encrypt_secret(new_access_token),
+                                "refresh_token": encrypt_secret(new_refresh_token),
                                 "expires_at": expires_at,
                                 "kick_username": kick_username,
+                                # Scope the write to the row we actually read, so a
+                                # username shared across workspaces can't have one
+                                # server's refresh overwrite another's token.
+                                "server_id": _row_server_id,
                             },
                         )
 
@@ -4009,12 +3889,11 @@ async def kick_chat_loop(channel_name: str, guild_id: int):
                                                 dashboard_url = (
                                                     get_server_base_url(engine, guild_id) or bot_settings.dashboard_url
                                                 )
-                                                # Env-controlled system secret first;
-                                                # DB value is a legacy fallback.
-                                                api_key = get_clip_api_key(bot_settings.bot_api_key)
+                                                # System secret, environment only.
+                                                api_key = get_clip_api_key()
 
                                                 logger.info(f"[Clip] DEBUG - dashboard_url resolved: '{dashboard_url}'")
-                                                logger.info(f"[Clip] DEBUG - bot_api_key exists: {bool(api_key)}")
+                                                logger.info(f"[Clip] DEBUG - clip api key configured: {bool(api_key)}")
 
                                                 if not dashboard_url:
                                                     logger.info(
@@ -5447,6 +5326,19 @@ async def proactive_token_refresh_task():
             for user_id, kick_username, refresh_token, expires_at in results:
                 checked += 1
 
+                # Decrypt per row: one unreadable row must not abort the whole
+                # refresh sweep for every other server.
+                try:
+                    refresh_token = decrypt_secret(
+                        refresh_token, key_name="kick_oauth_tokens.refresh_token", row_id=user_id
+                    )
+                except (SecretConfigError, SecretDecryptError):
+                    logger.exception(
+                        f"[Kick] 🔐 Could not decrypt refresh token for {kick_username} - skipping this row"
+                    )
+                    failed += 1
+                    continue
+
                 if expires_at is None:
                     # Legacy token without expiration info - treat as expired to trigger refresh
                     logger.info(
@@ -5523,7 +5415,15 @@ async def refresh_kick_oauth_token_for_user(user_id: int, kick_username: str, re
                 text("SELECT refresh_token, expires_at FROM kick_oauth_tokens WHERE user_id = :uid"),
                 {"uid": user_id},
             ).fetchone()
-            if current and current[0] != refresh_token:
+            # Compare PLAINTEXT: Fernet ciphertext differs on every write, so a raw
+            # column comparison would always look "already refreshed" and starve
+            # the real refresh.
+            current_refresh = (
+                decrypt_secret(current[0], key_name="kick_oauth_tokens.refresh_token", row_id=user_id)
+                if current
+                else None
+            )
+            if current and current_refresh != refresh_token:
                 logger.info(f"[Kick] ✅ Token for {kick_username} was already refreshed by another process")
                 conn.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": lock_key})
                 conn.commit()
@@ -5574,44 +5474,19 @@ async def refresh_kick_oauth_token_for_user(user_id: int, kick_username: str, re
                         """
                             ),
                             {
-                                "access_token": new_access_token,
-                                "refresh_token": new_refresh_token,
+                                "access_token": encrypt_secret(new_access_token),
+                                "refresh_token": encrypt_secret(new_refresh_token),
                                 "expires_at": expires_at,
                                 "user_id": user_id,
                             },
                         )
 
-                        # Also update bot_settings table if tokens exist there (legacy support)
-                        # This ensures both tables stay in sync
-                        conn.execute(
-                            text(
-                                """
-                            UPDATE bot_settings
-                            SET value = :access_token, updated_at = CURRENT_TIMESTAMP
-                            WHERE key IN ('kick_oauth_token', 'kick_access_token')
-                            AND discord_server_id IN (
-                                SELECT DISTINCT discord_server_id FROM bot_settings
-                                WHERE key = 'kick_channel' AND LOWER(value) = LOWER(:kick_username)
-                            )
-                        """
-                            ),
-                            {"access_token": new_access_token, "kick_username": kick_username},
-                        )
-
-                        conn.execute(
-                            text(
-                                """
-                            UPDATE bot_settings
-                            SET value = :refresh_token, updated_at = CURRENT_TIMESTAMP
-                            WHERE key = 'kick_refresh_token'
-                            AND discord_server_id IN (
-                                SELECT DISTINCT discord_server_id FROM bot_settings
-                                WHERE key = 'kick_channel' AND LOWER(value) = LOWER(:kick_username)
-                            )
-                        """
-                            ),
-                            {"refresh_token": new_refresh_token, "kick_username": kick_username},
-                        )
+                        # The legacy bot_settings mirror ('kick_oauth_token' /
+                        # 'kick_access_token' / 'kick_refresh_token') is NOT written
+                        # any more. kick_oauth_tokens above is the only home, so
+                        # there is nothing left to keep in sync — and the old mirror
+                        # matched rows by kick_channel -> username, which was
+                        # unscoped across servers.
 
                     # Release lock after successful update
                     with engine.connect() as conn:
@@ -5734,7 +5609,6 @@ async def clip_buffer_management_task():
             # Get per-guild settings from database
             kick_channel = None
             dashboard_url = None
-            bot_api_key = None
             # Default True: only the explicit string 'false' disables auto-start.
             auto_start_buffer = True
 
@@ -5744,7 +5618,7 @@ async def clip_buffer_management_task():
                         """
                     SELECT key, value FROM bot_settings
                     WHERE discord_server_id = :guild_id
-                    AND key IN ('kick_channel', 'dashboard_url', 'bot_api_key', 'clips_auto_start_on_live')
+                    AND key IN ('kick_channel', 'dashboard_url', 'clips_auto_start_on_live')
                 """
                     ),
                     {"guild_id": guild_id},
@@ -5755,8 +5629,6 @@ async def clip_buffer_management_task():
                         kick_channel = value
                     elif key == "dashboard_url":
                         dashboard_url = value
-                    elif key == "bot_api_key":
-                        bot_api_key = value
                     elif key == "clips_auto_start_on_live":
                         auto_start_buffer = str(value).lower() != "false"
 
@@ -5764,9 +5636,8 @@ async def clip_buffer_management_task():
             # domain); the stored dashboard_url is only a stale-prone fallback.
             dashboard_url = get_server_base_url(engine, guild_id) or dashboard_url
 
-            # Env-controlled system secret takes precedence over the legacy per-server
-            # DB value (covers both the live-start and offline-stop calls below).
-            bot_api_key = get_clip_api_key(bot_api_key)
+            # System secret, environment only.
+            bot_api_key = get_clip_api_key()
 
             # Skip guilds without required configuration. dashboard_url and
             # bot_api_key are no longer needed: the buffer lives in this process,
@@ -5953,7 +5824,8 @@ def _fetch_howl_freeze_rows(conn, server_id, start_dt, end_dt, winner_count):
     """
     s = _lb_bot_settings(conn, server_id, ("howl_affiliate_url", "howl_api_key"))
     url = s.get("howl_affiliate_url") or "https://howl.gg/api/user/affiliate/lb"
-    api_key = s.get("howl_api_key")
+    # Decrypt at the API boundary — immediately before the Howl request below.
+    api_key = decrypt_secret(s.get("howl_api_key"), key_name="howl_api_key", row_id=server_id)
     if not api_key:
         logger.warning(f"[Leaderboard] howl freeze: no api_key for server {server_id}")
         return []

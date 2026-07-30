@@ -12,7 +12,23 @@ from typing import Any, Dict, Optional, Union
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+from utils.secret_settings import decrypt_secret
+
 logger = logging.getLogger(__name__)
+
+# Credentials that must never enter the settings cache. These are either owned by
+# the environment (bot_api_key -> CLIPS_API_KEY) or live in a dedicated table
+# (kick_oauth_tokens). Mirrors the dashboard's utils/setting_policy.SECRET_SETTINGS.
+_NEVER_CACHE_KEYS = frozenset(
+    {
+        "bot_api_key",
+        "howl_api_key",
+        "kick_oauth_token",
+        "kick_access_token",
+        "kick_refresh_token",
+        "kick_webhook_secret",
+    }
+)
 
 
 class BotSettingsManager:
@@ -112,8 +128,12 @@ class BotSettingsManager:
 
                 rows = result.fetchall()
 
-                # Later rows override earlier ones (server-specific overrides global)
-                self._cache = {row[0]: row[1] for row in rows}
+                # Later rows override earlier ones (server-specific overrides global).
+                # Credential keys are dropped on the way in: this cache is long-lived,
+                # is dumped by to_dict()/debug paths, and is refreshed from Redis
+                # settings-reload events. Keeping secrets out of it means they cannot
+                # leak through any of those, and nothing reads them from here any more.
+                self._cache = {row[0]: row[1] for row in rows if row[0] not in _NEVER_CACHE_KEYS}
                 self._last_loaded = datetime.now(timezone.utc)
 
                 guild_info = f" for guild {active_guild_id}" if active_guild_id else ""
@@ -125,6 +145,55 @@ class BotSettingsManager:
 
     # Alias for backwards compatibility
     reload = refresh
+
+    def get_secret(self, key: str, env_fallback: Optional[str] = None) -> str:
+        """Read a credential FRESH from the database and decrypt it.
+
+        Deliberately bypasses `_cache` (secrets are excluded from it) and queries on
+        every call. Credentials are read at the point of use — right before an API
+        call — so a key rotated on the dashboard takes effect without a restart, and
+        so the plaintext never sits in a long-lived process cache.
+
+        Returns "" when not configured. RAISES on a decryption failure rather than
+        returning "" — an unreadable credential must not be mistaken for an absent
+        one, which would silently disable the integration instead of alerting.
+        """
+        if key not in _NEVER_CACHE_KEYS:
+            logger.warning(f"[Settings] get_secret() used for non-secret key '{key}'")
+
+        raw = None
+        if self._engine is not None:
+            try:
+                with self._engine.connect() as conn:
+                    if self._guild_id:
+                        row = conn.execute(
+                            text(
+                                """
+                                SELECT value FROM bot_settings
+                                WHERE key = :key AND discord_server_id = :guild_id
+                                """
+                            ),
+                            {"key": key, "guild_id": self._guild_id},
+                        ).fetchone()
+                    else:
+                        row = conn.execute(
+                            text(
+                                """
+                                SELECT value FROM bot_settings
+                                WHERE key = :key AND discord_server_id IS NULL
+                                """
+                            ),
+                            {"key": key},
+                        ).fetchone()
+                raw = row[0] if row else None
+            except Exception as e:
+                logger.warning(f"[Settings] Error reading secret '{key}': {e}")
+                raw = None
+
+        if not raw:
+            return (os.getenv(env_fallback, "") if env_fallback else "") or ""
+
+        return decrypt_secret(raw, key_name=key, row_id=self._guild_id) or ""
 
     @property
     def guild_id(self) -> Optional[int]:
@@ -291,9 +360,17 @@ class BotSettingsManager:
 
     @property
     def bot_api_key(self) -> str:
-        """API key for authenticating with Dashboard"""
-        # Check database first, no env fallback since we want DB only
-        return self._cache.get("bot_api_key", "") or ""
+        """DEPRECATED — always empty. Use utils.clip_auth.get_clip_api_key().
+
+        The clip API key is a system secret owned by the environment
+        (CLIPS_API_KEY), not per-server settings data. It is no longer read from
+        or cached out of bot_settings: that row was writable through the
+        dashboard's generic settings endpoints, and caching it here also meant the
+        credential rode along in Redis settings-reload payloads and debug dumps.
+        Retained as an always-empty property so any missed caller degrades to
+        "not configured" rather than raising.
+        """
+        return ""
 
     @property
     def shuffle_affiliate_url(self) -> str:
@@ -356,7 +433,9 @@ class BotSettingsManager:
             "gtb_channel_id": self.gtb_channel_id,
             "clip_duration": self.clip_duration,
             "dashboard_url": self.dashboard_url,
-            "bot_api_key": "***" if self.bot_api_key else "",  # Don't expose key
+            # bot_api_key intentionally absent — it is no longer a settings value
+            # (see the property docstring). Omitted rather than masked so this dict
+            # can't even advertise whether a credential is present.
             "wager_affiliate_url": "***configured***" if self.shuffle_affiliate_url else "",  # Don't expose full URL
             "wager_campaign_code": self.shuffle_campaign_code,
             "wager_tickets_per_1000": self.shuffle_tickets_per_1000,

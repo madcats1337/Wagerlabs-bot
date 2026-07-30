@@ -152,6 +152,40 @@ def run_database_migration():
         logger.warning(f"   ⚠️ Migration warning: {e}")
         logger.info("   Continuing startup anyway...")
 
+    # Encrypt credentials at rest. Mirrored from the dashboard repo because either
+    # Railway service may boot first; the migration is idempotent so whichever runs
+    # first does the work and the other finds nothing to do. A NO-OP until
+    # SETTINGS_ENCRYPTION_KEY + SECRET_ENCRYPTION_WRITE_ENABLED are set.
+    try:
+        import importlib.util as _ilu
+
+        import psycopg2
+
+        _mig_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations", "encrypt_credentials.py")
+        _spec = _ilu.spec_from_file_location("encrypt_credentials", _mig_path)
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        _db_url = os.getenv("DATABASE_URL")
+        if _db_url:
+            _mod.run(lambda: psycopg2.connect(_db_url))
+
+            # Fail-closed readiness check: encrypted rows with no key on THIS service
+            # means every credential read raises later. Say so at boot.
+            from utils.secret_settings import encryption_available
+
+            if not encryption_available():
+                _c = psycopg2.connect(_db_url)
+                try:
+                    if _mod.has_encrypted_rows(_c):
+                        logger.error(
+                            "   ❌ encrypted credential rows exist but SETTINGS_ENCRYPTION_KEY is not "
+                            "configured on the bot service — Kick/Howl/webhook reads WILL fail"
+                        )
+                finally:
+                    _c.close()
+    except Exception as e:
+        logger.warning(f"   ⚠️ credential encryption migration: {e}")
+
 
 def run_discord_bot():
     """Start Discord bot as a subprocess, return the process handle"""

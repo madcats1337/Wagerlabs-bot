@@ -33,6 +33,8 @@ from typing import Any, Callable, Dict, Optional
 
 from flask import Blueprint, abort, jsonify, request
 
+from utils.secret_settings import decrypt_secret
+
 logger = logging.getLogger(__name__)
 
 
@@ -424,7 +426,12 @@ def handle_kick_webhook():
                     if result:
                         discord_server_id = result[0]
                         broadcaster_user_id = result[1]
-                        webhook_secret = result[2]
+                        # Decrypt at the signature-verification boundary.
+                        webhook_secret = decrypt_secret(
+                            result[2],
+                            key_name="kick_webhook_subscriptions.webhook_secret",
+                            row_id=subscription_id,
+                        )
 
                         if os.getenv("DEBUG_WEBHOOKS") == "true":
                             logger.info(
@@ -783,7 +790,9 @@ def simulate_real_webhook_event():
 
             subscription_id = result[0]
             broadcaster_user_id = result[1]
-            webhook_secret = result[2]
+            webhook_secret = decrypt_secret(
+                result[2], key_name="kick_webhook_subscriptions.webhook_secret", row_id=subscription_id
+            )
 
             if not webhook_secret:
                 return (

@@ -5,15 +5,22 @@ Docs: https://docs.kick.com/getting-started/generating-tokens-oauth2-flow
 """
 import base64
 import hashlib
+import logging
 import os
 import secrets
 import threading
 import webbrowser
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import psycopg2
 import requests
+
+from utils.secret_settings import encrypt_secret
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 # Credentials must come from the environment. Hardcoded fallbacks were
 # removed because they leaked production secrets into source control —
@@ -197,11 +204,15 @@ def step2_exchange_code(code, code_verifier, discord_server_id=None):
     if response.status_code == 200:
         token_data = response.json()
         print(f"\n✅ SUCCESS! Token generated:\n")
-        print(f"Access Token:  {token_data['access_token']}")
-        print(f"Token Type:    {token_data['token_type']}")
-        print(f"Expires In:    {token_data['expires_in']} seconds")
-        print(f"Refresh Token: {token_data['refresh_token']}")
-        print(f"Scopes:        {token_data.get('scope', 'N/A')}")
+        # Token VALUES are deliberately not printed. This script runs in terminals,
+        # CI logs and screen shares; echoing a live credential is how it ends up
+        # somewhere it can't be un-leaked. The tokens are persisted (encrypted)
+        # below — nothing here needs the operator to copy them by hand.
+        logger.info(f"Token Type:    {token_data['token_type']}")
+        logger.info(f"Expires In:    {token_data['expires_in']} seconds")
+        logger.info(f"Access Token:  [received, not shown]")
+        logger.info(f"Refresh Token: {'[received, not shown]' if token_data.get('refresh_token') else '[none]'}")
+        logger.info(f"Scopes:        {token_data.get('scope', 'N/A')}")
 
         # Save to database if discord_server_id provided
         if discord_server_id:
@@ -221,48 +232,58 @@ def step2_exchange_code(code, code_verifier, discord_server_id=None):
         return None
 
 
-def save_to_database(discord_server_id, token_data):
-    """Save OAuth tokens to database"""
+def save_to_database(discord_server_id, token_data, kick_user_id=0, kick_username=None):
+    """Save OAuth tokens to the CANONICAL kick_oauth_tokens table.
+
+    This used to write the legacy `bot_settings` rows ('kick_oauth_token' /
+    'kick_refresh_token'). An operational script must not be able to recreate the
+    duplicate plaintext credentials the runtime no longer reads — otherwise one
+    manual run silently reintroduces the disclosure path.
+    """
     if not DATABASE_URL:
-        print("\n⚠️  DATABASE_URL not set — skipping DB save.")
-        print("   Copy the access/refresh tokens above and set them as env vars instead.")
+        logger.warning("DATABASE_URL not set — skipping DB save.")
+        logger.warning("Re-run with DATABASE_URL set, or use the dashboard OAuth flow.")
         return
     try:
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(token_data.get("expires_in") or 3600))
+
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
-
-        # Update or insert kick_oauth_token
         cur.execute(
             """
-            INSERT INTO bot_settings (discord_server_id, key, value)
-            VALUES (%s, 'kick_oauth_token', %s)
-            ON CONFLICT (discord_server_id, key)
-            DO UPDATE SET value = EXCLUDED.value
-        """,
-            (discord_server_id, token_data["access_token"]),
+            INSERT INTO kick_oauth_tokens (
+                user_id, discord_server_id, kick_username,
+                access_token, refresh_token, scopes, expires_at, needs_reauth
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE)
+            ON CONFLICT (user_id, discord_server_id) DO UPDATE SET
+                kick_username = COALESCE(EXCLUDED.kick_username, kick_oauth_tokens.kick_username),
+                access_token  = EXCLUDED.access_token,
+                refresh_token = EXCLUDED.refresh_token,
+                scopes        = EXCLUDED.scopes,
+                expires_at    = EXCLUDED.expires_at,
+                needs_reauth  = FALSE,
+                updated_at    = CURRENT_TIMESTAMP
+            """,
+            (
+                int(kick_user_id or 0),
+                int(discord_server_id),
+                kick_username,
+                encrypt_secret(token_data["access_token"]),
+                encrypt_secret(token_data.get("refresh_token") or ""),
+                token_data.get("scope", ""),
+                expires_at,
+            ),
         )
-
-        # Update or insert kick_refresh_token
-        cur.execute(
-            """
-            INSERT INTO bot_settings (discord_server_id, key, value)
-            VALUES (%s, 'kick_refresh_token', %s)
-            ON CONFLICT (discord_server_id, key)
-            DO UPDATE SET value = EXCLUDED.value
-        """,
-            (discord_server_id, token_data["refresh_token"]),
-        )
-
         conn.commit()
         cur.close()
         conn.close()
 
-        print(f"\n✅ OAuth 2.1 tokens securely saved to database for discord_server_id={discord_server_id}")
-        print(f"✅ Access token expires in {token_data['expires_in']} seconds")
-        print(f"✅ Refresh token can be used to get new access tokens")
+        logger.info(f"Canonical Kick token saved for discord_server_id={discord_server_id}")
+        logger.info(f"Access token expires in {token_data.get('expires_in')} seconds")
     except Exception as e:
-        print(f"\n⚠️  Failed to save to database: {e}")
-        print("You'll need to update the tokens manually or run the dashboard OAuth flow.")
+        logger.warning(f"Failed to save to database: {e}")
+        logger.warning("Use the dashboard OAuth flow instead.")
 
 
 def refresh_token(refresh_token):
