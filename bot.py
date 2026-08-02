@@ -738,7 +738,6 @@ class KickWebSocketManager:
                                     if resp.status not in [200, 201]:
                                         # Try streamer OAuth as final fallback
                                         logger.info(f"⚠️ Trying streamer OAuth as fallback...")
-                                        from utils.kick_oauth import get_kick_token_for_server
 
                                         token_data = get_kick_token_for_server(engine, guild_id)
                                         if token_data and token_data.get("access_token"):
@@ -3290,7 +3289,6 @@ async def kick_chat_loop(channel_name: str, guild_id: int):
                     # Try official API first with OAuth token (if available)
                     access_token = None
                     try:
-                        from utils.kick_oauth import get_kick_token_for_server
 
                         token_data = get_kick_token_for_server(engine, guild_id)
                         if token_data:
@@ -3384,7 +3382,6 @@ async def kick_chat_loop(channel_name: str, guild_id: int):
                     # Fallback: Try getting streamer's OAuth token from database
                     if not access_token:
                         try:
-                            from utils.kick_oauth import get_kick_token_for_server
 
                             token_data = get_kick_token_for_server(engine, guild_id)
                             if token_data:
