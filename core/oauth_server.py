@@ -1293,7 +1293,6 @@ def auth_kick_callback():
         logger.error(f"❌ State not found or expired")
 
         # Debug: Check if state exists at all and show recent states
-        failed_notification_written = False
         with engine.begin() as conn:
             count = conn.execute(text("SELECT COUNT(*) FROM oauth_states")).fetchone()[0]
             recent_states = conn.execute(
@@ -1513,23 +1512,33 @@ def handle_user_linking_callback(code, code_verifier, state, discord_id, created
         kick_username = kick_user["username"]
         logger.info(f"👤 Kick username: {kick_username}")
 
+        # Must be bound before the check below: the "already linked" branch is the
+        # exception, so leaving this to be assigned only inside it made EVERY
+        # successful link raise UnboundLocalError (caught by the outer handler and
+        # reported to the viewer as a generic failure — no links row, no role).
+        failed_notification_written = False
+
         # Check if Kick account is already linked to another Discord user on this server
-        with engine.connect() as conn:
+        # engine.begin(): the FAILED notification is a write, and a connect()
+        # block rolls back on exit, so the row never reached the bot.
+        with engine.begin() as conn:
             existing = conn.execute(
                 text("SELECT discord_id FROM links WHERE kick_name = :k AND discord_server_id = :gid"),
                 {"k": kick_username.lower(), "gid": guild_id},
             ).fetchone()
 
             if existing and existing[0] != discord_id:
-                # Store failed attempt for logging
+                # Store failed attempt for logging. discord_server_id must be
+                # explicit — the column default is a hardcoded legacy guild, which
+                # would log this failure into the wrong server's link-logs channel.
                 conn.execute(
                     text(
                         """
-                    INSERT INTO oauth_notifications (discord_id, kick_username, processed)
-                    VALUES (:d, :k, FALSE)
+                    INSERT INTO oauth_notifications (discord_id, kick_username, processed, discord_server_id, platform)
+                    VALUES (:d, :k, FALSE, :g, 'kick')
                 """
                     ),
-                    {"d": discord_id, "k": f"FAILED:{kick_username}:already_linked"},
+                    {"d": discord_id, "k": f"FAILED:{kick_username}:already_linked", "g": guild_id},
                 )
                 failed_notification_written = True
 

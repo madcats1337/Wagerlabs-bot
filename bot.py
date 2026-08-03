@@ -3015,6 +3015,7 @@ async def log_link_attempt(
         logger.warning("⚠️ log_link_attempt: No guild_id provided, skipping log")
         return
 
+    channel_id = None
     try:
         with engine.connect() as conn:
             result = conn.execute(
@@ -3027,16 +3028,31 @@ async def log_link_attempt(
                 {"guild_id": guild_id},
             ).fetchone()
 
-            if not result or not result[1]:  # Not configured or disabled
+            if not result:
+                logger.info(f"ℹ️ No link-logs channel configured for guild {guild_id}")
+                return
+            if not result[1]:
+                logger.info(f"ℹ️ Link logs are turned off for guild {guild_id}")
                 return
 
             channel_id = result[0]
 
-        # Get the channel
+        # get_channel is cache-only. A channel created (or a guild joined) after
+        # the cache was built resolves to None, which silently dropped the log —
+        # fall back to the API before giving up.
         channel = bot.get_channel(int(channel_id))
         if not channel:
-            logger.warning(f"⚠️ Link logs channel {channel_id} not found")
-            return
+            try:
+                channel = await bot.fetch_channel(int(channel_id))
+            except discord.NotFound:
+                logger.warning(f"⚠️ Link logs channel {channel_id} no longer exists (guild {guild_id})")
+                return
+            except discord.Forbidden:
+                logger.warning(f"⚠️ No access to link logs channel {channel_id} (guild {guild_id})")
+                return
+            except discord.HTTPException as fetch_err:
+                logger.warning(f"⚠️ Could not fetch link logs channel {channel_id}: {fetch_err}")
+                return
 
         # Create embed
         embed = discord.Embed(
@@ -3058,6 +3074,10 @@ async def log_link_attempt(
         await channel.send(embed=embed)
         logger.info(f"✅ Logged link attempt to channel {channel_id}")
 
+    except discord.Forbidden:
+        logger.warning(
+            f"⚠️ Cannot post link logs in channel {channel_id}: the bot is missing " f"Send Messages / Embed Links there"
+        )
     except Exception as e:
         logger.warning(f"⚠️ Failed to log link attempt: {e}")
 
@@ -5044,7 +5064,21 @@ async def process_oauth_notifications():
                                     if not guild:
                                         logger.warning(f"⚠️ Guild {guild_id} not found in bot")
                                     else:
+                                        # get_member reads the local cache only. A member who
+                                        # joined while the bot was down (or in a guild that had
+                                        # not finished chunking) is absent from it, which silently
+                                        # skipped the role grant — fall back to the API.
                                         member = guild.get_member(int(discord_id))
+                                        if not member:
+                                            try:
+                                                member = await guild.fetch_member(int(discord_id))
+                                            except discord.NotFound:
+                                                member = None
+                                            except discord.HTTPException as fetch_err:
+                                                logger.warning(
+                                                    f"⚠️ Could not fetch member {discord_id} in {guild.name}: {fetch_err}"
+                                                )
+                                                member = None
                                         if not member:
                                             logger.warning(f"⚠️ Member {discord_id} not found in guild {guild.name}")
                                         else:
@@ -5072,7 +5106,7 @@ async def process_oauth_notifications():
                                                 logger.error(f"❌ Failed to query linked role ID: {query_err}")
                                                 linked_role_id = None
 
-                                            if linked_role_id and linked_role_id.strip():
+                                            if linked_role_id and str(linked_role_id).strip():
                                                 try:
                                                     role = guild.get_role(int(linked_role_id))
                                                     if not role:
@@ -5082,6 +5116,21 @@ async def process_oauth_notifications():
                                                     elif role in member.roles:
                                                         logger.info(
                                                             f"ℹ️ Member {member.display_name} already has role '{role.name}'"
+                                                        )
+                                                    elif not guild.me.guild_permissions.manage_roles:
+                                                        # The two silent-failure causes worth naming: without
+                                                        # Manage Roles, or with the target role above the bot's
+                                                        # top role, Discord rejects the grant and the streamer
+                                                        # only sees "the role wasn't given".
+                                                        logger.error(
+                                                            f"❌ Cannot grant '{role.name}' in {guild.name}: "
+                                                            f"the bot is missing the Manage Roles permission"
+                                                        )
+                                                    elif role >= guild.me.top_role:
+                                                        logger.error(
+                                                            f"❌ Cannot grant '{role.name}' in {guild.name}: it is "
+                                                            f"positioned above the bot's highest role "
+                                                            f"('{guild.me.top_role.name}') — move the bot's role up"
                                                         )
                                                     else:
                                                         _plat_label = "Twitch" if link_platform == "twitch" else "Kick"
@@ -5094,6 +5143,14 @@ async def process_oauth_notifications():
                                                         )
                                                 except ValueError as val_err:
                                                     logger.error(f"❌ Invalid role ID {linked_role_id}: {val_err}")
+                                                except discord.Forbidden as forbid_err:
+                                                    logger.error(
+                                                        f"❌ Discord refused the linked-role grant in {guild.name}: {forbid_err}"
+                                                    )
+                                                except discord.HTTPException as http_err:
+                                                    logger.error(
+                                                        f"❌ Linked-role grant failed (Discord API): {http_err}"
+                                                    )
                                             else:
                                                 logger.warning(f"⚠️ No linked role configured for guild {guild_id}")
                                 except Exception as role_error:
