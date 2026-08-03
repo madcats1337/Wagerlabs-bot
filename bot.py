@@ -35,6 +35,7 @@ from utils.redis_signing import sign_payload  # noqa: E402
 from utils.secret_settings import SecretConfigError, SecretDecryptError, decrypt_secret, encrypt_secret  # noqa: E402
 from utils.server_urls import get_server_base_url, get_server_public_page_url  # noqa: E402
 from utils.subscription_tier import server_has_feature, upgrade_message  # noqa: E402
+from utils.wager_leaderboard import next_period_window, period_leaderboard_rows  # noqa: E402
 
 # Platform that the chat message currently being handled arrived on ('kick' |
 # 'twitch'). Set at the top of _handle_incoming_message so send_kick_message can
@@ -5844,10 +5845,12 @@ async def before_clip_buffer_task():
 # Leaderboard period auto-renewal (Tier 4: "leaderboard_generator")
 #
 # When an active wager_leaderboard_periods row's end_date passes, freeze its
-# top-N snapshot (the SAME SUM(wager_delta) math as the dashboard's
-# get_wager_leaderboard) and, if auto_renew is on, immediately start the next
-# back-to-back period (new.start = old.end, new.end = old.end + duration),
-# copying the prizes/site/settings.
+# top-N snapshot (the SAME baseline math and the SAME shuffle_wager_totals rows
+# the dashboard renders — compute_shuffle_leaderboard) and, if auto_renew is on,
+# immediately start the next back-to-back period, copying the prizes/site/
+# settings. The new window comes from utils.wager_leaderboard.next_period_window,
+# which rolls calendar boards by calendar months so a monthly leaderboard stays
+# pinned to the 1st.
 #
 # These tables are wager-leaderboard-specific — this task NEVER touches
 # raffle_periods, points, or watchtime. It mirrors the raffle period-rollover
@@ -5923,26 +5926,29 @@ def _fetch_howl_freeze_rows(conn, server_id, start_dt, end_dt, winner_count):
 
 
 def _shuffle_lifetime_totals(conn, server_id):
-    """Lifetime totals per shuffle user, from the bot's tracked rows (DB read).
+    """Lifetime (RTP-WEIGHTED) totals per shuffle user — a pure DB read.
 
-    The shuffle tracker already polls the affiliate URL continuously and stores
-    total_wager_usd in raffle_shuffle_wagers, so the leaderboard reads THOSE rows
-    instead of fetching shuffle's API again (shuffle 400s with TOO_MANY_REQUEST
-    when many surfaces hit it). Pure DB read — no external request.
+    Reads `shuffle_wager_totals`: the period-INDEPENDENT table the tracker
+    upserts on every poll (ShuffleWagerTracker._store_lifetime_totals), which is
+    the SAME source the dashboard renders from
+    (Admin-Dashboard utils/database.py::get_shuffle_totals_from_db). Both sides
+    MUST read this table — it holds the RTP-weighted total from shuffle's
+    /wager/<id> endpoint, whereas raffle_shuffle_wagers holds the RAW wagerAmount
+    and only has rows while a raffle period is running. Baselining from raw while
+    displaying weighted made the board show `weighted_now - raw_baseline`, which
+    is understated and clamps to $0.00 for most users.
 
-    One row per username (most recent), INDEPENDENT of any raffle period_id.
     Returns {uname_key: (username, total)}.
     """
     rows = conn.execute(
         text(
             """
-            SELECT DISTINCT ON (LOWER(shuffle_username))
+            SELECT
                 LOWER(shuffle_username) AS uname_key,
                 shuffle_username,
                 CAST(total_wager_usd AS FLOAT) AS total
-            FROM raffle_shuffle_wagers
+            FROM shuffle_wager_totals
             WHERE discord_server_id = :sid AND platform = 'shuffle'
-            ORDER BY LOWER(shuffle_username), last_updated DESC
             """
         ),
         {"sid": server_id},
@@ -5951,15 +5957,16 @@ def _shuffle_lifetime_totals(conn, server_id):
 
 
 def _shuffle_identity(conn, server_id):
-    """Map shuffle username -> (kick_name, discord_id) for link badges (DB)."""
+    """Map shuffle username -> (kick_name, discord_id) for link badges (DB).
+
+    Same source as _shuffle_lifetime_totals (one row per server/platform/username).
+    """
     rows = conn.execute(
         text(
             """
-            SELECT DISTINCT ON (LOWER(shuffle_username))
-                LOWER(shuffle_username) AS uname_key, kick_name, discord_id
-            FROM raffle_shuffle_wagers
+            SELECT LOWER(shuffle_username) AS uname_key, kick_name, discord_id
+            FROM shuffle_wager_totals
             WHERE discord_server_id = :sid AND platform = 'shuffle'
-            ORDER BY LOWER(shuffle_username), last_updated DESC
             """
         ),
         {"sid": server_id},
@@ -5990,31 +5997,31 @@ def _ensure_leaderboard_baselines(conn, period_id, totals, identity):
         )
 
 
-def _shuffle_baseline_rows(conn, period_id, server_id, winner_count):
-    """Top-N shuffle rows for a period via the baseline model (SQLAlchemy).
-
-    leaderboard_value = max(0, current_lifetime_total - period_baseline), where
-    the current total comes from the affiliate URL. Baselines are seeded by the
-    live sync, so freezing just reads them.
-    """
-    totals = _shuffle_lifetime_totals(conn, server_id)
-    identity = _shuffle_identity(conn, server_id)
-    baselines = {
+def _period_baselines(conn, period_id):
+    """Baseline map {uname_key: baseline_amount} for a leaderboard period."""
+    return {
         str(u).lower(): float(b)
         for u, b in conn.execute(
             text("SELECT shuffle_username, baseline_amount FROM wager_leaderboard_baselines WHERE period_id = :pid"),
             {"pid": period_id},
         ).fetchall()
     }
-    rows = []
-    for key, (username, total) in totals.items():
-        baseline = baselines.get(key, total)
-        period_wagered = round(max(0.0, total - baseline), 2)
-        if period_wagered > 0:
-            kick, did = identity.get(key, (None, None))
-            rows.append((username, kick, did, did is not None, period_wagered))
-    rows.sort(key=lambda t: t[4], reverse=True)
-    return rows[: winner_count or 10]
+
+
+def _shuffle_baseline_rows(conn, period_id, server_id, winner_count):
+    """Top-N shuffle rows for a period via the baseline model (SQLAlchemy).
+
+    leaderboard_value = max(0, current_lifetime_total - period_baseline), with
+    the totals read from `shuffle_wager_totals` — the same rows the dashboard
+    renders. Baselines are seeded by the live sync, so freezing just reads them.
+    The row math itself lives in utils.wager_leaderboard so it stays in step with
+    the dashboard's compute_shuffle_leaderboard (including keeping $0.00 rows, so
+    a frozen snapshot matches what the public page displayed).
+    """
+    totals = _shuffle_lifetime_totals(conn, server_id)
+    identity = _shuffle_identity(conn, server_id)
+    baselines = _period_baselines(conn, period_id)
+    return period_leaderboard_rows(totals, identity, baselines, winner_count)
 
 
 def _freeze_leaderboard_snapshot(conn, period_id, server_id, start_dt, end_dt, winner_count, site="shuffle"):
@@ -6066,6 +6073,65 @@ def _freeze_leaderboard_snapshot(conn, period_id, server_id, start_dt, end_dt, w
     return len(rows)
 
 
+def _repair_raw_anchored_baselines(conn, server_id):
+    """One-shot repair of baselines left over from the RAW wager source.
+
+    Until this fix the sync below snapshotted baselines from raffle_shuffle_wagers
+    (RAW wagerAmount) while the dashboard renders shuffle_wager_totals
+    (RTP-WEIGHTED), so an active period displayed `weighted_now - raw_baseline`.
+    Weighted totals only ever grow, so any baseline sitting ABOVE the user's
+    current weighted total is provably from the raw source — re-anchor exactly
+    those to the current total (the same thing the period's own new-user
+    snapshotting would have done), leaving already-correct baselines untouched.
+
+    Runs once per server (marker row), so a temporary dip in a reported total can
+    never keep lowering a live baseline.
+    """
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS wager_leaderboard_baseline_repair (
+                discord_server_id BIGINT PRIMARY KEY,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    )
+    claimed = conn.execute(
+        text(
+            """
+            INSERT INTO wager_leaderboard_baseline_repair (discord_server_id)
+            VALUES (:sid)
+            ON CONFLICT (discord_server_id) DO NOTHING
+            RETURNING discord_server_id
+            """
+        ),
+        {"sid": server_id},
+    ).fetchone()
+    if not claimed:
+        return
+
+    result = conn.execute(
+        text(
+            """
+            UPDATE wager_leaderboard_baselines b
+            SET baseline_amount = t.total_wager_usd
+            FROM wager_leaderboard_periods p, shuffle_wager_totals t
+            WHERE b.period_id = p.id
+              AND p.discord_server_id = :sid
+              AND p.status = 'active'
+              AND t.discord_server_id = :sid
+              AND t.platform = 'shuffle'
+              AND LOWER(t.shuffle_username) = LOWER(b.shuffle_username)
+              AND b.baseline_amount > t.total_wager_usd
+            """
+        ),
+        {"sid": server_id},
+    )
+    if result.rowcount:
+        logger.info(f"[Leaderboard] Re-anchored {result.rowcount} stale baseline(s) to weighted totals")
+
+
 def _sync_active_leaderboard_baselines(conn, guild_id, now):
     """Snapshot baselines for active, started SHUFFLE periods (decoupled from raffle).
 
@@ -6096,6 +6162,7 @@ def _sync_active_leaderboard_baselines(conn, guild_id, now):
         if (site or "shuffle").lower() == "howl":
             continue
         if totals is None:
+            _repair_raw_anchored_baselines(conn, guild_id)
             totals = _shuffle_lifetime_totals(conn, guild_id)
             identity = _shuffle_identity(conn, guild_id)
         if totals:
@@ -6160,11 +6227,12 @@ async def leaderboard_sync_task():
                 )
                 logger.info(f"[Leaderboard] Froze period {pid} ({count} winners)")
 
-                # 2) Roll over if auto-renew is on. Back-to-back, same duration.
+                # 2) Roll over if auto-renew is on. Back-to-back; a calendar
+                #    window (monthly/quarterly/…) rolls by calendar months so it
+                #    stays pinned to the 1st instead of drifting a day or three
+                #    every renewal. See utils.wager_leaderboard.
                 if auto_renew:
-                    duration = end_dt - start_dt
-                    new_start = end_dt
-                    new_end = end_dt + duration
+                    new_start, new_end = next_period_window(start_dt, end_dt)
                     new_id = conn.execute(
                         text(
                             """
@@ -6201,7 +6269,18 @@ async def leaderboard_sync_task():
                         ),
                         {"new_id": new_id, "old_id": pid},
                     )
-                    logger.info(f"[Leaderboard] Auto-renewed period {pid} -> {new_id}")
+                    # Seed the new window's baselines from the SAME totals the
+                    # freeze above just read, inside this transaction. Waiting for
+                    # the next tick would leave up to 2 minutes of wagering
+                    # counted against neither period.
+                    if (site or "shuffle").lower() != "howl":
+                        totals = _shuffle_lifetime_totals(conn, guild_id)
+                        if totals:
+                            _ensure_leaderboard_baselines(conn, new_id, totals, _shuffle_identity(conn, guild_id))
+                    logger.info(
+                        f"[Leaderboard] Auto-renewed period {pid} -> {new_id} "
+                        f"({new_start:%Y-%m-%d} → {new_end:%Y-%m-%d})"
+                    )
         except Exception as e:
             # Fail safe: skip this guild and retry next tick. Never end/create
             # from a partial read (the raffle period-rollover lesson).
