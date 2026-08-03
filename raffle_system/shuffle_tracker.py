@@ -16,6 +16,8 @@ from datetime import datetime
 import aiohttp
 from sqlalchemy import text
 
+from utils.wager_leaderboard import is_http_url, resolve_shuffle_stats_url
+
 from .tickets import TicketManager
 
 logger = logging.getLogger(__name__)
@@ -77,6 +79,53 @@ class ShuffleWagerTracker:
             return affiliate_url
         return affiliate_url.replace("/stats/", "/wager/", 1)
 
+    def _leaderboard_stats_url(self):
+        """The active leaderboard period's "Stats URL" for this server, or "".
+
+        Read fresh on every poll (this runs from refresh_settings) so editing the
+        period's Stats URL takes effect without a bot restart, exactly like the
+        other wager settings. A DB failure returns "" so the caller falls back to
+        the Profile Settings affiliate URL rather than losing wager tracking.
+        """
+        if not self.server_id or self.engine is None:
+            return ""
+        try:
+            with self.engine.begin() as conn:
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT stats_url FROM wager_leaderboard_periods
+                        WHERE discord_server_id = :sid
+                          AND status = 'active'
+                          AND site = 'shuffle'
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"sid": self.server_id},
+                ).fetchone()
+        except Exception as e:
+            logger.info(f"[Shuffle Tracker] leaderboard stats_url lookup failed: {type(e).__name__}: {e}")
+            return ""
+        return (row[0] or "").strip() if row else ""
+
+    def _resolve_shuffle_url(self, affiliate_url):
+        """Stats URL (active leaderboard period) with the Affiliate URL as fallback.
+
+        The leaderboard's own "Stats URL" field is what the streamer wants tracked
+        for that board; blank means "use the Affiliate URL from Profile Settings".
+        A value that isn't an http(s) URL is ignored (with a warning) so a typo
+        degrades to the server's affiliate URL instead of taking wager tracking
+        offline.
+        """
+        stats_url = self._leaderboard_stats_url()
+        if stats_url and not is_http_url(stats_url):
+            logger.warning(
+                f"[Shuffle Tracker] Ignoring leaderboard Stats URL {stats_url[:60]!r} "
+                f"— not an http(s) URL; using the Profile Settings affiliate URL"
+            )
+        return resolve_shuffle_stats_url(stats_url, affiliate_url)
+
     def _load_settings(self):
         """Load wager settings from bot_settings (database) or environment variables.
 
@@ -84,6 +133,9 @@ class ShuffleWagerTracker:
         in Profile Settings). Because this runs before EVERY poll (refresh_settings)
         and on every dashboard settings save, switching the platform hot-swaps the
         SAME tracker object to the other API — no restart, no second tracker.
+
+        For shuffle the URL is resolved per-poll as the active leaderboard period's
+        "Stats URL", falling back to the Profile Settings "Affiliate URL".
         """
         if self.bot_settings:
             # Refresh to get latest values
@@ -106,10 +158,11 @@ class ShuffleWagerTracker:
                 self.tickets_per_1000 = self.bot_settings.shuffle_tickets_per_1000 or 20
             else:
                 self.howl_api_key = ""
-                # Strip so a blank-but-not-empty value (stray spaces from a cleared
-                # dashboard field) is treated as "not configured" — the task's
-                # empty-URL guard then skips this server instead of fetching "   ".
-                self.affiliate_url = (self.bot_settings.shuffle_affiliate_url or "").strip()
+                # Leaderboard "Stats URL" first, else Profile Settings' "Affiliate
+                # URL". Blank/whitespace-only values (a cleared dashboard field)
+                # resolve to "" — the task's empty-URL guard then skips this server
+                # instead of fetching "   ".
+                self.affiliate_url = self._resolve_shuffle_url(self.bot_settings.shuffle_affiliate_url)
                 self.campaign_code = self.bot_settings.shuffle_campaign_code or "lele"
                 self.tickets_per_1000 = self.bot_settings.shuffle_tickets_per_1000 or 20
         else:
@@ -122,9 +175,10 @@ class ShuffleWagerTracker:
                 self.tickets_per_1000 = int(os.getenv("WAGER_TICKETS_PER_1000_USD", "20"))
             else:
                 self.howl_api_key = ""
-                self.affiliate_url = (
+                # Same precedence as the DB path: the leaderboard's Stats URL wins.
+                self.affiliate_url = self._resolve_shuffle_url(
                     os.getenv("WAGER_AFFILIATE_URL") or os.getenv("SHUFFLE_AFFILIATE_URL", "")
-                ).strip()
+                )
                 self.campaign_code = os.getenv("WAGER_CAMPAIGN_CODE") or os.getenv("SHUFFLE_CAMPAIGN_CODE", "lele")
                 self.tickets_per_1000 = int(os.getenv("WAGER_TICKETS_PER_1000_USD", "20"))
 

@@ -6,7 +6,7 @@ period-window math and the shuffle baseline model can be unit tested without
 importing bot.py. The SQL that feeds these lives in bot.py's
 `leaderboard_sync_task` section.
 
-Two concerns:
+Three concerns:
 
   • next_period_window() — where an auto-renewing period rolls to. Calendar
     windows must roll by CALENDAR months, not by their raw duration, or a
@@ -15,6 +15,7 @@ Two concerns:
     (max(0, current_lifetime_total - period_baseline)). Mirrors the dashboard's
     utils/database.py::compute_shuffle_leaderboard so the snapshot the bot
     freezes matches exactly what the public page was showing.
+  • resolve_shuffle_stats_url() — which Shuffle URL the wager tracker polls.
 """
 
 import calendar
@@ -84,6 +85,30 @@ def next_period_window(start: datetime, end: datetime):
                 new_start = end + _ONE_SECOND
                 return new_start, add_months(new_start, months, keep_month_end=keep_month_end) - _ONE_SECOND
     return end, end + (end - start)
+
+
+def is_http_url(value) -> bool:
+    """True for a non-empty http(s) URL. Used to reject a mistyped Stats URL."""
+    return bool(value) and str(value).strip().lower().startswith(("http://", "https://"))
+
+
+def resolve_shuffle_stats_url(period_stats_url, affiliate_url) -> str:
+    """The Shuffle URL the wager tracker should poll.
+
+    The active leaderboard period's "Stats URL" wins, so a board can be tracked
+    against a specific Shuffle affiliate stats page. Blank — or anything that
+    isn't an http(s) URL — falls back to the server's Affiliate URL from Profile
+    Settings, so a typo degrades to the old source instead of silently taking
+    wager tracking offline.
+
+    The fallback is returned as-is (only stripped): it is the value the tracker
+    has always polled, and it is not this function's job to start rejecting it.
+    "" means "wager tracking isn't set up for this server" and the caller skips
+    the poll.
+    """
+    if is_http_url(period_stats_url):
+        return str(period_stats_url).strip()
+    return (affiliate_url or "").strip()
 
 
 def period_leaderboard_rows(totals, identity, baselines, winner_count):
