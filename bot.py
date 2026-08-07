@@ -8707,6 +8707,75 @@ async def sync_shuffle_role_on_startup(bot, engine):
 # Bot events
 # -------------------------
 @bot.event
+async def on_member_join(member):
+    """Restore linked roles if a member leaves and rejoins."""
+    if not hasattr(bot, "engine") and "engine" not in globals():
+        return
+
+    guild_id = member.guild.id
+    discord_id = member.id
+
+    set_server(guild_id, member.guild.name)
+    logger.info(f"👤 Member joined: {member.name} ({discord_id})")
+
+    try:
+        # Check if the user has linked their Kick or Twitch account in this server
+        with engine.connect() as conn:
+            links = conn.execute(
+                text(
+                    """
+                    SELECT platform, kick_name
+                    FROM links
+                    WHERE discord_id = :discord_id AND discord_server_id = :guild_id
+                """
+                ),
+                {"discord_id": int(discord_id), "guild_id": guild_id},
+            ).fetchall()
+
+            if not links:
+                return
+
+            for link in links:
+                platform = link[0] or "kick"
+                kick_username = link[1]
+
+                # Retrieve the configured linked_role_id for the platform
+                role_setting_key = "twitch_linked_role_id" if platform == "twitch" else "kick_linked_role_id"
+
+                linked_role_id = conn.execute(
+                    text(
+                        """
+                        SELECT value FROM bot_settings
+                        WHERE key = :role_key AND discord_server_id = :guild_id
+                    """
+                    ),
+                    {"role_key": role_setting_key, "guild_id": guild_id},
+                ).scalar()
+
+                if linked_role_id and str(linked_role_id).strip():
+                    try:
+                        role = member.guild.get_role(int(linked_role_id))
+                        if role and role not in member.roles:
+                            if member.guild.me.guild_permissions.manage_roles and role < member.guild.me.top_role:
+                                _plat_label = "Twitch" if platform == "twitch" else "Kick"
+                                await member.add_roles(
+                                    role,
+                                    reason=f"Restored {_plat_label} link on rejoin: {kick_username}",
+                                )
+                                logger.info(
+                                    f"✅ Restored role '{role.name}' to {member.display_name} for {_plat_label} link"
+                                )
+                            else:
+                                logger.error(
+                                    f"❌ Cannot grant '{role.name}' in {member.guild.name} (permissions/hierarchy)"
+                                )
+                    except ValueError:
+                        pass
+    except Exception as e:
+        logger.error(f"❌ Error restoring linked role for {discord_id}: {e}")
+
+
+@bot.event
 async def on_guild_remove(guild):
     """Free per-guild state when the bot is removed from a guild.
 

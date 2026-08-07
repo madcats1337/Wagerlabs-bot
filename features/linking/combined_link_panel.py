@@ -276,9 +276,41 @@ class CombinedLinkPanelView(LayoutView):
                     ),
                     {"d": discord_id, "sid": guild_id, "p": platform},
                 ).fetchone()
+
+                linked_role_id = None
+                if existing and guild_id:
+                    role_setting_key = "twitch_linked_role_id" if platform == "twitch" else "kick_linked_role_id"
+                    linked_role_id = conn.execute(
+                        text("SELECT value FROM bot_settings WHERE key = :role_key AND discord_server_id = :guild_id"),
+                        {"role_key": role_setting_key, "guild_id": guild_id},
+                    ).scalar()
+
             if existing:
+                kick_username = existing[0]
+
+                # Attempt to re-grant the linked role if they don't have it
+                if linked_role_id and str(linked_role_id).strip() and interaction.guild:
+                    try:
+                        role = interaction.guild.get_role(int(linked_role_id))
+                        if role and role not in interaction.user.roles:
+                            if (
+                                interaction.guild.me.guild_permissions.manage_roles
+                                and role < interaction.guild.me.top_role
+                            ):
+                                _plat_label = "Twitch" if platform == "twitch" else "Kick"
+                                await interaction.user.add_roles(
+                                    role,
+                                    reason=f"Restored {_plat_label} link on panel click: {kick_username}",
+                                )
+                                logger.info(
+                                    f"✅ Restored role '{role.name}' to {interaction.user.display_name} for {_plat_label} link"
+                                )
+                    except ValueError:
+                        pass
+
                 await interaction.response.send_message(
-                    f"✅ Your {platform.capitalize()} is already linked to **{existing[0]}**!", ephemeral=True
+                    f"✅ Your {platform.capitalize()} is already linked to **{kick_username}**! (Role access verified)",
+                    ephemeral=True,
                 )
                 return
         except Exception as e:
