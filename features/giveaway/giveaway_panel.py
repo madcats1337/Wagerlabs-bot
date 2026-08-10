@@ -72,6 +72,31 @@ def _fmt_stamp(value) -> str:
     return f"<t:{int(value.timestamp())}:f>"
 
 
+def _tickets_per_join(giveaway, member) -> int:
+    """How many tickets one join is worth for this member.
+
+    A role bonus is a WEIGHTING, not an extra click: `max_entries_per_user` caps
+    how many times someone may enter, and each entry is then worth 1 + bonus
+    tickets. (Capping the ticket total instead would make bonuses a no-op in the
+    usual setup, where multiple entries are off and the cap is 1.)
+
+    When several configured roles match, the HIGHEST bonus wins rather than
+    stacking, so overlapping roles stay predictable.
+    """
+    bonus_roles = giveaway.get("bonus_roles")
+    if not isinstance(bonus_roles, dict) or not hasattr(member, "roles"):
+        return 1
+    member_role_ids = {str(r.id) for r in member.roles}
+    extra = 0
+    for role_id, bonus in bonus_roles.items():
+        if str(role_id) in member_role_ids:
+            try:
+                extra = max(extra, int(bonus))
+            except (TypeError, ValueError):
+                continue
+    return 1 + max(0, extra)
+
+
 def _entry_count(engine, giveaway_id, guild_id) -> int:
     with engine.connect() as conn:
         row = conn.execute(
@@ -87,30 +112,50 @@ def _entry_count(engine, giveaway_id, guild_id) -> int:
     return int(row[0]) if row else 0
 
 
-def _active_discord_giveaway(engine, guild_id):
+def _active_discord_giveaway(engine, guild_id, message_id=None):
     """The guild's live Discord-hosted giveaway, or None.
 
     Read fresh on every interaction — the persistent view is shared across all
     guilds and all giveaways, so this is the only source of truth.
+    If message_id is provided, accurately finds the specific giveaway.
     """
     with engine.connect() as conn:
-        row = conn.execute(
-            text(
-                """
-                SELECT id, title, description, status, started_at, ends_at, ended_at,
-                       max_winners, discord_channel_id, discord_message_id,
-                       allow_multiple_entries, max_entries_per_user,
-                       required_role_id, entry_prompt
-                FROM giveaways
-                WHERE discord_server_id = :sid
-                  AND entry_method = 'discord'
-                  AND status = 'active'
-                ORDER BY started_at DESC NULLS LAST
-                LIMIT 1
-                """
-            ),
-            {"sid": guild_id},
-        ).fetchone()
+        if message_id:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT id, title, description, status, started_at, ends_at, ended_at,
+                           max_winners, discord_channel_id, discord_message_id,
+                           allow_multiple_entries, max_entries_per_user,
+                           required_role_id, entry_prompt, bonus_roles
+                    FROM giveaways
+                    WHERE discord_server_id = :sid
+                      AND discord_message_id = :mid
+                      AND entry_method = 'discord'
+                      AND status = 'active'
+                    LIMIT 1
+                    """
+                ),
+                {"sid": guild_id, "mid": str(message_id)},
+            ).fetchone()
+        else:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT id, title, description, status, started_at, ends_at, ended_at,
+                           max_winners, discord_channel_id, discord_message_id,
+                           allow_multiple_entries, max_entries_per_user,
+                           required_role_id, entry_prompt, bonus_roles
+                    FROM giveaways
+                    WHERE discord_server_id = :sid
+                      AND entry_method = 'discord'
+                      AND status = 'active'
+                    ORDER BY started_at DESC NULLS LAST
+                    LIMIT 1
+                    """
+                ),
+                {"sid": guild_id},
+            ).fetchone()
     return dict(row._mapping) if row else None
 
 
@@ -219,7 +264,9 @@ class GiveawayPanelView(discord.ui.LayoutView):
             await interaction.response.send_message("This only works in a server.", ephemeral=True)
             return
 
-        giveaway = _active_discord_giveaway(self.engine, guild_id)
+        giveaway = _active_discord_giveaway(
+            self.engine, guild_id, interaction.message.id if interaction.message else None
+        )
         if not giveaway:
             await interaction.response.send_message("This giveaway has ended.", ephemeral=True)
             return
@@ -250,7 +297,9 @@ class GiveawayPanelView(discord.ui.LayoutView):
         # Cheap pre-check so an ineligible member is told BEFORE being shown a
         # modal they would fill in for nothing. The authoritative check runs
         # again inside the write transaction.
-        blocked = self._entry_block_reason(giveaway, guild_id, interaction.user.id)
+        blocked = self._entry_block_reason(
+            giveaway, guild_id, interaction.user.id, per_join=_tickets_per_join(giveaway, interaction.user)
+        )
         if blocked:
             await interaction.response.send_message(blocked, ephemeral=True)
             return
@@ -264,8 +313,13 @@ class GiveawayPanelView(discord.ui.LayoutView):
 
         await self._commit_entry(interaction, giveaway, answer=None)
 
-    def _entry_block_reason(self, giveaway, guild_id, discord_id):
-        """Why this member may not enter right now, or None if they may."""
+    def _entry_block_reason(self, giveaway, guild_id, discord_id, per_join=1):
+        """Why this member may not enter right now, or None if they may.
+
+        `per_join` is how many tickets one join is worth for THIS member (1 plus
+        any role bonus), so the stored ticket count can be converted back into a
+        join count for the cap check.
+        """
         allow_multiple = bool(giveaway.get("allow_multiple_entries"))
         max_per_user = int(giveaway.get("max_entries_per_user") or 1)
         with self.engine.connect() as conn:
@@ -282,7 +336,8 @@ class GiveawayPanelView(discord.ui.LayoutView):
             return None
         if not allow_multiple:
             return "You are already entered - good luck!"
-        if int(row[0]) >= max_per_user:
+        joins_so_far = -(-int(row[0]) // max(1, per_join))  # ceil division
+        if joins_so_far >= max_per_user:
             return f"You have reached the maximum of {max_per_user} entries."
         return None
 
@@ -294,6 +349,8 @@ class GiveawayPanelView(discord.ui.LayoutView):
         display = user.display_name or user.name
         allow_multiple = bool(giveaway.get("allow_multiple_entries"))
         max_per_user = int(giveaway.get("max_entries_per_user") or 1)
+
+        entries_to_add = _tickets_per_join(giveaway, user)
 
         with self.engine.begin() as conn:
             existing = conn.execute(
@@ -312,7 +369,12 @@ class GiveawayPanelView(discord.ui.LayoutView):
                 if not allow_multiple:
                     await interaction.response.send_message("You are already entered - good luck!", ephemeral=True)
                     return
-                if int(existing[1]) >= max_per_user:
+                # The cap counts JOINS, not tickets — `entry_count` holds tickets
+                # once a role bonus is applied, so dividing by the per-join value
+                # recovers how many times this member has actually entered.
+                per_join = max(1, entries_to_add)
+                joins_so_far = -(-int(existing[1]) // per_join)  # ceil division
+                if joins_so_far >= max_per_user:
                     await interaction.response.send_message(
                         f"You have reached the maximum of {max_per_user} entries.", ephemeral=True
                     )
@@ -321,14 +383,14 @@ class GiveawayPanelView(discord.ui.LayoutView):
                     text(
                         """
                         UPDATE giveaway_entries
-                        SET entry_count = entry_count + 1,
+                        SET entry_count = entry_count + :entries_to_add,
                             entry_answer = COALESCE(:answer, entry_answer)
                         WHERE id = :id
                         """
                     ),
-                    {"id": existing[0], "answer": answer},
+                    {"id": existing[0], "answer": answer, "entries_to_add": entries_to_add},
                 )
-                new_count = int(existing[1]) + 1
+                new_count = int(existing[1]) + entries_to_add
             else:
                 # kick_username stays NULL for Discord entrants; the canonical
                 # identity for the draw is COALESCE(kick_username, discord_username).
@@ -338,7 +400,7 @@ class GiveawayPanelView(discord.ui.LayoutView):
                         INSERT INTO giveaway_entries
                           (giveaway_id, discord_server_id, discord_id, discord_username,
                            display_name, entry_method, entry_count, profile_pic_url, entry_answer)
-                        VALUES (:gid, :sid, :did, :uname, :display, 'discord', 1, :pfp, :answer)
+                        VALUES (:gid, :sid, :did, :uname, :display, 'discord', :entries_to_add, :pfp, :answer)
                         """
                     ),
                     {
@@ -349,12 +411,13 @@ class GiveawayPanelView(discord.ui.LayoutView):
                         "display": display,
                         "pfp": str(user.display_avatar.url) if user.display_avatar else None,
                         "answer": answer,
+                        "entries_to_add": entries_to_add,
                     },
                 )
-                new_count = 1
+                new_count = entries_to_add
 
         await interaction.response.send_message(
-            f"You are in! ({new_count} {'entry' if new_count == 1 else 'entries'})",
+            f"You are in **{giveaway.get('title', 'Giveaway')}**! ({new_count} {'entry' if new_count == 1 else 'entries'})",
             ephemeral=True,
         )
 
@@ -451,7 +514,7 @@ async def refresh_panel(bot, engine, guild_id, giveaway_id, ended=False, winners
                 """
                 SELECT id, title, description, status, started_at, ends_at, ended_at,
                        max_winners, discord_channel_id, discord_message_id,
-                       required_role_id, entry_prompt
+                       required_role_id, entry_prompt, bonus_roles
                 FROM giveaways
                 WHERE id = :gid AND discord_server_id = :sid
                 """

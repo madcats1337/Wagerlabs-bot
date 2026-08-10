@@ -2870,6 +2870,15 @@ bot = commands.Bot(
 # bot connects, making them available in every server that installs Wagerlabs.
 register_wagerlabs_slash_commands(bot, engine)
 
+# /giveaway start — launch a giveaway from a saved template. Registered on the
+# same local tree so it is published by the existing global sync.
+try:
+    from features.giveaway.giveaway_commands import register_giveaway_commands
+
+    register_giveaway_commands(bot, engine)
+except Exception as e:
+    logger.warning(f"Could not register /giveaway commands: {e}")
+
 
 @bot.before_invoke
 async def deduplicate_command(ctx):
@@ -9255,7 +9264,8 @@ async def on_ready():
                     ADD COLUMN IF NOT EXISTS ends_at TIMESTAMP,
                     ADD COLUMN IF NOT EXISTS max_winners INTEGER NOT NULL DEFAULT 1,
                     ADD COLUMN IF NOT EXISTS required_role_id BIGINT,
-                    ADD COLUMN IF NOT EXISTS entry_prompt VARCHAR(45)
+                    ADD COLUMN IF NOT EXISTS entry_prompt VARCHAR(45),
+                    ADD COLUMN IF NOT EXISTS bonus_roles JSONB
                 """
                     )
                 )
@@ -9282,6 +9292,52 @@ async def on_ready():
                 )
                 conn.execute(text("ALTER TABLE giveaway_entries ALTER COLUMN kick_username DROP NOT NULL"))
                 logger.debug("✅ Discord-hosted giveaway columns ready")
+
+                # Reusable giveaway settings (no title/description/duration —
+                # those are supplied per run). Mirrors the dashboard's
+                # run_migrations(); either service may boot first.
+                conn.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS giveaway_templates (
+                        id SERIAL PRIMARY KEY,
+                        discord_server_id VARCHAR(50) NOT NULL,
+                        name VARCHAR(100) NOT NULL,
+                        entry_method VARCHAR(20) NOT NULL DEFAULT 'discord',
+                        max_winners INTEGER NOT NULL DEFAULT 1,
+                        allow_multiple_entries BOOLEAN DEFAULT FALSE,
+                        max_entries_per_user INTEGER DEFAULT 1,
+                        required_role_id BIGINT,
+                        discord_channel_id BIGINT,
+                        keyword VARCHAR(50),
+                        messages_required INTEGER,
+                        time_window_minutes INTEGER,
+                        bonus_roles JSONB,
+                        entry_prompt VARCHAR(45),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """
+                    )
+                )
+                # Additive for servers whose table predates the column.
+                conn.execute(text("ALTER TABLE giveaway_templates ADD COLUMN IF NOT EXISTS entry_prompt VARCHAR(45)"))
+                conn.execute(
+                    text(
+                        """
+                    CREATE INDEX IF NOT EXISTS idx_giveaway_templates_server
+                    ON giveaway_templates (discord_server_id)
+                """
+                    )
+                )
+                conn.execute(
+                    text(
+                        """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_giveaway_templates_server_name
+                    ON giveaway_templates (discord_server_id, lower(name))
+                """
+                    )
+                )
+                logger.debug("✅ giveaway_templates table ready")
 
                 # Add provably fair columns to slot_requests table
                 logger.debug("🔄 Checking provably fair columns in slot_requests table...")
