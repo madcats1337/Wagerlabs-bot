@@ -9237,7 +9237,9 @@ async def on_ready():
                     ADD COLUMN IF NOT EXISTS discord_message_id BIGINT,
                     ADD COLUMN IF NOT EXISTS duration_minutes INTEGER,
                     ADD COLUMN IF NOT EXISTS ends_at TIMESTAMP,
-                    ADD COLUMN IF NOT EXISTS max_winners INTEGER NOT NULL DEFAULT 1
+                    ADD COLUMN IF NOT EXISTS max_winners INTEGER NOT NULL DEFAULT 1,
+                    ADD COLUMN IF NOT EXISTS required_role_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS entry_prompt VARCHAR(45)
                 """
                     )
                 )
@@ -9257,7 +9259,8 @@ async def on_ready():
                         """
                     ALTER TABLE giveaway_entries
                     ADD COLUMN IF NOT EXISTS discord_username VARCHAR(255),
-                    ADD COLUMN IF NOT EXISTS display_name VARCHAR(255)
+                    ADD COLUMN IF NOT EXISTS display_name VARCHAR(255),
+                    ADD COLUMN IF NOT EXISTS entry_answer TEXT
                 """
                     )
                 )
