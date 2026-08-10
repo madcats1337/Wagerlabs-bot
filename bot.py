@@ -903,42 +903,51 @@ class KickWebSocketManager:
             # 🎁 GIVEAWAY: Track messages for keyword and active chatter detection
             if guild_id in giveaway_managers:
                 giveaway_manager = giveaway_managers[guild_id]
-                if giveaway_manager.active_giveaway:
-                    try:
-                        entry_method = giveaway_manager.active_giveaway["entry_method"]
-                        giveaway_id = giveaway_manager.active_giveaway["id"]
-                        entry_added = False
+                if giveaway_manager.active_giveaways:
+                    for giveaway in giveaway_manager.active_giveaways:
+                        try:
+                            entry_method = giveaway["entry_method"]
+                            giveaway_id = giveaway["id"]
+                            entry_added = False
 
-                        # Keyword detection - exact match only (no extra text)
-                        if entry_method == "keyword":
-                            keyword = giveaway_manager.active_giveaway.get("keyword", "").lower()
-                            if keyword and content.strip().lower() == keyword:
-                                entry_added = await giveaway_manager.add_entry(
-                                    username, entry_method="keyword", platform=platform, display_name=display_username
+                            # Keyword detection - exact match only (no extra text)
+                            if entry_method == "keyword":
+                                keyword = giveaway.get("keyword", "").lower()
+                                if keyword and content.strip().lower() == keyword:
+                                    entry_added = await giveaway_manager.add_entry(
+                                        username,
+                                        entry_method="keyword",
+                                        platform=platform,
+                                        display_name=display_username,
+                                        giveaway=giveaway,
+                                    )
+                                    if entry_added:
+                                        logger.info(f"🎁 Giveaway entry added: {username} (keyword: {keyword})")
+
+                            # Active chatter tracking
+                            elif entry_method == "active_chatter":
+                                entry_added = await giveaway_manager.track_message(
+                                    username,
+                                    content,
+                                    platform=platform,
+                                    display_name=display_username,
+                                    giveaway=giveaway,
                                 )
-                                if entry_added:
-                                    logger.info(f"🎁 Giveaway entry added: {username} (keyword: {keyword})")
 
-                        # Active chatter tracking
-                        elif entry_method == "active_chatter":
-                            entry_added = await giveaway_manager.track_message(
-                                username, content, platform=platform, display_name=display_username
-                            )
-
-                        # Notify the dashboard admin page so its entries list updates
-                        # live (session-scoped SSE forwards this by discord_server_id).
-                        if entry_added:
-                            publish_redis_event(
-                                channel="dashboard:giveaway",
-                                action="giveaway_entry",
-                                data={
-                                    "discord_server_id": guild_id,
-                                    "giveaway_id": giveaway_id,
-                                    "kick_username": username,
-                                },
-                            )
-                    except Exception as e:
-                        logger.info(f"⚠️ Giveaway tracking error: {e}")
+                            # Notify the dashboard admin page so its entries list updates
+                            # live (session-scoped SSE forwards this by discord_server_id).
+                            if entry_added:
+                                publish_redis_event(
+                                    channel="dashboard:giveaway",
+                                    action="giveaway_entry",
+                                    data={
+                                        "discord_server_id": guild_id,
+                                        "giveaway_id": giveaway_id,
+                                        "kick_username": username,
+                                    },
+                                )
+                        except Exception as e:
+                            logger.info(f"⚠️ Giveaway tracking error: {e}")
 
             # Process commands from Kick chat
             content_stripped = content.strip()
@@ -2721,22 +2730,29 @@ async def kick_chat_loop(channel_slug: str, guild_id: int):
                             # 🎁 GIVEAWAY: Track messages for keyword and active chatter detection
                             if guild_id in giveaway_managers:
                                 giveaway_manager = giveaway_managers[guild_id]
-                                if giveaway_manager.active_giveaway:
-                                    try:
-                                        entry_method = giveaway_manager.active_giveaway["entry_method"]
+                                if giveaway_manager.active_giveaways:
+                                    for giveaway in giveaway_manager.active_giveaways:
+                                        try:
+                                            entry_method = giveaway["entry_method"]
 
-                                        # Keyword detection - exact match only (no extra text)
-                                        if entry_method == "keyword":
-                                            keyword = giveaway_manager.active_giveaway.get("keyword", "").lower()
-                                            if keyword and content_stripped.lower() == keyword:
-                                                await giveaway_manager.add_entry(username, entry_method="keyword")
-                                                logger.info(f"🎁 Giveaway entry added: {username} (keyword: {keyword})")
+                                            # Keyword detection - exact match only (no extra text)
+                                            if entry_method == "keyword":
+                                                keyword = giveaway.get("keyword", "").lower()
+                                                if keyword and content_stripped.lower() == keyword:
+                                                    await giveaway_manager.add_entry(
+                                                        username, entry_method="keyword", giveaway=giveaway
+                                                    )
+                                                    logger.info(
+                                                        f"🎁 Giveaway entry added: {username} (keyword: {keyword})"
+                                                    )
 
-                                        # Active chatter tracking
-                                        elif entry_method == "active_chatter":
-                                            await giveaway_manager.track_message(username, content)
-                                    except Exception as e:
-                                        logger.info(f"⚠️ Giveaway tracking error: {e}")
+                                            # Active chatter tracking
+                                            elif entry_method == "active_chatter":
+                                                await giveaway_manager.track_message(
+                                                    username, content, giveaway=giveaway
+                                                )
+                                        except Exception as e:
+                                            logger.info(f"⚠️ Giveaway tracking error: {e}")
 
                             # Process commands
                             content_stripped = content.strip()

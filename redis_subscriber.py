@@ -1775,12 +1775,14 @@ class RedisSubscriber:
             if action == "giveaway_started":
                 logger.info(f"▶️  Starting giveaway {giveaway_id} for guild {guild_id}")
 
-                # Reload active giveaway from database
-                await giveaway_manager.load_active_giveaway()
+                # Reload active giveaways from database
+                active_giveaways = await giveaway_manager.load_active_giveaways()
+                started_giveaway = next((g for g in active_giveaways if g["id"] == giveaway_id), None)
 
-                if giveaway_manager.active_giveaway:
-                    giveaway_title = giveaway_manager.active_giveaway.get("title", "New Giveaway")
-                    entry_method = giveaway_manager.active_giveaway.get("entry_method", "keyword")
+                if started_giveaway:
+                    giveaway_title = started_giveaway.get("title", "New Giveaway")
+                    entry_method = started_giveaway.get("entry_method", "keyword")
+                    discord_channel_id = started_giveaway.get("discord_channel_id")
 
                     # Discord-hosted: post the interactive panel (Join button +
                     # entry count + optional countdown) to the giveaway's own
@@ -1793,7 +1795,7 @@ class RedisSubscriber:
                                 self.bot,
                                 engine,
                                 guild_id,
-                                giveaway_manager.active_giveaway,
+                                started_giveaway,
                             )
                         except Exception as panel_error:
                             logger.error(f"❌ Failed to post giveaway panel: {panel_error}", exc_info=True)
@@ -1801,59 +1803,60 @@ class RedisSubscriber:
                         return
 
                     # Announce in Discord.
-                    # Per-guild settings: `self.bot.settings_manager` is the
-                    # GLOBAL (first guild's) manager, so using it here sent every
-                    # guild's giveaway announcement to one server's channel.
-                    guild_settings = None
-                    if hasattr(self.bot, "get_guild_settings"):
-                        try:
-                            guild_settings = self.bot.get_guild_settings(guild_id)
-                        except Exception:
-                            guild_settings = None
-                    if guild_settings is None:
-                        guild_settings = getattr(self.bot, "settings_manager", None)
+                    announcement_channel_id = discord_channel_id
 
-                    if guild_settings is not None:
-                        announcement_channel_id = getattr(guild_settings, "raffle_announcement_channel_id", None)
-                        if announcement_channel_id:
-                            channel = self.bot.get_channel(announcement_channel_id)
-                            if channel:
-                                import discord
+                    if not announcement_channel_id:
+                        # Fallback to guild settings if no specific channel is set
+                        guild_settings = None
+                        if hasattr(self.bot, "get_guild_settings"):
+                            try:
+                                guild_settings = self.bot.get_guild_settings(guild_id)
+                            except Exception:
+                                guild_settings = None
+                        if guild_settings is None:
+                            guild_settings = getattr(self.bot, "settings_manager", None)
+                        if guild_settings is not None:
+                            announcement_channel_id = getattr(guild_settings, "raffle_announcement_channel_id", None)
 
-                                embed = discord.Embed(
-                                    title="🎁 New Giveaway Started!", description=giveaway_title, color=0x00FF00
+                    if announcement_channel_id:
+                        channel = self.bot.get_channel(announcement_channel_id)
+                        if channel:
+                            import discord
+
+                            embed = discord.Embed(
+                                title="🎁 New Giveaway Started!", description=giveaway_title, color=0x00FF00
+                            )
+
+                            if entry_method == "keyword":
+                                keyword = started_giveaway.get("keyword", "")
+                                embed.add_field(
+                                    name="How to Enter", value=f"Type `{keyword}` in Kick chat!", inline=False
+                                )
+                            elif entry_method == "active_chatter":
+                                messages_required = started_giveaway.get("messages_required", 10)
+                                time_window = started_giveaway.get("time_window_minutes", 10)
+                                embed.add_field(
+                                    name="How to Enter",
+                                    value=f"Send {messages_required} unique messages in {time_window} minutes in Kick chat!",
+                                    inline=False,
                                 )
 
-                                if entry_method == "keyword":
-                                    keyword = giveaway_manager.active_giveaway.get("keyword", "")
-                                    embed.add_field(
-                                        name="How to Enter", value=f"Type `{keyword}` in Kick chat!", inline=False
-                                    )
-                                elif entry_method == "active_chatter":
-                                    messages_required = giveaway_manager.active_giveaway.get("messages_required", 10)
-                                    time_window = giveaway_manager.active_giveaway.get("time_window_minutes", 10)
-                                    embed.add_field(
-                                        name="How to Enter",
-                                        value=f"Send {messages_required} unique messages in {time_window} minutes in Kick chat!",
-                                        inline=False,
-                                    )
+                            allow_multiple = started_giveaway.get("allow_multiple_entries", False)
+                            if allow_multiple:
+                                max_entries = started_giveaway.get("max_entries_per_user", 5)
+                                embed.add_field(
+                                    name="Multiple Entries",
+                                    value=f"You can enter up to {max_entries} times!",
+                                    inline=False,
+                                )
 
-                                allow_multiple = giveaway_manager.active_giveaway.get("allow_multiple_entries", False)
-                                if allow_multiple:
-                                    max_entries = giveaway_manager.active_giveaway.get("max_entries_per_user", 5)
-                                    embed.add_field(
-                                        name="Multiple Entries",
-                                        value=f"You can enter up to {max_entries} times!",
-                                        inline=False,
-                                    )
-
-                                await channel.send(embed=embed)
-                                logger.info(f"✅ Announced giveaway start in Discord")
+                            await channel.send(embed=embed)
+                            logger.info(f"✅ Announced giveaway start in Discord")
 
                     # Announce in Kick chat
                     if self.send_message_callback:
                         if entry_method == "keyword":
-                            keyword = giveaway_manager.active_giveaway.get("keyword", "")
+                            keyword = started_giveaway.get("keyword", "")
                             message = f"🎁 GIVEAWAY STARTED: {giveaway_title} | Type {keyword} to enter!"
                         else:
                             message = f"🎁 GIVEAWAY STARTED: {giveaway_title} | Be active in chat to enter!"
@@ -1876,8 +1879,11 @@ class RedisSubscriber:
                 except Exception as panel_error:
                     logger.debug(f"[giveaway] panel close-out skipped: {panel_error}")
 
-                # Clear active giveaway
-                giveaway_manager.active_giveaway = None
+                # Clean up active giveaways cache
+                if hasattr(giveaway_manager, "active_giveaways"):
+                    giveaway_manager.active_giveaways = [
+                        g for g in giveaway_manager.active_giveaways if g["id"] != giveaway_id
+                    ]
                 logger.info(f"✅ Giveaway {giveaway_id} stopped")
 
                 # Announce in Kick chat
@@ -1886,6 +1892,8 @@ class RedisSubscriber:
 
             elif action == "giveaway_winner":
                 winner = data.get("winner_username")
+                winner_discord_id = data.get("winner_discord_id")
+                discord_channel_id = data.get("discord_channel_id")
                 giveaway_title = data.get("giveaway_title", "Giveaway")
                 delay_announcement = data.get("delay_announcement", False)
 
@@ -1909,33 +1917,35 @@ class RedisSubscriber:
                 except Exception as panel_error:
                     logger.debug(f"[giveaway] panel winner update skipped: {panel_error}")
 
-                # Announce in Discord (per-guild settings — see the note in the
-                # giveaway_started branch; the global manager sent every guild's
-                # announcement to one server's channel).
-                guild_settings = None
-                if hasattr(self.bot, "get_guild_settings"):
-                    try:
-                        guild_settings = self.bot.get_guild_settings(guild_id)
-                    except Exception:
-                        guild_settings = None
-                if guild_settings is None:
-                    guild_settings = getattr(self.bot, "settings_manager", None)
+                # Announce in Discord
+                announcement_channel_id = discord_channel_id
+                if not announcement_channel_id:
+                    # Fallback to guild settings if no specific channel is set
+                    guild_settings = None
+                    if hasattr(self.bot, "get_guild_settings"):
+                        try:
+                            guild_settings = self.bot.get_guild_settings(guild_id)
+                        except Exception:
+                            guild_settings = None
+                    if guild_settings is None:
+                        guild_settings = getattr(self.bot, "settings_manager", None)
+                    if guild_settings is not None:
+                        announcement_channel_id = getattr(guild_settings, "raffle_announcement_channel_id", None)
 
-                if guild_settings is not None:
-                    announcement_channel_id = getattr(guild_settings, "raffle_announcement_channel_id", None)
-                    if announcement_channel_id:
-                        channel = self.bot.get_channel(announcement_channel_id)
-                        if channel:
-                            import discord
+                if announcement_channel_id:
+                    channel = self.bot.get_channel(announcement_channel_id)
+                    if channel:
+                        import discord
 
-                            embed = discord.Embed(
-                                title="🎉 Giveaway Winner!", description=f"**{giveaway_title}**", color=0xFFD700
-                            )
-                            embed.add_field(name="Winner", value=f"🏆 **{winner}**", inline=False)
-                            embed.add_field(name="", value="Congratulations! 🎊", inline=False)
+                        embed = discord.Embed(
+                            title="🎉 Giveaway Winner!", description=f"**{giveaway_title}**", color=0xFFD700
+                        )
+                        embed.add_field(name="Winner", value=f"🏆 **{winner}**", inline=False)
+                        embed.add_field(name="", value="Congratulations! 🎊", inline=False)
 
-                            await channel.send(embed=embed)
-                            logger.info(f"✅ Announced giveaway winner in Discord: {winner}")
+                        content = f"Congratulations <@{winner_discord_id}>!" if winner_discord_id else None
+                        await channel.send(content=content, embed=embed)
+                        logger.info(f"✅ Announced giveaway winner in Discord: {winner}")
 
                 # Announce in Kick chat
                 if self.send_message_callback:
@@ -1943,8 +1953,11 @@ class RedisSubscriber:
                     await self.announce_in_chat(message, guild_id=guild_id)
                     logger.info(f"✅ Announced giveaway winner in Kick chat: {winner}")
 
-                # Clear active giveaway
-                giveaway_manager.active_giveaway = None
+                # Clean up active giveaways cache
+                if hasattr(giveaway_manager, "active_giveaways"):
+                    giveaway_manager.active_giveaways = [
+                        g for g in giveaway_manager.active_giveaways if g["id"] != giveaway_id
+                    ]
 
         except Exception as e:
             logger.error(f"❌ Error handling giveaway event: {e}")

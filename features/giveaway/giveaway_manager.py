@@ -20,11 +20,11 @@ class GiveawayManager:
     def __init__(self, engine, guild_id=None):
         self.engine = engine
         self.guild_id = guild_id
-        self.active_giveaway = None
+        self.active_giveaways = []
         self.chat_tracker = None
 
-    async def load_active_giveaway(self):
-        """Load currently active giveaway for this server"""
+    async def load_active_giveaways(self):
+        """Load currently active giveaways for this server"""
         with self.engine.connect() as conn:
             result = conn.execute(
                 text(
@@ -32,19 +32,23 @@ class GiveawayManager:
                 SELECT * FROM giveaways
                 WHERE discord_server_id = :server_id
                 AND status = 'active'
-                LIMIT 1
             """
                 ),
                 {"server_id": self.guild_id},
-            ).fetchone()
+            ).fetchall()
 
             if result:
-                self.active_giveaway = dict(result._mapping)
-                logger.info(f"Loaded active giveaway {self.active_giveaway['id']} for server {self.guild_id}")
+                self.active_giveaways = [dict(r._mapping) for r in result]
+                logger.info(f"Loaded {len(self.active_giveaways)} active giveaways for server {self.guild_id}")
             else:
-                self.active_giveaway = None
+                self.active_giveaways = []
 
-        return self.active_giveaway
+        return self.active_giveaways
+
+    async def load_active_giveaway(self):
+        """Deprecated: use load_active_giveaways instead"""
+        await self.load_active_giveaways()
+        return self.active_giveaways[0] if self.active_giveaways else None
 
     async def start_giveaway(self, giveaway_id):
         """Start a giveaway"""
@@ -65,8 +69,8 @@ class GiveawayManager:
             )
             conn.commit()
 
-        # Reload active giveaway
-        await self.load_active_giveaway()
+        # Reload active giveaways
+        await self.load_active_giveaways()
         logger.info(f"Started giveaway {giveaway_id}")
         return True
 
@@ -88,8 +92,7 @@ class GiveawayManager:
             )
             conn.commit()
 
-        if self.active_giveaway and self.active_giveaway["id"] == giveaway_id:
-            self.active_giveaway = None
+        self.active_giveaways = [g for g in self.active_giveaways if g["id"] != giveaway_id]
 
         logger.info(f"Stopped giveaway {giveaway_id}")
         return True
@@ -128,6 +131,7 @@ class GiveawayManager:
         entry_method="keyword",
         platform="kick",
         display_name=None,
+        giveaway=None,
     ):
         """Add an entry to the active giveaway.
 
@@ -136,13 +140,13 @@ class GiveawayManager:
         `display_name` is the native platform name shown in the winner announcement
         (falls back to kick_username); kick_username stays the credit/dedup key.
         """
-        if not self.active_giveaway:
-            logger.warning(f"No active giveaway for entry from {kick_username}")
+        if not giveaway:
+            logger.warning(f"No giveaway provided for entry from {kick_username}")
             return False
 
-        giveaway_id = self.active_giveaway["id"]
-        allow_multiple = self.active_giveaway["allow_multiple_entries"]
-        max_entries = self.active_giveaway["max_entries_per_user"]
+        giveaway_id = giveaway["id"]
+        allow_multiple = giveaway["allow_multiple_entries"]
+        max_entries = giveaway["max_entries_per_user"]
 
         # Fetch profile picture from the entrant's platform.
         profile_pic_url = await self._fetch_avatar(kick_username, platform)
@@ -209,17 +213,15 @@ class GiveawayManager:
             conn.commit()
             return True
 
-    async def track_message(self, kick_username, message, platform="kick", display_name=None):
+    async def track_message(self, kick_username, message, platform="kick", display_name=None, giveaway=None):
         """Track a chat message for active chatter detection.
 
         Returns True only when this message pushed the chatter over the threshold
         and a new/incremented entry was actually recorded, so the caller can emit a
         realtime "entry added" event; False/None otherwise.
         """
-        if not self.active_giveaway:
+        if not giveaway:
             return False
-
-        giveaway = self.active_giveaway
 
         # Only track if using active_chatter entry method
         if giveaway["entry_method"] != "active_chatter":
@@ -288,23 +290,24 @@ class GiveawayManager:
 
             conn.commit()
 
-            if message_count and message_count[0] >= messages_required:
-                # User qualifies! Add entry
-                logger.info(f"{kick_username} qualified for auto-entry with {message_count[0]} unique messages")
+            message_count = message_count_row[0] if message_count_row else 0
+            if message_count >= messages_required:
+                logger.info(
+                    f"🎉 {kick_username} reached {messages_required} messages in {time_window} mins! Added active chatter entry."
+                )
+                # We reached threshold. Add the entry.
                 return await self.add_entry(
-                    kick_username, entry_method="active_chatter", platform=platform, display_name=display_name
+                    kick_username,
+                    entry_method="active_chatter",
+                    platform=platform,
+                    display_name=display_name,
+                    giveaway=giveaway,
                 )
 
         return False
 
     async def get_entries(self, giveaway_id=None):
-        """Get all entries for a giveaway (defaults to the cached active one).
-
-        `kick_username` is the CANONICAL identity used for winner bookkeeping —
-        Discord entrants have no Kick name, so it falls back to their Discord
-        username. `display_name` is what humans should see.
-        """
-        giveaway_id = giveaway_id or (self.active_giveaway or {}).get("id")
+        """Get all entries for a giveaway."""
         if not giveaway_id:
             return []
 
@@ -330,21 +333,18 @@ class GiveawayManager:
         """Draw ONE winner using the provably-fair algorithm.
 
         Split so it can be called repeatedly for a multi-winner giveaway:
-          * `exclude` - canonical names already drawn, filtered out of the pool.
-          * `finalize` - when False, the giveaway is left 'active' and the
-            in-memory cache is kept, so the caller can draw again. The caller
-            marks completion once the cap is reached (see `complete()`).
+        finalize=False prevents ending the giveaway after this draw.
 
         Records the winner in `giveaway_winners` (the table the dashboard
-        console and the exclusion queries read) as well as stamping
+        observes) and optionally updates the `giveaways.status` and
         `giveaways.winner_kick_username` for backwards compatibility.
 
         Returns {"winner", "display"} or None when the pool is exhausted.
         """
         from utils.provably_fair import generate_provably_fair_result
 
-        giveaway_id = giveaway_id or (self.active_giveaway or {}).get("id")
         if not giveaway_id:
+            logger.warning("No giveaway_id provided to draw_winner")
             return None
 
         exclude = set(exclude or [])
@@ -384,9 +384,7 @@ class GiveawayManager:
         )
 
         with self.engine.begin() as conn:
-            # The winners TABLE is authoritative for who has already won —
-            # without this row the next draw would not exclude them and could
-            # pick the same person twice.
+            # The winners TABLE is authoritative for who has already won
             conn.execute(
                 text(
                     """
@@ -430,12 +428,7 @@ class GiveawayManager:
         return {"winner": winner_username, "display": winner_display}
 
     async def draw_all_winners(self, giveaway_id=None):
-        """Draw up to `max_winners` winners in one pass, then complete.
-
-        Used by the expiry loop. Stops early when the entry pool runs out.
-        Returns the list of display names, newest last.
-        """
-        giveaway_id = giveaway_id or (self.active_giveaway or {}).get("id")
+        """Draw up to `max_winners` winners in one pass, then complete."""
         if not giveaway_id:
             return []
 
@@ -450,7 +443,7 @@ class GiveawayManager:
         for _ in range(max_winners):
             result = await self.draw_winner(giveaway_id=giveaway_id, exclude=drawn, finalize=False)
             if not result:
-                break  # pool exhausted
+                break
             drawn.append(result["winner"])
             display_names.append(result["display"])
 
@@ -459,22 +452,35 @@ class GiveawayManager:
 
     async def complete(self, giveaway_id=None):
         """Mark the giveaway finished and drop it from the in-memory cache."""
-        giveaway_id = giveaway_id or (self.active_giveaway or {}).get("id")
         if not giveaway_id:
+            return
+        with self.engine.connect() as conn:
+            conn.execute(
+                text("UPDATE giveaways SET status = 'ended', ended_at = :now WHERE id = :id"),
+                {"now": datetime.utcnow(), "id": giveaway_id},
+            )
+            conn.commit()
+
+        self.active_giveaways = [g for g in self.active_giveaways if g["id"] != giveaway_id]
+
+    async def _clean_old_chat_activity(self, giveaway_id=None, time_window=10):
+        """Clean up old chat tracking records"""
+        if not giveaway_id:
+            giveaway_ids = [g["id"] for g in self.active_giveaways]
+            for gid in giveaway_ids:
+                await self._clean_old_chat_activity(giveaway_id=gid, time_window=time_window)
             return
         with self.engine.begin() as conn:
             conn.execute(
                 text(
                     """
-                UPDATE giveaways
-                SET status = 'completed', ended_at = :now, updated_at = :now
-                WHERE id = :giveaway_id
+                DELETE FROM giveaway_chat_activity
+                WHERE giveaway_id = :giveaway_id
+                AND timestamp < CURRENT_TIMESTAMP - (:window_minutes * INTERVAL '1 minute')
             """
                 ),
-                {"giveaway_id": giveaway_id, "now": datetime.utcnow()},
+                {"giveaway_id": giveaway_id, "window_minutes": time_window},
             )
-        if (self.active_giveaway or {}).get("id") == giveaway_id:
-            self.active_giveaway = None
 
 
 async def setup_giveaway_managers(bot, engine):
