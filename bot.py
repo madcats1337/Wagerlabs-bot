@@ -2933,6 +2933,126 @@ slot_call_trackers = {}  # guild_id -> SlotCallTracker
 gtb_managers = {}  # guild_id -> GTBManager
 giveaway_managers = {}  # guild_id -> GiveawayManager
 
+# Holds the giveaway expiry tasks.loop. Module-level so the closure-defined loop
+# isn't garbage-collected once _start_giveaway_expiry_loop returns (the same
+# reason raffle_system/scheduler.py keeps _active_scheduler_tasks).
+_giveaway_expiry_tasks = {}
+
+
+def _start_giveaway_expiry_loop(bot, engine):
+    """Draw timed giveaways when their countdown runs out.
+
+    One loop scans every guild — this is a cheap indexed query
+    (idx_giveaways_active_ends_at), and per-guild loops would multiply the
+    GC hazard above for no benefit.
+
+    Winners are announced IMMEDIATELY (delay_announcement=False): nobody is
+    necessarily watching an OBS overlay when a timer expires, so there's no
+    reveal animation to wait for. An open dashboard console polls itself
+    up to date.
+    """
+    from discord.ext import tasks
+
+    @tasks.loop(minutes=1)
+    async def check_expired_giveaways():
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        """
+                        SELECT id, discord_server_id, title
+                        FROM giveaways
+                        WHERE status = 'active'
+                          AND ends_at IS NOT NULL
+                          AND ends_at <= CURRENT_TIMESTAMP
+                        """
+                    )
+                ).fetchall()
+
+            for row in rows:
+                giveaway_id, guild_id, title = int(row[0]), int(row[1]), row[2]
+                guild = bot.get_guild(guild_id)
+                # Per-guild log tagging — without this the lines are untagged.
+                set_server(guild_id, guild.name if guild else None)
+                try:
+                    manager = giveaway_managers.get(guild_id)
+                    if not manager:
+                        logger.warning(f"[giveaway] no manager for guild {guild_id}; skipping auto-draw")
+                        continue
+
+                    logger.info(f"⏰ [giveaway] timer expired for '{title}' ({giveaway_id}) — drawing")
+                    winners = await manager.draw_all_winners(giveaway_id)
+
+                    if not winners:
+                        # No entries: still finish so it can't be drawn forever.
+                        logger.info(f"[giveaway] {giveaway_id} expired with no entries")
+                        try:
+                            from features.giveaway.giveaway_panel import refresh_panel
+
+                            await refresh_panel(bot, engine, guild_id, giveaway_id, ended=True)
+                        except Exception as e:
+                            logger.debug(f"[giveaway] panel close-out skipped: {e}")
+                        continue
+
+                    # Terminal panel listing every winner.
+                    try:
+                        from features.giveaway.giveaway_panel import refresh_panel
+
+                        await refresh_panel(bot, engine, guild_id, giveaway_id, ended=True, winners=winners)
+                    except Exception as e:
+                        logger.debug(f"[giveaway] panel winner update skipped: {e}")
+
+                    # ONE announcement listing all winners, not N messages.
+                    names = ", ".join(f"**{w}**" for w in winners)
+                    try:
+                        guild_settings = get_guild_settings(guild_id)
+                        channel_id = getattr(guild_settings, "raffle_announcement_channel_id", None)
+                        channel = bot.get_channel(channel_id) if channel_id else None
+                        if channel:
+                            embed = discord.Embed(
+                                title="🎉 Giveaway Winner!" if len(winners) == 1 else "🎉 Giveaway Winners!",
+                                description=f"**{title}**",
+                                color=0xFFD700,
+                            )
+                            embed.add_field(name="Winners", value=f"🏆 {names}", inline=False)
+                            await channel.send(embed=embed)
+                    except Exception as e:
+                        logger.warning(f"[giveaway] Discord announce failed: {e}")
+
+                    # Stream chat + dashboard console.
+                    try:
+                        plain = ", ".join(winners)
+                        await send_stream_message(
+                            f"🎉 GIVEAWAY WINNER{'S' if len(winners) != 1 else ''}: {plain} won {title}! 🎊",
+                            guild_id=guild_id,
+                        )
+                    except Exception as e:
+                        logger.debug(f"[giveaway] chat announce skipped: {e}")
+
+                    publish_redis_event(
+                        channel="dashboard:giveaway",
+                        action="giveaway_ended",
+                        data={
+                            "discord_server_id": guild_id,
+                            "giveaway_id": giveaway_id,
+                            "winners": winners,
+                        },
+                    )
+                except Exception as e:
+                    logger.error(f"[giveaway] auto-draw failed for {giveaway_id}: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"[giveaway] expiry scan failed: {e}", exc_info=True)
+
+    @check_expired_giveaways.before_loop
+    async def _before():
+        # The loop touches Discord channels/guilds.
+        await bot.wait_until_ready()
+
+    _giveaway_expiry_tasks["main"] = check_expired_giveaways
+    check_expired_giveaways.start()
+    logger.debug("✅ Giveaway expiry loop started (1 min)")
+
+
 # Legacy global variables (for backward compatibility)
 gifted_sub_tracker = None
 shuffle_tracker = None
@@ -9052,6 +9172,10 @@ async def on_ready():
     bot.giveaway_managers = giveaway_managers
     logger.debug(f"✅ Giveaway managers initialized for {len(giveaway_managers)} guilds")
 
+    # 🎁 Auto-draw timed giveaways when their countdown expires.
+    if not _giveaway_expiry_tasks:
+        _start_giveaway_expiry_loop(bot, engine)
+
     # Start Redis subscriber with the platform-aware send callback (fallback for
     # announce_in_chat). NOT gated on KICK_BOT_USER_TOKEN: send_kick_message queues
     # via the kickpython websocket (same path commands use) and send_stream_message
@@ -9100,6 +9224,45 @@ async def on_ready():
                     )
                 )
                 logger.debug("✅ Provably fair columns added to giveaways table")
+
+                # Discord-hosted giveaways: panel binding, optional countdown,
+                # max_winners. Mirrors Admin-Dashboard/app.py::run_migrations()
+                # — either service may boot first, so both apply it idempotently.
+                logger.debug("🔄 Checking discord-hosted giveaway columns...")
+                conn.execute(
+                    text(
+                        """
+                    ALTER TABLE giveaways
+                    ADD COLUMN IF NOT EXISTS discord_channel_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS discord_message_id BIGINT,
+                    ADD COLUMN IF NOT EXISTS duration_minutes INTEGER,
+                    ADD COLUMN IF NOT EXISTS ends_at TIMESTAMP,
+                    ADD COLUMN IF NOT EXISTS max_winners INTEGER NOT NULL DEFAULT 1
+                """
+                    )
+                )
+                conn.execute(
+                    text(
+                        """
+                    CREATE INDEX IF NOT EXISTS idx_giveaways_active_ends_at
+                    ON giveaways (status, ends_at) WHERE status = 'active'
+                """
+                    )
+                )
+                # Discord entrants have no Kick username. `display_name` also
+                # fixes a pre-existing bug: giveaway_manager.add_entry has been
+                # writing this column with no migration anywhere creating it.
+                conn.execute(
+                    text(
+                        """
+                    ALTER TABLE giveaway_entries
+                    ADD COLUMN IF NOT EXISTS discord_username VARCHAR(255),
+                    ADD COLUMN IF NOT EXISTS display_name VARCHAR(255)
+                """
+                    )
+                )
+                conn.execute(text("ALTER TABLE giveaway_entries ALTER COLUMN kick_username DROP NOT NULL"))
+                logger.debug("✅ Discord-hosted giveaway columns ready")
 
                 # Add provably fair columns to slot_requests table
                 logger.debug("🔄 Checking provably fair columns in slot_requests table...")
@@ -9375,6 +9538,18 @@ async def on_ready():
             # state from the interaction + DB, not from this instance).
             bot.add_view(ShopLayoutView.template())
             logger.debug(f"✅ Point shop persistent view registered (handles all guilds)")
+
+            # Discord-hosted giveaways: stateless template carrying the
+            # `giveaway_enter` custom_id, so Join buttons on panels posted
+            # BEFORE this restart re-bind their handler. The callback resolves
+            # the guild + giveaway from the interaction and the DB.
+            try:
+                from features.giveaway.giveaway_panel import GiveawayPanelView
+
+                bot.add_view(GiveawayPanelView.template(engine))
+                logger.debug(f"✅ Giveaway panel persistent view registered (handles all guilds)")
+            except Exception as e:
+                logger.warning(f"⚠️ Giveaway panel view registration failed (non-fatal): {e}")
 
             # Create slot panels per-guild (but only add cogs once)
             first_guild = True

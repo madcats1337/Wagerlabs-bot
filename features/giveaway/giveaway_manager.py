@@ -297,39 +297,60 @@ class GiveawayManager:
 
         return False
 
-    async def get_entries(self):
-        """Get all entries for active giveaway"""
-        if not self.active_giveaway:
+    async def get_entries(self, giveaway_id=None):
+        """Get all entries for a giveaway (defaults to the cached active one).
+
+        `kick_username` is the CANONICAL identity used for winner bookkeeping —
+        Discord entrants have no Kick name, so it falls back to their Discord
+        username. `display_name` is what humans should see.
+        """
+        giveaway_id = giveaway_id or (self.active_giveaway or {}).get("id")
+        if not giveaway_id:
             return []
 
         with self.engine.connect() as conn:
             results = conn.execute(
                 text(
                     """
-                SELECT kick_username, kick_user_id, entry_count, entry_method, created_at,
-                       COALESCE(display_name, kick_username) AS display_name
+                SELECT COALESCE(kick_username, discord_username) AS kick_username,
+                       kick_user_id, entry_count, entry_method, created_at,
+                       COALESCE(display_name, kick_username, discord_username) AS display_name
                 FROM giveaway_entries
                 WHERE giveaway_id = :giveaway_id
+                  AND COALESCE(kick_username, discord_username) IS NOT NULL
                 ORDER BY created_at ASC
             """
                 ),
-                {"giveaway_id": self.active_giveaway["id"]},
+                {"giveaway_id": giveaway_id},
             ).fetchall()
 
             return [dict(row._mapping) for row in results]
 
-    async def draw_winner(self):
-        """Randomly select a winner using provably fair algorithm (weighted by entry_count if multiple entries allowed)"""
-        import secrets
+    async def draw_winner(self, giveaway_id=None, exclude=None, finalize=True):
+        """Draw ONE winner using the provably-fair algorithm.
 
+        Split so it can be called repeatedly for a multi-winner giveaway:
+          * `exclude` - canonical names already drawn, filtered out of the pool.
+          * `finalize` - when False, the giveaway is left 'active' and the
+            in-memory cache is kept, so the caller can draw again. The caller
+            marks completion once the cap is reached (see `complete()`).
+
+        Records the winner in `giveaway_winners` (the table the dashboard
+        console and the exclusion queries read) as well as stamping
+        `giveaways.winner_kick_username` for backwards compatibility.
+
+        Returns {"winner", "display"} or None when the pool is exhausted.
+        """
         from utils.provably_fair import generate_provably_fair_result
 
-        if not self.active_giveaway:
+        giveaway_id = giveaway_id or (self.active_giveaway or {}).get("id")
+        if not giveaway_id:
             return None
 
-        entries = await self.get_entries()
+        exclude = set(exclude or [])
+        entries = [e for e in await self.get_entries(giveaway_id) if e["kick_username"] not in exclude]
         if not entries:
-            logger.warning("No entries to draw winner from")
+            logger.warning(f"No entries left to draw from for giveaway {giveaway_id}")
             return None
 
         # Build weighted list based on entry_count
@@ -338,48 +359,48 @@ class GiveawayManager:
             for _ in range(entry["entry_count"]):
                 weighted_entries.append(entry["kick_username"])
 
-        # Generate provably fair selection
-        giveaway_id = self.active_giveaway["id"]
+        # Client seed varies per draw so a multi-winner giveaway doesn't reuse
+        # the same proof for every winner.
+        client_seed = f"giveaway:{giveaway_id}:{len(weighted_entries)}:{len(exclude)}"
 
-        # Use first entry as client seed base, combined with giveaway data
-        client_seed = f"giveaway:{giveaway_id}:{len(weighted_entries)}"
-
-        # Generate server seed
-        server_seed = secrets.token_hex(32)
-
-        # Create provably fair result to get random value
-        # We'll use the random value to select from weighted entries
         result = generate_provably_fair_result(
-            kick_username=client_seed,  # Use giveaway data as client seed
+            kick_username=client_seed,
             slot_request_id=giveaway_id,
             slot_call="giveaway_draw",
-            chance_percent=100.0,  # Always "wins" to generate random value
+            chance_percent=100.0,
         )
 
-        # Use random_value (0.00-99.99) to select winner
-        # Scale to index: int(random_value / 100 * len(weighted_entries))
         winner_index = int((result["random_value"] / 100.0) * len(weighted_entries))
-        winner_index = min(winner_index, len(weighted_entries) - 1)  # Ensure within bounds
+        winner_index = min(winner_index, len(weighted_entries) - 1)
         winner_username = weighted_entries[winner_index]
-        # Map the canonical winner back to their native display name for the announcement.
         winner_display = next(
             (e.get("display_name") or e["kick_username"] for e in entries if e["kick_username"] == winner_username),
             winner_username,
         )
 
         logger.info(
-            f"Provably fair draw - Random value: {result['random_value']}, Index: {winner_index}/{len(weighted_entries)}, Winner: {winner_username}"
+            f"Provably fair draw - Random value: {result['random_value']}, "
+            f"Index: {winner_index}/{len(weighted_entries)}, Winner: {winner_username}"
         )
 
-        # Save winner and provably fair data to database
-        with self.engine.connect() as conn:
+        with self.engine.begin() as conn:
+            # The winners TABLE is authoritative for who has already won —
+            # without this row the next draw would not exclude them and could
+            # pick the same person twice.
+            conn.execute(
+                text(
+                    """
+                INSERT INTO giveaway_winners (giveaway_id, discord_server_id, kick_username)
+                VALUES (:giveaway_id, :server_id, :winner)
+            """
+                ),
+                {"giveaway_id": giveaway_id, "server_id": str(self.guild_id), "winner": winner_username},
+            )
             conn.execute(
                 text(
                     """
                 UPDATE giveaways
                 SET winner_kick_username = :winner,
-                    status = 'completed',
-                    ended_at = :now,
                     updated_at = :now,
                     server_seed = :server_seed,
                     client_seed = :client_seed,
@@ -400,13 +421,60 @@ class GiveawayManager:
                     "random_value": result["random_value"],
                 },
             )
-            conn.commit()
 
         logger.info(f"Drew winner: {winner_username} (shown as {winner_display}) for giveaway {giveaway_id}")
-        self.active_giveaway = None
-        # Return the NATIVE display name for announcements; DB keeps the canonical
-        # winner_kick_username for crediting.
-        return winner_display
+
+        if finalize:
+            await self.complete(giveaway_id)
+
+        return {"winner": winner_username, "display": winner_display}
+
+    async def draw_all_winners(self, giveaway_id=None):
+        """Draw up to `max_winners` winners in one pass, then complete.
+
+        Used by the expiry loop. Stops early when the entry pool runs out.
+        Returns the list of display names, newest last.
+        """
+        giveaway_id = giveaway_id or (self.active_giveaway or {}).get("id")
+        if not giveaway_id:
+            return []
+
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT COALESCE(max_winners, 1) FROM giveaways WHERE id = :gid"),
+                {"gid": giveaway_id},
+            ).fetchone()
+        max_winners = max(1, int(row[0])) if row else 1
+
+        drawn, display_names = [], []
+        for _ in range(max_winners):
+            result = await self.draw_winner(giveaway_id=giveaway_id, exclude=drawn, finalize=False)
+            if not result:
+                break  # pool exhausted
+            drawn.append(result["winner"])
+            display_names.append(result["display"])
+
+        await self.complete(giveaway_id)
+        return display_names
+
+    async def complete(self, giveaway_id=None):
+        """Mark the giveaway finished and drop it from the in-memory cache."""
+        giveaway_id = giveaway_id or (self.active_giveaway or {}).get("id")
+        if not giveaway_id:
+            return
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                UPDATE giveaways
+                SET status = 'completed', ended_at = :now, updated_at = :now
+                WHERE id = :giveaway_id
+            """
+                ),
+                {"giveaway_id": giveaway_id, "now": datetime.utcnow()},
+            )
+        if (self.active_giveaway or {}).get("id") == giveaway_id:
+            self.active_giveaway = None
 
 
 async def setup_giveaway_managers(bot, engine):

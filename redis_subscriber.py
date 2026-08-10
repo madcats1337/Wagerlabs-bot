@@ -1782,11 +1782,39 @@ class RedisSubscriber:
                     giveaway_title = giveaway_manager.active_giveaway.get("title", "New Giveaway")
                     entry_method = giveaway_manager.active_giveaway.get("entry_method", "keyword")
 
-                    # Announce in Discord
-                    if hasattr(self.bot, "settings_manager"):
-                        announcement_channel_id = getattr(
-                            self.bot.settings_manager, "raffle_announcement_channel_id", None
-                        )
+                    # Discord-hosted: post the interactive panel (Join button +
+                    # entry count + optional countdown) to the giveaway's own
+                    # channel instead of the generic announcement embed.
+                    if entry_method == "discord":
+                        try:
+                            from features.giveaway.giveaway_panel import post_panel
+
+                            await post_panel(
+                                self.bot,
+                                engine,
+                                guild_id,
+                                giveaway_manager.active_giveaway,
+                            )
+                        except Exception as panel_error:
+                            logger.error(f"❌ Failed to post giveaway panel: {panel_error}", exc_info=True)
+                        logger.info(f"✅ Giveaway {giveaway_id} started (Discord-hosted): {giveaway_title}")
+                        return
+
+                    # Announce in Discord.
+                    # Per-guild settings: `self.bot.settings_manager` is the
+                    # GLOBAL (first guild's) manager, so using it here sent every
+                    # guild's giveaway announcement to one server's channel.
+                    guild_settings = None
+                    if hasattr(self.bot, "get_guild_settings"):
+                        try:
+                            guild_settings = self.bot.get_guild_settings(guild_id)
+                        except Exception:
+                            guild_settings = None
+                    if guild_settings is None:
+                        guild_settings = getattr(self.bot, "settings_manager", None)
+
+                    if guild_settings is not None:
+                        announcement_channel_id = getattr(guild_settings, "raffle_announcement_channel_id", None)
                         if announcement_channel_id:
                             channel = self.bot.get_channel(announcement_channel_id)
                             if channel:
@@ -1838,6 +1866,16 @@ class RedisSubscriber:
             elif action == "giveaway_stopped":
                 logger.info(f"⏹️  Stopping giveaway {giveaway_id} for guild {guild_id}")
 
+                # Close out the Discord panel if this giveaway had one: drop the
+                # Join button so nobody can enter a stopped giveaway from a stale
+                # message. Left in place (not deleted) as a record.
+                try:
+                    from features.giveaway.giveaway_panel import refresh_panel
+
+                    await refresh_panel(self.bot, engine, guild_id, giveaway_id, ended=True)
+                except Exception as panel_error:
+                    logger.debug(f"[giveaway] panel close-out skipped: {panel_error}")
+
                 # Clear active giveaway
                 giveaway_manager.active_giveaway = None
                 logger.info(f"✅ Giveaway {giveaway_id} stopped")
@@ -1862,9 +1900,29 @@ class RedisSubscriber:
                     logger.info(f"⏳ Waiting 7 seconds for animation to complete...")
                     await asyncio.sleep(7)
 
-                # Announce in Discord
-                if hasattr(self.bot, "settings_manager"):
-                    announcement_channel_id = getattr(self.bot.settings_manager, "raffle_announcement_channel_id", None)
+                # Close out the Discord panel (if this giveaway had one) so the
+                # message shows the winner and the Join button is gone.
+                try:
+                    from features.giveaway.giveaway_panel import refresh_panel
+
+                    await refresh_panel(self.bot, engine, guild_id, giveaway_id, ended=True, winners=[winner])
+                except Exception as panel_error:
+                    logger.debug(f"[giveaway] panel winner update skipped: {panel_error}")
+
+                # Announce in Discord (per-guild settings — see the note in the
+                # giveaway_started branch; the global manager sent every guild's
+                # announcement to one server's channel).
+                guild_settings = None
+                if hasattr(self.bot, "get_guild_settings"):
+                    try:
+                        guild_settings = self.bot.get_guild_settings(guild_id)
+                    except Exception:
+                        guild_settings = None
+                if guild_settings is None:
+                    guild_settings = getattr(self.bot, "settings_manager", None)
+
+                if guild_settings is not None:
+                    announcement_channel_id = getattr(guild_settings, "raffle_announcement_channel_id", None)
                     if announcement_channel_id:
                         channel = self.bot.get_channel(announcement_channel_id)
                         if channel:
