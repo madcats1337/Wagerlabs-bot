@@ -47,7 +47,8 @@ def _fetch_templates_full(engine, guild_id):
                 SELECT id, name, entry_method, max_winners, allow_multiple_entries,
                        max_entries_per_user, required_role_id, discord_channel_id,
                        keyword, messages_required, time_window_minutes, bonus_roles,
-                       entry_prompt
+                       entry_prompt, min_account_age_days, min_server_days,
+                       require_captcha
                 FROM giveaway_templates
                 WHERE discord_server_id = :sid
                 ORDER BY name ASC
@@ -67,7 +68,8 @@ def _fetch_template(engine, template_id, guild_id):
                 SELECT id, name, entry_method, max_winners, allow_multiple_entries,
                        max_entries_per_user, required_role_id, discord_channel_id,
                        keyword, messages_required, time_window_minutes, bonus_roles,
-                       entry_prompt
+                       entry_prompt, min_account_age_days, min_server_days,
+                       require_captcha
                 FROM giveaway_templates
                 WHERE id = :tid AND discord_server_id = :sid
                 """
@@ -106,13 +108,15 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
                    messages_required, time_window_minutes, allow_multiple_entries,
                    max_entries_per_user, status, created_by, discord_channel_id,
                    duration_minutes, max_winners, required_role_id, bonus_roles,
-                   entry_prompt, started_at, ends_at)
+                   entry_prompt, min_account_age_days, min_server_days,
+                   require_captcha, started_at, ends_at)
                 VALUES
                   (:sid, :title, :description, :entry_method, :keyword,
                    :messages_required, :time_window_minutes, :allow_multiple,
                    :max_per_user, 'active', :created_by, :channel_id,
                    :duration, :max_winners, :required_role_id, CAST(:bonus AS JSONB),
-                   :entry_prompt, CURRENT_TIMESTAMP,
+                   :entry_prompt, :min_account_age_days, :min_server_days,
+                   :require_captcha, CURRENT_TIMESTAMP,
                    -- NULL duration = no timer: ends_at stays NULL and the
                    -- expiry loop ignores it, so it waits for a manual draw.
                    CASE WHEN :duration IS NULL THEN NULL
@@ -137,6 +141,12 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
                 "required_role_id": tpl.get("required_role_id"),
                 "bonus": _json.dumps(bonus_roles) if bonus_roles else None,
                 "entry_prompt": tpl.get("entry_prompt"),
+                # Alt/bot gates carried over from the template, so a giveaway
+                # started from Discord enforces the same rules as one started
+                # from the dashboard.
+                "min_account_age_days": tpl.get("min_account_age_days"),
+                "min_server_days": tpl.get("min_server_days"),
+                "require_captcha": bool(tpl.get("require_captcha")),
             },
         ).fetchone()
         giveaway_id = int(row[0])
