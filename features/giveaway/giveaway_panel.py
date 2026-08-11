@@ -45,6 +45,66 @@ _VERIFY_VALID_DAYS = 30
 _VERIFY_TOKEN_TTL_SECONDS = 10 * 60
 
 
+# Last successfully-read policy per guild. A DB blip must not silently disable
+# the gates — that is precisely the alt flood the feature exists to stop — but
+# failing fully CLOSED would block every legitimate entrant instead. Replaying
+# the last known policy keeps enforcing what the operator configured, and only
+# a guild whose rules were never read falls back to "no gates".
+_rules_cache: dict[int, dict] = {}
+
+
+def _entry_rules(engine, guild_id):
+    """The server's giveaway entry rules, read FRESH from bot_settings.
+
+    Server-wide policy, not per-giveaway: every Discord-hosted giveaway in a
+    guild enforces the same gates, configured on the dashboard's Giveaway
+    Management -> Entry rules tab.
+
+    Read straight from the DB rather than through BotSettingsManager, which
+    caches — a dashboard change must take effect on the very next Join click,
+    not after a bot restart. The cache below is a FAILURE fallback only; the
+    happy path always hits the DB.
+
+    Returns {min_account_age_days, min_server_days, require_captcha}.
+    """
+    rules = {"min_account_age_days": 0, "min_server_days": 0, "require_captcha": False}
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT key, value FROM bot_settings
+                    WHERE discord_server_id = :sid
+                      AND key IN ('giveaway_min_account_age_days',
+                                  'giveaway_min_server_days',
+                                  'giveaway_require_captcha')
+                    """
+                ),
+                {"sid": str(guild_id)},
+            ).fetchall()
+    except Exception as e:
+        cached = _rules_cache.get(int(guild_id))
+        logger.error(
+            f"[giveaway] entry-rules lookup failed for {guild_id}: {e} — "
+            f"{'replaying last known rules' if cached else 'no cached rules, gates off'}"
+        )
+        return dict(cached) if cached else rules
+
+    for key, value in rows:
+        raw = (value or "").strip()
+        if key == "giveaway_require_captcha":
+            rules["require_captcha"] = raw.lower() in ("true", "1", "yes", "on")
+        else:
+            field = "min_account_age_days" if key.endswith("account_age_days") else "min_server_days"
+            try:
+                rules[field] = max(0, int(raw))
+            except (TypeError, ValueError):
+                pass  # keep the 0 default; a malformed value must not gate entry
+
+    _rules_cache[int(guild_id)] = dict(rules)
+    return rules
+
+
 def _captcha_configured() -> bool:
     """Are the Turnstile keys present?
 
@@ -320,8 +380,7 @@ def _active_discord_giveaway(engine, guild_id, message_id=None):
                     SELECT id, title, description, status, started_at, ends_at, ended_at,
                            max_winners, discord_channel_id, discord_message_id,
                            allow_multiple_entries, max_entries_per_user,
-                           required_role_id, entry_prompt, bonus_roles,
-                           min_account_age_days, min_server_days, require_captcha
+                           required_role_id, entry_prompt, bonus_roles
                     FROM giveaways
                     WHERE discord_server_id = :sid
                       AND discord_message_id = :mid
@@ -339,8 +398,7 @@ def _active_discord_giveaway(engine, guild_id, message_id=None):
                     SELECT id, title, description, status, started_at, ends_at, ended_at,
                            max_winners, discord_channel_id, discord_message_id,
                            allow_multiple_entries, max_entries_per_user,
-                           required_role_id, entry_prompt, bonus_roles,
-                           min_account_age_days, min_server_days, require_captcha
+                           required_role_id, entry_prompt, bonus_roles
                     FROM giveaways
                     WHERE discord_server_id = :sid
                       AND entry_method = 'discord'
@@ -523,14 +581,19 @@ class GiveawayPanelView(discord.ui.LayoutView):
         account age, server tenure, and a one-time captcha. Each returns its own
         specific message naming the member's actual value — a bare "you cannot
         enter" just generates support tickets.
+
+        The rules are SERVER-WIDE (bot_settings), not per-giveaway, and are read
+        fresh on every click so a dashboard change applies immediately.
         """
         member = interaction.user
         guild_id = interaction.guild_id
         now = datetime.now(timezone.utc)
 
+        rules = _entry_rules(self.engine, guild_id)
+
         # Account age. `created_at` is decoded from the snowflake, so this needs
         # no API call and no privileged intent.
-        min_age = giveaway.get("min_account_age_days")
+        min_age = rules["min_account_age_days"]
         if min_age:
             age_days = (now - member.created_at).days
             if age_days < int(min_age):
@@ -542,7 +605,7 @@ class GiveawayPanelView(discord.ui.LayoutView):
         # Server tenure. `joined_at` can be absent on an uncached member, so
         # fetch once. If it still can't be resolved we fail OPEN and log —
         # failing closed on a Discord API hiccup would block every entrant.
-        min_tenure = giveaway.get("min_server_days")
+        min_tenure = rules["min_server_days"]
         if min_tenure:
             joined = getattr(member, "joined_at", None)
             if joined is None and interaction.guild is not None:
@@ -565,7 +628,7 @@ class GiveawayPanelView(discord.ui.LayoutView):
         # Captcha. Runs last so only members who already passed the cheap gates
         # pay the click-out cost. Verification is remembered per (server, member),
         # so this is a one-time step rather than a per-giveaway one.
-        if giveaway.get("require_captcha") and not _is_verified(self.engine, guild_id, member.id):
+        if rules["require_captcha"] and not _is_verified(self.engine, guild_id, member.id):
             if not _captcha_configured():
                 # Keys missing on the dashboard side: degrade to the age/tenure
                 # gates rather than handing out a link nobody can ever pass.

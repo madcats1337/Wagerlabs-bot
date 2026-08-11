@@ -47,8 +47,7 @@ def _fetch_templates_full(engine, guild_id):
                 SELECT id, name, entry_method, max_winners, allow_multiple_entries,
                        max_entries_per_user, required_role_id, discord_channel_id,
                        keyword, messages_required, time_window_minutes, bonus_roles,
-                       entry_prompt, min_account_age_days, min_server_days,
-                       require_captcha
+                       entry_prompt
                 FROM giveaway_templates
                 WHERE discord_server_id = :sid
                 ORDER BY name ASC
@@ -68,8 +67,7 @@ def _fetch_template(engine, template_id, guild_id):
                 SELECT id, name, entry_method, max_winners, allow_multiple_entries,
                        max_entries_per_user, required_role_id, discord_channel_id,
                        keyword, messages_required, time_window_minutes, bonus_roles,
-                       entry_prompt, min_account_age_days, min_server_days,
-                       require_captcha
+                       entry_prompt
                 FROM giveaway_templates
                 WHERE id = :tid AND discord_server_id = :sid
                 """
@@ -113,15 +111,13 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
                    messages_required, time_window_minutes, allow_multiple_entries,
                    max_entries_per_user, status, created_by, discord_channel_id,
                    duration_minutes, max_winners, required_role_id, bonus_roles,
-                   entry_prompt, min_account_age_days, min_server_days,
-                   require_captcha, started_at, ends_at)
+                   entry_prompt, started_at, ends_at)
                 VALUES
                   (:sid, :title, :description, :entry_method, :keyword,
                    :messages_required, :time_window_minutes, :allow_multiple,
                    :max_per_user, 'active', :created_by, :channel_id,
                    :duration, :max_winners, :required_role_id, CAST(:bonus AS JSONB),
-                   :entry_prompt, :min_account_age_days, :min_server_days,
-                   :require_captcha, CURRENT_TIMESTAMP,
+                   :entry_prompt, CURRENT_TIMESTAMP,
                    -- NULL duration = no timer: ends_at stays NULL and the
                    -- expiry loop ignores it, so it waits for a manual draw.
                    CASE WHEN :duration IS NULL THEN NULL
@@ -146,12 +142,9 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
                 "required_role_id": tpl.get("required_role_id"),
                 "bonus": _json.dumps(bonus_roles) if bonus_roles else None,
                 "entry_prompt": tpl.get("entry_prompt"),
-                # Alt/bot gates carried over from the template, so a giveaway
-                # started from Discord enforces the same rules as one started
-                # from the dashboard.
-                "min_account_age_days": tpl.get("min_account_age_days"),
-                "min_server_days": tpl.get("min_server_days"),
-                "require_captcha": bool(tpl.get("require_captcha")),
+                # Alt/bot gates are NOT per-giveaway: they are a server-wide
+                # policy in bot_settings, read fresh on every Join click by
+                # giveaway_panel._entry_rules().
             },
         ).fetchone()
         giveaway_id = int(row[0])
@@ -334,20 +327,19 @@ class GiveawayDetailsModal(discord.ui.Modal):
 
 # ── /giveaway create ─────────────────────────────────────────────────────────
 #
-# Same settings as the dashboard's create form, without a saved template.
-# `entry_method` is always 'discord' — the command exists to post a panel with
-# a Join button, so there is nothing to choose. `max_entries_per_user` is
-# likewise omitted: a Discord giveaway is one click per member.
+# Same per-giveaway settings as the dashboard's create form, without a saved
+# template. `entry_method` is always 'discord' — the command exists to post a
+# panel with a Join button, so there is nothing to choose. `max_entries_per_user`
+# is likewise omitted: a Discord giveaway is one click per member.
+#
+# Alt/bot checks are NOT here. They are a server-wide policy configured once on
+# the dashboard (Giveaway Management -> Entry rules) and read fresh from
+# bot_settings on every Join click.
 #
 # Built with Components V2 (LayoutView + Container), NOT a plain View, so each
 # dropdown can carry a TextDisplay heading above it. A classic View has no way
 # to label a select beyond its placeholder — which vanishes the moment a value
 # is chosen — and is capped at five rows.
-
-# Preset day counts. Free-text numbers would need modal slots that the title,
-# description and duration fields already occupy.
-_AGE_PRESETS = [("No minimum", "0"), ("7 days", "7"), ("14 days", "14"), ("30 days", "30"), ("90 days", "90")]
-_TENURE_PRESETS = [("No minimum", "0"), ("1 day", "1"), ("3 days", "3"), ("7 days", "7"), ("30 days", "30")]
 
 
 def _opts(label_value_pairs, current):
@@ -380,9 +372,6 @@ class GiveawayCreateView(discord.ui.LayoutView):
         self.channel_id = None
         self.required_role_id = None
         self.max_winners = 1
-        self.min_account_age_days = 0
-        self.min_server_days = 0
-        self.require_captcha = False
         self.bonus_roles = {}
         self.bonus_role_id = None
 
@@ -446,38 +435,9 @@ class GiveawayCreateView(discord.ui.LayoutView):
         role.callback = self._on_role
         container.add_item(discord.ui.ActionRow(role))
 
-        container.add_item(discord.ui.Separator())
-        container.add_item(
-            discord.ui.TextDisplay("### Alt and bot checks\n-# Optional. Keeps throwaway accounts out of the draw.")
-        )
-
-        # ── Account age ──
-        age_state = f"{self.min_account_age_days} days" if self.min_account_age_days else "no minimum"
-        container.add_item(
-            discord.ui.TextDisplay(
-                f"**Minimum account age** · {age_state}\n-# How old their Discord account must be to enter."
-            )
-        )
-        age = discord.ui.Select(
-            placeholder="Minimum account age…",
-            options=_opts(_AGE_PRESETS, self.min_account_age_days),
-        )
-        age.callback = self._on_age
-        container.add_item(discord.ui.ActionRow(age))
-
-        # ── Server tenure ──
-        tenure_state = f"{self.min_server_days} days" if self.min_server_days else "no minimum"
-        container.add_item(
-            discord.ui.TextDisplay(
-                f"**Minimum time in server** · {tenure_state}\n-# How long they must have been a member here."
-            )
-        )
-        tenure = discord.ui.Select(
-            placeholder="Minimum time in server…",
-            options=_opts(_TENURE_PRESETS, self.min_server_days),
-        )
-        tenure.callback = self._on_tenure
-        container.add_item(discord.ui.ActionRow(tenure))
+        # Alt/bot checks are deliberately NOT here: they are a server-wide
+        # policy set once on the dashboard (Giveaway Management -> Entry rules)
+        # and applied to every Discord giveaway.
 
         container.add_item(discord.ui.Separator())
         container.add_item(
@@ -516,18 +476,13 @@ class GiveawayCreateView(discord.ui.LayoutView):
         container.add_item(discord.ui.Separator())
 
         # ── Actions ──
-        captcha = discord.ui.Button(
-            label=f"Bot check: {'on' if self.require_captcha else 'off'}",
-            style=discord.ButtonStyle.success if self.require_captcha else discord.ButtonStyle.secondary,
-        )
-        captcha.callback = self._on_captcha
         start = discord.ui.Button(
             label="Set title and duration" if self.channel_id else "Choose a channel first",
             style=discord.ButtonStyle.primary,
             disabled=self.channel_id is None,
         )
         start.callback = self._on_configure
-        container.add_item(discord.ui.ActionRow(captcha, start))
+        container.add_item(discord.ui.ActionRow(start))
 
         self.add_item(container)
 
@@ -572,33 +527,24 @@ class GiveawayCreateView(discord.ui.LayoutView):
         self.max_winners = self._first_id(interaction) or 1
         await self._apply(interaction)
 
-    async def _on_age(self, interaction):
-        self.min_account_age_days = self._first_id(interaction) or 0
-        await self._apply(interaction)
-
-    async def _on_tenure(self, interaction):
-        self.min_server_days = self._first_id(interaction) or 0
-        await self._apply(interaction)
-
     async def _on_bonus_role(self, interaction):
         self.bonus_role_id = self._first_id(interaction)
         # Switching roles must not strand the previous one: a role left in the
         # dict would still grant its bonus in the live giveaway, because the
         # award path takes the max across every entry in bonus_roles.
-        self.bonus_roles = (
-            {rid: n for rid, n in self.bonus_roles.items() if rid == str(self.bonus_role_id)}
-            if self.bonus_role_id
-            else {}
-        )
+        if self.bonus_role_id:
+            key = str(self.bonus_role_id)
+            # Default to +1 so a role picked without touching the amount select
+            # still counts — it is shown as chosen, so silently dropping it
+            # would contradict the panel.
+            self.bonus_roles = {key: self.bonus_roles.get(key, 1)}
+        else:
+            self.bonus_roles = {}
         await self._apply(interaction)
 
     async def _on_bonus_amount(self, interaction):
         if self.bonus_role_id:
             self.bonus_roles = {str(self.bonus_role_id): self._first_id(interaction) or 1}
-        await self._apply(interaction)
-
-    async def _on_captcha(self, interaction):
-        self.require_captcha = not self.require_captcha
         await self._apply(interaction)
 
     async def _on_configure(self, interaction):
@@ -624,9 +570,6 @@ class GiveawayCreateView(discord.ui.LayoutView):
             "allow_multiple_entries": False,
             "required_role_id": self.required_role_id,
             "bonus_roles": self.bonus_roles or None,
-            "min_account_age_days": self.min_account_age_days or None,
-            "min_server_days": self.min_server_days or None,
-            "require_captcha": self.require_captcha,
             "keyword": None,
             "messages_required": None,
             "time_window_minutes": None,

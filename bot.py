@@ -9295,18 +9295,12 @@ async def on_ready():
                 """
                     )
                 )
-                # Alt/bot entry gates. All optional: NULL/FALSE means "no
-                # requirement", so pre-existing giveaways keep one-click entry.
-                conn.execute(
-                    text(
-                        """
-                    ALTER TABLE giveaways
-                    ADD COLUMN IF NOT EXISTS min_account_age_days INTEGER,
-                    ADD COLUMN IF NOT EXISTS min_server_days INTEGER,
-                    ADD COLUMN IF NOT EXISTS require_captcha BOOLEAN NOT NULL DEFAULT FALSE
-                """
-                    )
-                )
+                # Alt/bot entry gates are a SERVER-WIDE bot_settings policy
+                # (giveaway_min_account_age_days / giveaway_min_server_days /
+                # giveaway_require_captcha), not per-giveaway columns. The
+                # dashboard's run_migrations() owns the backfill + DROP; this
+                # service only reads the settings, so there is nothing to add
+                # here. Do NOT re-add the columns.
                 # Captcha verification is remembered per (server, member), not
                 # per giveaway — solve once, every later giveaway in that server
                 # skips the redirect. Expiry applied at READ time, no cleanup job.
@@ -9377,18 +9371,8 @@ async def on_ready():
                 )
                 # Additive for servers whose table predates the column.
                 conn.execute(text("ALTER TABLE giveaway_templates ADD COLUMN IF NOT EXISTS entry_prompt VARCHAR(45)"))
-                # Templates carry the alt-gate settings too, so a saved template
-                # reproduces the same entry requirements on every run.
-                conn.execute(
-                    text(
-                        """
-                    ALTER TABLE giveaway_templates
-                    ADD COLUMN IF NOT EXISTS min_account_age_days INTEGER,
-                    ADD COLUMN IF NOT EXISTS min_server_days INTEGER,
-                    ADD COLUMN IF NOT EXISTS require_captcha BOOLEAN NOT NULL DEFAULT FALSE
-                """
-                    )
-                )
+                # NOTE: templates deliberately carry NO alt-gate columns —
+                # entry rules are a server-wide bot_settings policy.
                 conn.execute(
                     text(
                         """
