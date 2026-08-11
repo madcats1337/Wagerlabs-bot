@@ -80,7 +80,10 @@ def _entry_rules(engine, guild_id):
                                   'giveaway_require_captcha')
                     """
                 ),
-                {"sid": str(guild_id)},
+                # bot_settings.discord_server_id is BIGINT — bind an int, the
+                # same way the dashboard writes it and BotSettingsManager reads
+                # it. A string here relies on driver-side coercion.
+                {"sid": int(guild_id)},
             ).fetchall()
     except Exception as e:
         cached = _rules_cache.get(int(guild_id))
