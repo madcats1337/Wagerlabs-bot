@@ -121,11 +121,11 @@ def _captcha_configured() -> bool:
     return bool(os.getenv("TURNSTILE_SITE_KEY") and os.getenv("TURNSTILE_SECRET_KEY"))
 
 
-def _is_verified(engine, guild_id, discord_id) -> bool:
-    """Has this member passed the captcha for this server recently?
+def _is_verified(engine, guild_id, giveaway_id, discord_id) -> bool:
+    """Has this member passed the captcha for this giveaway recently?
 
-    Scoped per server on purpose: one solved challenge must not buy entry
-    across every tenant. Fails OPEN on a DB error — a verification lookup
+    Scoped per giveaway on purpose: one solved challenge must not buy entry
+    across every giveaway. Fails OPEN on a DB error — a verification lookup
     failing must not block a giveaway.
     """
     try:
@@ -134,11 +134,11 @@ def _is_verified(engine, guild_id, discord_id) -> bool:
                 text(
                     """
                     SELECT 1 FROM giveaway_verified_members
-                    WHERE discord_server_id = :sid AND discord_id = :did
+                    WHERE discord_server_id = :sid AND giveaway_id = :gid AND discord_id = :did
                       AND verified_at > CURRENT_TIMESTAMP - (:days * INTERVAL '1 day')
                     """
                 ),
-                {"sid": int(guild_id), "did": int(discord_id), "days": _VERIFY_VALID_DAYS},
+                {"sid": int(guild_id), "gid": int(giveaway_id), "did": int(discord_id), "days": _VERIFY_VALID_DAYS},
             ).fetchone()
         return row is not None
     except Exception as e:
@@ -675,9 +675,9 @@ class GiveawayPanelView(discord.ui.LayoutView):
                     )
 
         # Captcha. Runs last so only members who already passed the cheap gates
-        # pay the click-out cost. Verification is remembered per (server, member),
-        # so this is a one-time step rather than a per-giveaway one.
-        if rules["require_captcha"] and not _is_verified(self.engine, guild_id, member.id):
+        # pay the click-out cost. Verification is remembered per (server, giveaway, member),
+        # so this is a one-time step rather than a per-entry one.
+        if rules["require_captcha"] and not _is_verified(self.engine, guild_id, giveaway["id"], member.id):
             if not _captcha_configured():
                 # Keys missing on the dashboard side: degrade to the age/tenure
                 # gates rather than handing out a link nobody can ever pass.

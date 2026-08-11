@@ -9309,13 +9309,33 @@ async def on_ready():
                         """
                     CREATE TABLE IF NOT EXISTS giveaway_verified_members (
                         discord_server_id BIGINT NOT NULL,
+                        giveaway_id BIGINT NOT NULL DEFAULT 0,
                         discord_id BIGINT NOT NULL,
                         verified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        PRIMARY KEY (discord_server_id, discord_id)
+                        PRIMARY KEY (discord_server_id, giveaway_id, discord_id)
                     )
                 """
                     )
                 )
+                conn.execute(
+                    text(
+                        """
+                    ALTER TABLE giveaway_verified_members
+                    ADD COLUMN IF NOT EXISTS giveaway_id BIGINT DEFAULT 0
+                """
+                    )
+                )
+                try:
+                    conn.execute(
+                        text("ALTER TABLE giveaway_verified_members DROP CONSTRAINT giveaway_verified_members_pkey")
+                    )
+                    conn.execute(
+                        text(
+                            "ALTER TABLE giveaway_verified_members ADD PRIMARY KEY (discord_server_id, giveaway_id, discord_id)"
+                        )
+                    )
+                except Exception:
+                    pass
                 conn.execute(
                     text(
                         """
