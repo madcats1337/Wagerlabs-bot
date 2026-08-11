@@ -336,36 +336,38 @@ class GiveawayDetailsModal(discord.ui.Modal):
 #
 # Same settings as the dashboard's create form, without a saved template.
 # `entry_method` is always 'discord' — the command exists to post a panel with
-# a Join button, so there is nothing to choose.
+# a Join button, so there is nothing to choose. `max_entries_per_user` is
+# likewise omitted: a Discord giveaway is one click per member.
 #
-# A View allows five action rows and each select consumes a whole row, so the
-# settings are split across TWO pages of the same ephemeral message rather than
-# crammed into one. Free-text values (title, description, duration) go in the
-# modal, which is capped at five components.
+# Built with Components V2 (LayoutView + Container), NOT a plain View, so each
+# dropdown can carry a TextDisplay heading above it. A classic View has no way
+# to label a select beyond its placeholder — which vanishes the moment a value
+# is chosen — and is capped at five rows.
 
 # Preset day counts. Free-text numbers would need modal slots that the title,
 # description and duration fields already occupy.
-_AGE_PRESETS = [("Off", "0"), ("7 days", "7"), ("14 days", "14"), ("30 days", "30"), ("90 days", "90")]
-_TENURE_PRESETS = [("Off", "0"), ("1 day", "1"), ("3 days", "3"), ("7 days", "7"), ("30 days", "30")]
+_AGE_PRESETS = [("No minimum", "0"), ("7 days", "7"), ("14 days", "14"), ("30 days", "30"), ("90 days", "90")]
+_TENURE_PRESETS = [("No minimum", "0"), ("1 day", "1"), ("3 days", "3"), ("7 days", "7"), ("30 days", "30")]
 
 
-def _int_select(label_value_pairs, placeholder, current, row):
-    """A single-choice Select over (label, value) pairs, with `current` marked."""
-    return discord.ui.Select(
-        placeholder=placeholder,
-        row=row,
-        options=[
-            discord.SelectOption(label=label, value=value, default=(value == str(current)))
-            for label, value in label_value_pairs
-        ],
-    )
+def _opts(label_value_pairs, current):
+    """SelectOptions with `current` marked, so the choice survives a re-render."""
+    return [
+        discord.SelectOption(label=label, value=value, default=(value == str(current)))
+        for label, value in label_value_pairs
+    ]
 
 
-class GiveawayCreateView(discord.ui.View):
-    """Ephemeral two-page settings panel for `/giveaway create`.
+class GiveawayCreateView(discord.ui.LayoutView):
+    """Ephemeral settings panel for `/giveaway create`.
 
     Holds the chosen settings in memory; nothing is written until the modal is
     submitted, so abandoning the panel leaves no partial giveaway behind.
+
+    NOTE: the re-render method is `_rerender`, NOT `_refresh` — `View._refresh`
+    is discord.py's own hook for syncing component state back from Discord, and
+    overriding it with a coroutine breaks that sync and logs
+    "coroutine ... was never awaited".
     """
 
     def __init__(self, bot, engine, author_id):
@@ -373,195 +375,165 @@ class GiveawayCreateView(discord.ui.View):
         self._bot = bot
         self._engine = engine
         self._author_id = author_id
-        self._page = 1
 
         # Settings, mirroring the dashboard's defaults.
         self.channel_id = None
         self.required_role_id = None
         self.max_winners = 1
-        self.max_entries_per_user = 1
         self.min_account_age_days = 0
         self.min_server_days = 0
         self.require_captcha = False
         self.bonus_roles = {}
         self.bonus_role_id = None
 
-        self._build()
+        self._rerender()
 
-    # ── page construction ────────────────────────────────────────────────
-    def _build(self):
+    # ── layout ───────────────────────────────────────────────────────────
+    def _rerender(self):
+        """Rebuild the whole container from current state.
+
+        Every component is recreated, so anything that should look "chosen"
+        must be re-marked here — `default=` on options and `default_values=`
+        on the entity selects.
+        """
         self.clear_items()
-        if self._page == 1:
-            self._build_page_one()
-        else:
-            self._build_page_two()
+        container = discord.ui.Container(accent_colour=WAGERLABS_YELLOW)
 
-    def _build_page_one(self):
-        # default_values keeps the picked channel/role visible after the message
-        # is edited — the components are rebuilt from scratch on every refresh,
-        # so without it the select would snap back to its placeholder and
-        # disagree with the summary embed.
+        container.add_item(
+            discord.ui.TextDisplay("## Create a giveaway\nSet it up here, then add the title and how long it runs.")
+        )
+        container.add_item(discord.ui.Separator())
+
+        # ── Channel ──
+        channel_state = f"<#{self.channel_id}>" if self.channel_id else "*required*"
+        container.add_item(
+            discord.ui.TextDisplay(f"**Channel** · {channel_state}\n-# Where the giveaway panel is posted.")
+        )
         channel = discord.ui.ChannelSelect(
-            placeholder="Channel to post the giveaway in…",
+            placeholder="Choose a channel…",
             channel_types=[discord.ChannelType.text, discord.ChannelType.news],
-            row=0,
             default_values=([discord.Object(id=self.channel_id)] if self.channel_id else []),
         )
         channel.callback = self._on_channel
-        self.add_item(channel)
+        container.add_item(discord.ui.ActionRow(channel))
 
+        # ── Winners ──
+        container.add_item(
+            discord.ui.TextDisplay(f"**Winners** · {self.max_winners}\n-# How many people win the giveaway.")
+        )
+        winners = discord.ui.Select(
+            placeholder="How many winners…",
+            options=_opts(
+                [(f"{n} winner{'s' if n != 1 else ''}", str(n)) for n in (1, 2, 3, 5, 10, 25)],
+                self.max_winners,
+            ),
+        )
+        winners.callback = self._on_winners
+        container.add_item(discord.ui.ActionRow(winners))
+
+        # ── Required role ──
+        role_state = f"<@&{self.required_role_id}>" if self.required_role_id else "everyone can enter"
+        container.add_item(
+            discord.ui.TextDisplay(
+                f"**Required role** · {role_state}\n-# Only members with this role can join. Optional."
+            )
+        )
         role = discord.ui.RoleSelect(
-            placeholder="Required role (optional) — leave unset for everyone",
-            row=1,
+            placeholder="Choose a role (optional)…",
             min_values=0,
             default_values=([discord.Object(id=self.required_role_id)] if self.required_role_id else []),
         )
         role.callback = self._on_role
-        self.add_item(role)
+        container.add_item(discord.ui.ActionRow(role))
 
-        winners = _int_select(
-            [(f"{n} winner{'s' if n != 1 else ''}", str(n)) for n in (1, 2, 3, 5, 10, 25)],
-            "Number of winners…",
-            self.max_winners,
-            row=2,
+        container.add_item(discord.ui.Separator())
+        container.add_item(
+            discord.ui.TextDisplay("### Alt and bot checks\n-# Optional. Keeps throwaway accounts out of the draw.")
         )
-        winners.callback = self._on_winners
-        self.add_item(winners)
 
-        per_user = _int_select(
-            [("1 entry per person", "1")] + [(f"Up to {n} entries each", str(n)) for n in (2, 3, 5, 10)],
-            "Entries per person…",
-            self.max_entries_per_user,
-            row=3,
+        # ── Account age ──
+        age_state = f"{self.min_account_age_days} days" if self.min_account_age_days else "no minimum"
+        container.add_item(
+            discord.ui.TextDisplay(
+                f"**Minimum account age** · {age_state}\n-# How old their Discord account must be to enter."
+            )
         )
-        per_user.callback = self._on_per_user
-        self.add_item(per_user)
-
-        nxt = discord.ui.Button(label="Next: alt checks & bonuses", style=discord.ButtonStyle.secondary, row=4)
-        nxt.callback = self._on_next
-        self.add_item(nxt)
-
-        start = discord.ui.Button(
-            label="Set title & duration",
-            style=discord.ButtonStyle.success,
-            row=4,
-            disabled=self.channel_id is None,
+        age = discord.ui.Select(
+            placeholder="Minimum account age…",
+            options=_opts(_AGE_PRESETS, self.min_account_age_days),
         )
-        start.callback = self._on_configure
-        self.add_item(start)
-
-    def _build_page_two(self):
-        age = _int_select(_AGE_PRESETS, "Minimum account age…", self.min_account_age_days, row=0)
         age.callback = self._on_age
-        self.add_item(age)
+        container.add_item(discord.ui.ActionRow(age))
 
-        tenure = _int_select(_TENURE_PRESETS, "Minimum time in server…", self.min_server_days, row=1)
+        # ── Server tenure ──
+        tenure_state = f"{self.min_server_days} days" if self.min_server_days else "no minimum"
+        container.add_item(
+            discord.ui.TextDisplay(
+                f"**Minimum time in server** · {tenure_state}\n-# How long they must have been a member here."
+            )
+        )
+        tenure = discord.ui.Select(
+            placeholder="Minimum time in server…",
+            options=_opts(_TENURE_PRESETS, self.min_server_days),
+        )
         tenure.callback = self._on_tenure
-        self.add_item(tenure)
+        container.add_item(discord.ui.ActionRow(tenure))
 
+        container.add_item(discord.ui.Separator())
+        container.add_item(
+            discord.ui.TextDisplay("### Bonus entries\n-# Give a role extra tickets in the draw. Optional.")
+        )
+
+        # ── Bonus role ──
+        bonus_state = (
+            ", ".join(f"<@&{rid}> +{n}" for rid, n in self.bonus_roles.items()) if self.bonus_roles else "none"
+        )
+        container.add_item(
+            discord.ui.TextDisplay(f"**Bonus role** · {bonus_state}\n-# This role's entry counts more than once.")
+        )
         bonus_role = discord.ui.RoleSelect(
-            placeholder="Bonus entries: pick a role (optional)",
-            row=2,
+            placeholder="Choose a role to reward (optional)…",
             min_values=0,
             default_values=([discord.Object(id=self.bonus_role_id)] if self.bonus_role_id else []),
         )
         bonus_role.callback = self._on_bonus_role
-        self.add_item(bonus_role)
+        container.add_item(discord.ui.ActionRow(bonus_role))
 
         if self.bonus_role_id:
-            bonus_amount = _int_select(
-                [(f"+{n} extra entries", str(n)) for n in (1, 2, 3, 5, 10)],
-                "…and how many extra entries",
-                # Mark the amount already chosen for THIS role, so re-selecting
-                # a role shows what it is currently worth.
-                self.bonus_roles.get(str(self.bonus_role_id), 0),
-                row=3,
+            container.add_item(
+                discord.ui.TextDisplay("**Extra entries**\n-# How many tickets that role's single entry is worth.")
             )
-            bonus_amount.callback = self._on_bonus_amount
-            self.add_item(bonus_amount)
+            amount = discord.ui.Select(
+                placeholder="How many extra entries…",
+                options=_opts(
+                    [(f"+{n} extra entries", str(n)) for n in (1, 2, 3, 5, 10)],
+                    self.bonus_roles.get(str(self.bonus_role_id), 0),
+                ),
+            )
+            amount.callback = self._on_bonus_amount
+            container.add_item(discord.ui.ActionRow(amount))
 
+        container.add_item(discord.ui.Separator())
+
+        # ── Actions ──
         captcha = discord.ui.Button(
-            label=f"Bot check: {'On' if self.require_captcha else 'Off'}",
+            label=f"Bot check: {'on' if self.require_captcha else 'off'}",
             style=discord.ButtonStyle.success if self.require_captcha else discord.ButtonStyle.secondary,
-            row=4,
         )
         captcha.callback = self._on_captcha
-        self.add_item(captcha)
-
-        back = discord.ui.Button(
-            # The channel lives on page one, so say where to go when it's unset
-            # rather than presenting a dead disabled button on this page.
-            label="Back" if self.channel_id else "Back — pick a channel",
-            style=discord.ButtonStyle.secondary if self.channel_id else discord.ButtonStyle.primary,
-            row=4,
-        )
-        back.callback = self._on_back
-        self.add_item(back)
-
         start = discord.ui.Button(
-            label="Set title & duration",
-            style=discord.ButtonStyle.success,
-            row=4,
+            label="Set title and duration" if self.channel_id else "Choose a channel first",
+            style=discord.ButtonStyle.primary,
             disabled=self.channel_id is None,
         )
         start.callback = self._on_configure
-        self.add_item(start)
+        container.add_item(discord.ui.ActionRow(captcha, start))
 
-    # ── summary ──────────────────────────────────────────────────────────
-    def embed(self):
-        e = discord.Embed(
-            title="Create a giveaway",
-            description=(
-                "Choose where it posts and who can enter, then set the title and duration."
-                if self._page == 1
-                else "Optional checks that keep alt accounts and bots out."
-            ),
-            color=WAGERLABS_YELLOW,
-        )
-        e.add_field(
-            name="Channel",
-            value=f"<#{self.channel_id}>" if self.channel_id else "*required*",
-            inline=True,
-        )
-        e.add_field(name="Winners", value=str(self.max_winners), inline=True)
-        e.add_field(
-            name="Entries each",
-            value=str(self.max_entries_per_user),
-            inline=True,
-        )
-        e.add_field(
-            name="Required role",
-            value=f"<@&{self.required_role_id}>" if self.required_role_id else "Everyone",
-            inline=True,
-        )
-        e.add_field(
-            name="Account age",
-            value=f"{self.min_account_age_days}d+" if self.min_account_age_days else "Any",
-            inline=True,
-        )
-        e.add_field(
-            name="In server",
-            value=f"{self.min_server_days}d+" if self.min_server_days else "Any",
-            inline=True,
-        )
-        if self.bonus_roles:
-            e.add_field(
-                name="Bonus entries",
-                value=", ".join(f"<@&{rid}> +{n}" for rid, n in self.bonus_roles.items()),
-                inline=False,
-            )
-        if self.require_captcha:
-            e.add_field(
-                name="Bot check",
-                value="Entrants verify once on the web before joining.",
-                inline=False,
-            )
-        e.set_footer(text=f"Page {self._page} of 2")
-        return e
+        self.add_item(container)
 
-    async def _refresh(self, interaction):
-        self._build()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+    async def _apply(self, interaction):
+        self._rerender()
+        await interaction.response.edit_message(view=self)
 
     # ── callbacks ────────────────────────────────────────────────────────
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -572,65 +544,62 @@ class GiveawayCreateView(discord.ui.View):
 
     async def on_timeout(self):
         # Nothing is written until the modal is submitted, so an expired panel
-        # has no giveaway behind it — disable the controls rather than leave
-        # them live and silently dropping the settings.
-        for item in self.children:
-            item.disabled = True
+        # has no giveaway behind it.
+        for item in self.walk_children():
+            if hasattr(item, "disabled"):
+                item.disabled = True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        logger.error(f"[giveaway] create panel error: {error}", exc_info=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Something went wrong.", ephemeral=True)
+
+    @staticmethod
+    def _first_id(interaction):
+        """The single chosen value as an int, or None when the select is cleared."""
+        values = interaction.data.get("values") or []
+        return int(values[0]) if values else None
 
     async def _on_channel(self, interaction):
-        values = interaction.data.get("values") or []
-        self.channel_id = int(values[0]) if values else None
-        await self._refresh(interaction)
+        self.channel_id = self._first_id(interaction)
+        await self._apply(interaction)
 
     async def _on_role(self, interaction):
-        values = interaction.data.get("values") or []
-        self.required_role_id = int(values[0]) if values else None
-        await self._refresh(interaction)
+        self.required_role_id = self._first_id(interaction)
+        await self._apply(interaction)
 
     async def _on_winners(self, interaction):
-        self.max_winners = int(interaction.data["values"][0])
-        await self._refresh(interaction)
-
-    async def _on_per_user(self, interaction):
-        self.max_entries_per_user = int(interaction.data["values"][0])
-        await self._refresh(interaction)
+        self.max_winners = self._first_id(interaction) or 1
+        await self._apply(interaction)
 
     async def _on_age(self, interaction):
-        self.min_account_age_days = int(interaction.data["values"][0])
-        await self._refresh(interaction)
+        self.min_account_age_days = self._first_id(interaction) or 0
+        await self._apply(interaction)
 
     async def _on_tenure(self, interaction):
-        self.min_server_days = int(interaction.data["values"][0])
-        await self._refresh(interaction)
+        self.min_server_days = self._first_id(interaction) or 0
+        await self._apply(interaction)
 
     async def _on_bonus_role(self, interaction):
-        values = interaction.data.get("values") or []
-        self.bonus_role_id = int(values[0]) if values else None
+        self.bonus_role_id = self._first_id(interaction)
         # Switching roles must not strand the previous one: a role left in the
         # dict would still grant its bonus in the live giveaway, because the
         # award path takes the max across every entry in bonus_roles.
-        if self.bonus_role_id:
-            self.bonus_roles = {rid: n for rid, n in self.bonus_roles.items() if rid == str(self.bonus_role_id)}
-        else:
-            self.bonus_roles = {}
-        await self._refresh(interaction)
+        self.bonus_roles = (
+            {rid: n for rid, n in self.bonus_roles.items() if rid == str(self.bonus_role_id)}
+            if self.bonus_role_id
+            else {}
+        )
+        await self._apply(interaction)
 
     async def _on_bonus_amount(self, interaction):
         if self.bonus_role_id:
-            self.bonus_roles = {str(self.bonus_role_id): int(interaction.data["values"][0])}
-        await self._refresh(interaction)
+            self.bonus_roles = {str(self.bonus_role_id): self._first_id(interaction) or 1}
+        await self._apply(interaction)
 
     async def _on_captcha(self, interaction):
         self.require_captcha = not self.require_captcha
-        await self._refresh(interaction)
-
-    async def _on_next(self, interaction):
-        self._page = 2
-        await self._refresh(interaction)
-
-    async def _on_back(self, interaction):
-        self._page = 1
-        await self._refresh(interaction)
+        await self._apply(interaction)
 
     async def _on_configure(self, interaction):
         if not self.channel_id:
@@ -648,10 +617,11 @@ class GiveawayCreateView(discord.ui.View):
             "entry_method": "discord",
             "discord_channel_id": self.channel_id,
             "max_winners": self.max_winners,
-            "max_entries_per_user": self.max_entries_per_user,
-            # The dashboard models "more than one entry" as a flag plus a cap;
-            # the panel collects only the cap, so derive the flag from it.
-            "allow_multiple_entries": self.max_entries_per_user > 1,
+            # One click per member: a Discord giveaway has no repeat-entry mode,
+            # so the cap is 1 and multiple entries stay off. A role bonus is a
+            # ticket WEIGHTING on that single entry, not extra clicks.
+            "max_entries_per_user": 1,
+            "allow_multiple_entries": False,
             "required_role_id": self.required_role_id,
             "bonus_roles": self.bonus_roles or None,
             "min_account_age_days": self.min_account_age_days or None,
