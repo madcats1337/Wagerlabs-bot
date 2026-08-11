@@ -763,8 +763,10 @@ def register_giveaway_commands(bot: commands.Bot, engine) -> None:
                 )
                 return
 
+            # Components V2: the LayoutView carries its own headings and copy,
+            # so there is no separate embed (and a V2 message cannot have one).
             view = GiveawayCreateView(bot, engine, interaction.user.id)
-            await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+            await interaction.response.send_message(view=view, ephemeral=True)
 
     bot.tree.add_command(giveaway_group)
     logger.debug("Registered /giveaway command group")
