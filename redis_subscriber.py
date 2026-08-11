@@ -3254,6 +3254,13 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                                 await self.handle_tournament_event(action, data)
                             elif channel == "dashboard:clips":
                                 await self.handle_clips_event(action, data)
+                            elif channel == "dashboard:giveaway_verified":
+                                try:
+                                    from features.giveaway.giveaway_panel import process_giveaway_verification
+
+                                    await process_giveaway_verification(self.bot, get_engine(), data)
+                                except Exception as e:
+                                    logger.error(f"Error handling giveaway verification: {e}")
                             elif channel == "bot_events":
                                 # bot_events uses {type, data} rather than {action, data}.
                                 await self.handle_bot_event(payload)
@@ -3288,6 +3295,7 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                         "dashboard:subscriptions",
                         "dashboard:tournament",
                         "dashboard:clips",
+                        "dashboard:giveaway_verified",
                         # 'bot_events' removed - no longer using webhooks
                     )
 

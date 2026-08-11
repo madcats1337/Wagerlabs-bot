@@ -146,7 +146,7 @@ def _is_verified(engine, guild_id, discord_id) -> bool:
         return True
 
 
-def _issue_verify_link(engine, guild_id, giveaway_id, discord_id):
+def _issue_verify_link(engine, guild_id, giveaway_id, discord_id, interaction_token=None):
     """Mint a one-time verify URL, or None if one can't be built.
 
     The Discord id is stored SERVER-SIDE against an opaque token and never
@@ -171,17 +171,18 @@ def _issue_verify_link(engine, guild_id, giveaway_id, discord_id):
     client = None
     try:
         client = _redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
+        payload = {
+            "discord_server_id": str(guild_id),
+            "giveaway_id": int(giveaway_id),
+            "discord_id": str(discord_id),
+        }
+        if interaction_token:
+            payload["interaction_token"] = interaction_token
+
         client.setex(
             f"giveaway_verify:{token}",
             _VERIFY_TOKEN_TTL_SECONDS,
-            json.dumps(
-                {
-                    "discord_server_id": str(guild_id),
-                    "giveaway_id": int(giveaway_id),
-                    "discord_id": str(discord_id),
-                },
-                separators=(",", ":"),
-            ),
+            json.dumps(payload, separators=(",", ":")),
         )
     except Exception as e:
         logger.error(f"[giveaway] could not store verify token: {e}")
@@ -553,9 +554,14 @@ class GiveawayPanelView(discord.ui.LayoutView):
         # Alt/bot gates. Ordered cheapest-first and placed before the modal so
         # nobody fills in an entry prompt only to be rejected afterwards.
         # All three are optional; NULL/False means "no requirement".
-        blocked = await self._alt_gate_reason(giveaway, interaction)
-        if blocked:
-            await interaction.response.send_message(blocked, ephemeral=True)
+        blocked_msg, verify_url = await self._alt_gate_reason(giveaway, interaction)
+        if blocked_msg:
+            if verify_url:
+                view = discord.ui.View()
+                view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=verify_url, label="Verify"))
+                await interaction.response.send_message(blocked_msg, view=view, ephemeral=True)
+            else:
+                await interaction.response.send_message(blocked_msg, ephemeral=True)
             return
 
         # Cheap pre-check so an ineligible member is told BEFORE being shown a
@@ -579,6 +585,8 @@ class GiveawayPanelView(discord.ui.LayoutView):
 
     async def _alt_gate_reason(self, giveaway, interaction):
         """Why this member fails the alt/bot gates right now, or None if they pass.
+        Returns a tuple of (message, verify_url). If blocked but no verify URL, verify_url is None.
+        If passed, returns (None, None).
 
         Three optional gates, evaluated against the member's state at click time:
         account age, server tenure, and a one-time captcha. Each returns its own
@@ -602,7 +610,8 @@ class GiveawayPanelView(discord.ui.LayoutView):
             if age_days < int(min_age):
                 return (
                     f"Your Discord account must be at least {int(min_age)} days old to enter "
-                    f"this giveaway. Yours is {age_days} {'day' if age_days == 1 else 'days'} old."
+                    f"this giveaway. Yours is {age_days} {'day' if age_days == 1 else 'days'} old.",
+                    None,
                 )
 
         # Server tenure. `joined_at` can be absent on an uncached member, so
@@ -625,7 +634,8 @@ class GiveawayPanelView(discord.ui.LayoutView):
                     return (
                         f"You must have been in this server for at least {int(min_tenure)} days "
                         f"to enter. You have been here {tenure_days} "
-                        f"{'day' if tenure_days == 1 else 'days'}."
+                        f"{'day' if tenure_days == 1 else 'days'}.",
+                        None,
                     )
 
         # Captcha. Runs last so only members who already passed the cheap gates
@@ -636,20 +646,22 @@ class GiveawayPanelView(discord.ui.LayoutView):
                 # Keys missing on the dashboard side: degrade to the age/tenure
                 # gates rather than handing out a link nobody can ever pass.
                 logger.error("[giveaway] TURNSTILE_SITE_KEY/SECRET_KEY unset; captcha gate skipped")
-                return None
-            url = _issue_verify_link(self.engine, guild_id, giveaway["id"], member.id)
+                return None, None
+            url = _issue_verify_link(
+                self.engine, guild_id, giveaway["id"], member.id, interaction_token=interaction.token
+            )
             if not url:
                 # Redis unavailable or no link could be built. Fail OPEN: a
                 # broken verification service must not silently kill a giveaway.
                 logger.error(f"[giveaway] could not issue verify link for {member.id}; allowing entry")
-                return None
+                return None, None
             return (
                 "One quick check before you enter — it takes a few seconds, and you only "
-                f"need to do it once for this server:\n{url}\n\n"
-                "Come back and press **Join giveaway** when you're done."
+                "need to do it once for this server. Please click the Verify button below to complete the captcha.",
+                url,
             )
 
-        return None
+        return None, None
 
     def _entry_block_reason(self, giveaway, guild_id, discord_id, per_join=1):
         """Why this member may not enter right now, or None if they may.
@@ -679,11 +691,8 @@ class GiveawayPanelView(discord.ui.LayoutView):
             return f"You have reached the maximum of {max_per_user} entries."
         return None
 
-    async def _commit_entry(self, interaction: discord.Interaction, giveaway, answer=None):
-        """Record the entry and acknowledge. Safe to call from the modal too."""
-        guild_id = interaction.guild_id
+    def _do_commit_entry(self, guild_id, user, giveaway, answer=None):
         giveaway_id = giveaway["id"]
-        user = interaction.user
         display = user.display_name or user.name
         allow_multiple = bool(giveaway.get("allow_multiple_entries"))
         max_per_user = int(giveaway.get("max_entries_per_user") or 1)
@@ -702,21 +711,12 @@ class GiveawayPanelView(discord.ui.LayoutView):
             ).fetchone()
 
             if existing:
-                # Re-checked inside the transaction: two fast clicks (or a slow
-                # modal submit) can both pass the pre-check above.
                 if not allow_multiple:
-                    await interaction.response.send_message("You are already entered - good luck!", ephemeral=True)
-                    return
-                # The cap counts JOINS, not tickets — `entry_count` holds tickets
-                # once a role bonus is applied, so dividing by the per-join value
-                # recovers how many times this member has actually entered.
+                    return False, "You are already entered - good luck!"
                 per_join = max(1, entries_to_add)
-                joins_so_far = -(-int(existing[1]) // per_join)  # ceil division
+                joins_so_far = -(-int(existing[1]) // per_join)
                 if joins_so_far >= max_per_user:
-                    await interaction.response.send_message(
-                        f"You have reached the maximum of {max_per_user} entries.", ephemeral=True
-                    )
-                    return
+                    return False, f"You have reached the maximum of {max_per_user} entries."
                 conn.execute(
                     text(
                         """
@@ -730,8 +730,6 @@ class GiveawayPanelView(discord.ui.LayoutView):
                 )
                 new_count = int(existing[1]) + entries_to_add
             else:
-                # kick_username stays NULL for Discord entrants; the canonical
-                # identity for the draw is COALESCE(kick_username, discord_username).
                 conn.execute(
                     text(
                         """
@@ -754,13 +752,8 @@ class GiveawayPanelView(discord.ui.LayoutView):
                 )
                 new_count = entries_to_add
 
-        await interaction.response.send_message(
-            f"You are in **{giveaway.get('title', 'Giveaway')}**! ({new_count} {'entry' if new_count == 1 else 'entries'})",
-            ephemeral=True,
-        )
+        msg = f"✅ You are in **{giveaway.get('title', 'Giveaway')}**! ({new_count} {'entry' if new_count == 1 else 'entries'})"
 
-        # Tell the dashboard console live entries stream. Imported lazily -
-        # bot.py imports this package, so a module-level import would cycle.
         try:
             from bot import publish_redis_event
 
@@ -776,8 +769,19 @@ class GiveawayPanelView(discord.ui.LayoutView):
         except Exception as e:
             logger.debug(f"[giveaway] entry publish failed (non-fatal): {e}")
 
-        # Refresh the entry count on the panel (debounced).
-        asyncio.create_task(schedule_panel_refresh(interaction.client, self.engine, guild_id, giveaway_id))
+        return True, msg
+
+    async def _commit_entry(self, interaction: discord.Interaction, giveaway, answer=None):
+        """Record the entry and acknowledge. Safe to call from the modal too."""
+        guild_id = interaction.guild_id
+        user = interaction.user
+
+        success, msg = self._do_commit_entry(guild_id, user, giveaway, answer)
+
+        await interaction.response.send_message(msg, ephemeral=True)
+
+        if success:
+            asyncio.create_task(schedule_panel_refresh(interaction.client, self.engine, guild_id, giveaway["id"]))
 
 
 class GiveawayEntryModal(discord.ui.Modal):
@@ -898,3 +902,104 @@ async def post_panel(bot, engine, guild_id, giveaway):
         )
     logger.info(f"[giveaway] posted panel for giveaway {giveaway['id']} in #{channel} ({message.id})")
     return True
+
+
+async def process_giveaway_verification(bot, engine, payload):
+    """Handle a completed captcha from the dashboard and enter the user."""
+    guild_id = int(payload.get("discord_server_id", 0))
+    giveaway_id = int(payload.get("giveaway_id", 0))
+    discord_id = int(payload.get("discord_id", 0))
+    interaction_token = payload.get("interaction_token")
+
+    if not guild_id or not giveaway_id or not discord_id or not interaction_token:
+        logger.error("[giveaway] missing required fields in verification payload")
+        return
+
+    try:
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            guild = await bot.fetch_guild(guild_id)
+
+        member = guild.get_member(discord_id)
+        if not member:
+            member = await guild.fetch_member(discord_id)
+
+        giveaway = _active_discord_giveaway(engine, guild_id, None, giveaway_id=giveaway_id)
+        if not giveaway:
+            await _edit_webhook_message(bot, interaction_token, "❌ This giveaway has ended.")
+            return
+
+        # Check deadline
+        ends_at = giveaway.get("ends_at")
+        if ends_at:
+            deadline = ends_at if ends_at.tzinfo else ends_at.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) >= deadline:
+                await _edit_webhook_message(bot, interaction_token, "❌ This giveaway has ended.")
+                return
+
+        # Check role gate
+        required_role_id = giveaway.get("required_role_id")
+        if required_role_id:
+            role_ids = {r.id for r in getattr(member, "roles", [])}
+            if int(required_role_id) not in role_ids:
+                await _edit_webhook_message(
+                    bot, interaction_token, f"❌ This giveaway is limited to <@&{int(required_role_id)}> members."
+                )
+                return
+
+        # Mock an interaction to use the existing gates
+        class MockInteraction:
+            def __init__(self, guild_id, user, guild):
+                self.guild_id = guild_id
+                self.user = user
+                self.guild = guild
+                self.token = interaction_token
+
+        mock_interaction = MockInteraction(guild_id, member, guild)
+        view = GiveawayPanelView(engine)
+
+        # Check alt gates (skipping captcha since we just verified it)
+        blocked_msg, _ = await view._alt_gate_reason(giveaway, mock_interaction)
+        if blocked_msg:
+            # If we got a blocked message that IS NOT the captcha request
+            # Note: _is_verified will now return True for this user, so captcha gate is skipped
+            await _edit_webhook_message(bot, interaction_token, f"❌ {blocked_msg}")
+            return
+
+        blocked = view._entry_block_reason(giveaway, guild_id, member.id, per_join=_tickets_per_join(giveaway, member))
+        if blocked:
+            await _edit_webhook_message(bot, interaction_token, f"❌ {blocked}")
+            return
+
+        prompt = (giveaway.get("entry_prompt") or "").strip()
+        if prompt:
+            # Modals can't be triggered after the fact via webhook edits.
+            # We must instruct them to click Join again.
+            await _edit_webhook_message(
+                bot,
+                interaction_token,
+                "✅ Verification complete. Please press **Join giveaway** again to answer the entry prompt.",
+            )
+            return
+
+        success, msg = view._do_commit_entry(guild_id, member, giveaway)
+        await _edit_webhook_message(bot, interaction_token, msg)
+
+        if success:
+            asyncio.create_task(schedule_panel_refresh(bot, engine, guild_id, giveaway_id))
+
+    except Exception as e:
+        logger.error(f"[giveaway] verification process failed: {e}", exc_info=True)
+        await _edit_webhook_message(
+            bot, interaction_token, "❌ Something went wrong while entering you into the giveaway."
+        )
+
+
+async def _edit_webhook_message(bot, interaction_token, content):
+    """Helper to edit the original ephemeral interaction response."""
+    try:
+        await bot.http.edit_webhook_message(
+            bot.user.id, interaction_token, "@original", content=content, components=[]  # Remove the verify button
+        )
+    except Exception as e:
+        logger.warning(f"[giveaway] failed to edit ephemeral message: {e}")
