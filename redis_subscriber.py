@@ -1869,15 +1869,62 @@ class RedisSubscriber:
             elif action == "giveaway_stopped":
                 logger.info(f"⏹️  Stopping giveaway {giveaway_id} for guild {guild_id}")
 
+                # Winners already drawn before the stop. A multi-winner giveaway
+                # holds its announcement until the cap is reached — if it is
+                # stopped early, this is the only chance to post them.
+                drawn_winners = []
+                try:
+                    with engine.connect() as conn:
+                        rows = conn.execute(
+                            text(
+                                """
+                                SELECT kick_username, discord_id FROM giveaway_winners
+                                WHERE giveaway_id = :gid AND discord_server_id = :sid
+                                ORDER BY drawn_at ASC
+                                """
+                            ),
+                            {"gid": giveaway_id, "sid": str(guild_id)},
+                        ).fetchall()
+                    drawn_winners = [{"name": r[0], "discord_id": r[1]} for r in rows]
+                except Exception as e:
+                    logger.debug(f"[giveaway] stopped-winner lookup failed: {e}")
+
                 # Close out the Discord panel if this giveaway had one: drop the
                 # Join button so nobody can enter a stopped giveaway from a stale
                 # message. Left in place (not deleted) as a record.
                 try:
-                    from features.giveaway.giveaway_panel import refresh_panel
+                    from features.giveaway.giveaway_panel import refresh_panel, winner_label
 
-                    await refresh_panel(self.bot, engine, guild_id, giveaway_id, ended=True)
+                    labels = [
+                        winner_label({"display": w["name"], "discord_id": w["discord_id"]}) for w in drawn_winners
+                    ]
+                    await refresh_panel(self.bot, engine, guild_id, giveaway_id, ended=True, winners=labels or None)
                 except Exception as panel_error:
                     logger.debug(f"[giveaway] panel close-out skipped: {panel_error}")
+
+                # Post whoever was drawn, since the held announcement never fired.
+                if drawn_winners:
+                    try:
+                        from features.giveaway.giveaway_panel import resolve_announce_channel, winner_label
+
+                        channel = await resolve_announce_channel(self.bot, engine, guild_id, giveaway_id)
+                        if channel:
+                            import discord
+
+                            joined = ", ".join(
+                                winner_label({"display": w["name"], "discord_id": w["discord_id"]})
+                                for w in drawn_winners
+                            )
+                            plural = len(drawn_winners) != 1
+                            embed = discord.Embed(
+                                title="Giveaway Winners" if plural else "Giveaway Winner",
+                                color=0xFFD700,
+                            )
+                            embed.add_field(name="Winners" if plural else "Winner", value=joined, inline=False)
+                            await channel.send(content=f"Congratulations {joined}!", embed=embed)
+                            logger.info(f"✅ Announced winner(s) on stop: {joined}")
+                    except Exception as e:
+                        logger.warning(f"[giveaway] stop announce failed: {e}")
 
                 # Clean up active giveaways cache
                 if hasattr(giveaway_manager, "active_giveaways"):
@@ -1896,12 +1943,24 @@ class RedisSubscriber:
                 discord_channel_id = data.get("discord_channel_id")
                 giveaway_title = data.get("giveaway_title", "Giveaway")
                 delay_announcement = data.get("delay_announcement", False)
+                # A multi-winner giveaway is drawn one at a time; the dashboard
+                # sets `announce` only on the LAST draw (cap reached, or the
+                # entry pool ran out), so Discord gets one message naming every
+                # winner instead of one per draw. Absent = announce (older
+                # dashboard builds, and every single-winner giveaway).
+                should_announce = data.get("announce", True)
+                all_winners = data.get("winners") or []
 
                 if not winner:
                     logger.warning("⚠️ No winner in giveaway_winner event")
                     return
 
-                logger.info(f"🎉 Winner drawn: {winner}")
+                logger.info(f"🎉 Winner drawn: {winner}" + ("" if should_announce else " (holding announcement)"))
+
+                if not should_announce:
+                    # More winners still to draw: leave the panel live and post
+                    # nothing. The console already shows the winner.
+                    return
 
                 # If delay requested, wait 7 seconds for OBS animation to complete (6s animation + 1s buffer)
                 if delay_announcement:
@@ -1909,11 +1968,19 @@ class RedisSubscriber:
                     await asyncio.sleep(7)
 
                 # Close out the Discord panel (if this giveaway had one) so the
-                # message shows the winner and the Join button is gone.
+                # message shows the winners and the Join button is gone.
                 try:
-                    from features.giveaway.giveaway_panel import refresh_panel
+                    from features.giveaway.giveaway_panel import refresh_panel, winner_label
 
-                    await refresh_panel(self.bot, engine, guild_id, giveaway_id, ended=True, winners=[winner])
+                    panel_names = (
+                        [
+                            winner_label({"display": w.get("name"), "discord_id": w.get("discord_id")})
+                            for w in all_winners
+                        ]
+                        if all_winners
+                        else [winner]
+                    )
+                    await refresh_panel(self.bot, engine, guild_id, giveaway_id, ended=True, winners=panel_names)
                 except Exception as panel_error:
                     logger.debug(f"[giveaway] panel winner update skipped: {panel_error}")
 
@@ -1930,11 +1997,10 @@ class RedisSubscriber:
                 if channel is None:
                     channel = await resolve_announce_channel(self.bot, engine, guild_id, giveaway_id)
 
-                if channel:
-                    import discord
-
-                    # The winner's Discord id may not be in the payload (older
-                    # dashboard builds); fall back to the recorded winner row.
+                # Every winner drawn for this giveaway, oldest first. Falls back
+                # to the single winner from the payload when the dashboard did
+                # not send the full list.
+                if not all_winners:
                     if not winner_discord_id:
                         try:
                             with engine.connect() as conn:
@@ -1952,21 +2018,38 @@ class RedisSubscriber:
                                 winner_discord_id = int(row[0])
                         except Exception as e:
                             logger.debug(f"[giveaway] winner discord_id lookup failed: {e}")
+                    all_winners = [{"name": winner, "discord_id": winner_discord_id}]
 
-                    mention = f"<@{int(winner_discord_id)}>" if winner_discord_id else f"**{winner}**"
-                    embed = discord.Embed(title="Giveaway Winner", description=f"**{giveaway_title}**", color=0xFFD700)
-                    embed.add_field(name="Winner", value=mention, inline=False)
+                from features.giveaway.giveaway_panel import winner_label
+
+                mentions = [
+                    winner_label({"display": w.get("name"), "discord_id": w.get("discord_id")}) for w in all_winners
+                ]
+                joined = ", ".join(mentions)
+                plural = len(mentions) != 1
+
+                if channel:
+                    import discord
+
+                    embed = discord.Embed(
+                        title="Giveaway Winners" if plural else "Giveaway Winner",
+                        description=f"**{giveaway_title}**",
+                        color=0xFFD700,
+                    )
+                    embed.add_field(name="Winners" if plural else "Winner", value=joined, inline=False)
 
                     # The mention must be in the message CONTENT to actually
                     # ping — Discord does not notify from inside an embed.
-                    await channel.send(content=f"Congratulations {mention}!", embed=embed)
-                    logger.info(f"✅ Announced giveaway winner in Discord: {winner}")
+                    await channel.send(content=f"Congratulations {joined}!", embed=embed)
+                    logger.info(f"✅ Announced giveaway winner(s) in Discord: {joined}")
 
-                # Announce in Kick chat
+                # Announce in stream chat. Plain names: a <@id> mention would
+                # render as raw text on Kick/Twitch.
                 if self.send_message_callback:
-                    message = f"🎉 GIVEAWAY WINNER: @{winner} won {giveaway_title}! Congratulations! 🎊"
+                    plain = ", ".join(str(w.get("name") or "") for w in all_winners)
+                    message = f"GIVEAWAY WINNER{'S' if plural else ''}: {plain} won {giveaway_title}!"
                     await self.announce_in_chat(message, guild_id=guild_id)
-                    logger.info(f"✅ Announced giveaway winner in Kick chat: {winner}")
+                    logger.info(f"✅ Announced giveaway winner(s) in Kick chat: {plain}")
 
                 # Clean up active giveaways cache
                 if hasattr(giveaway_manager, "active_giveaways"):
