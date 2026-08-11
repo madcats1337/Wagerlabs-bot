@@ -80,10 +80,15 @@ def _fetch_template(engine, template_id, guild_id):
 
 
 async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, description, duration_minutes):
-    """Insert + start a giveaway from a template, post its panel, and describe it.
+    """Insert + start a giveaway from a settings dict, post its panel, describe it.
 
-    Shared by every entry point (the setup panel and the direct-option form) so
-    there is exactly one place that knows how a template becomes a giveaway.
+    `tpl` is a saved template row for `/giveaway start`, or an equivalent dict
+    assembled in memory by `/giveaway create`. Both go through here so there is
+    exactly one place that knows how settings become a running giveaway — and
+    so a new column only has to be added to this INSERT once.
+
+    Only `tpl["name"]` is template-specific; it is optional, and the summary
+    embed omits the Template field when it is absent.
 
     Returns (embed, giveaway_id) — or (embed, None) when it could not start.
     """
@@ -173,7 +178,10 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
             logger.error(f"[giveaway] panel post failed: {e}", exc_info=True)
 
     embed = discord.Embed(title="Giveaway started", description=f"**{title}**", color=WAGERLABS_YELLOW)
-    embed.add_field(name="Template", value=tpl["name"], inline=True)
+    # Absent for /giveaway create, which assembles its settings on the panel
+    # rather than loading a saved template.
+    if tpl.get("name"):
+        embed.add_field(name="Template", value=tpl["name"], inline=True)
     ends_epoch = _ends_at_epoch(engine, giveaway_id)
     embed.add_field(
         name="Ends",
@@ -188,7 +196,7 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
             value="The panel could not be posted — check the template's channel.",
             inline=False,
         )
-    logger.info(f"[giveaway] started id={giveaway_id} via template {tpl['name']}")
+    logger.info(f"[giveaway] started id={giveaway_id} via {tpl.get('name') or 'ad-hoc create'}")
     return embed, giveaway_id
 
 
@@ -222,7 +230,10 @@ class GiveawayDetailsModal(discord.ui.Modal):
     """
 
     def __init__(self, bot, engine, tpl):
-        super().__init__(title=f"Start: {tpl['name']}"[:45])
+        # `tpl` is a saved template row (from /giveaway start) or an in-memory
+        # settings dict (from /giveaway create). Only the former has a name and
+        # an id, and only the former is re-read on submit.
+        super().__init__(title=(f"Start: {tpl['name']}" if tpl.get("name") else "New giveaway")[:45])
         self._bot = bot
         self._engine = engine
         self._tpl = tpl
@@ -293,12 +304,16 @@ class GiveawayDetailsModal(discord.ui.Modal):
 
             await interaction.response.defer(ephemeral=True)
 
-            # Re-read the template: it may have been edited or deleted while the
-            # modal sat open.
-            tpl = _fetch_template(self._engine, self._tpl["id"], guild_id)
-            if not tpl:
-                await interaction.followup.send("That template no longer exists.", ephemeral=True)
-                return
+            # Re-read a SAVED template: it may have been edited or deleted while
+            # the modal sat open. An ad-hoc create has no stored row to re-read —
+            # its settings live on the panel — so use them as given.
+            if self._tpl.get("id"):
+                tpl = _fetch_template(self._engine, self._tpl["id"], guild_id)
+                if not tpl:
+                    await interaction.followup.send("That template no longer exists.", ephemeral=True)
+                    return
+            else:
+                tpl = self._tpl
 
             embed, giveaway_id = await _create_giveaway_from_template(
                 self._bot,
@@ -315,6 +330,338 @@ class GiveawayDetailsModal(discord.ui.Modal):
         logger.error(f"[giveaway] setup modal error: {error}", exc_info=True)
         if not interaction.response.is_done():
             await interaction.response.send_message("Something went wrong.", ephemeral=True)
+
+
+# ── /giveaway create ─────────────────────────────────────────────────────────
+#
+# Same settings as the dashboard's create form, without a saved template.
+# `entry_method` is always 'discord' — the command exists to post a panel with
+# a Join button, so there is nothing to choose.
+#
+# A View allows five action rows and each select consumes a whole row, so the
+# settings are split across TWO pages of the same ephemeral message rather than
+# crammed into one. Free-text values (title, description, duration) go in the
+# modal, which is capped at five components.
+
+# Preset day counts. Free-text numbers would need modal slots that the title,
+# description and duration fields already occupy.
+_AGE_PRESETS = [("Off", "0"), ("7 days", "7"), ("14 days", "14"), ("30 days", "30"), ("90 days", "90")]
+_TENURE_PRESETS = [("Off", "0"), ("1 day", "1"), ("3 days", "3"), ("7 days", "7"), ("30 days", "30")]
+
+
+def _int_select(label_value_pairs, placeholder, current, row):
+    """A single-choice Select over (label, value) pairs, with `current` marked."""
+    return discord.ui.Select(
+        placeholder=placeholder,
+        row=row,
+        options=[
+            discord.SelectOption(label=label, value=value, default=(value == str(current)))
+            for label, value in label_value_pairs
+        ],
+    )
+
+
+class GiveawayCreateView(discord.ui.View):
+    """Ephemeral two-page settings panel for `/giveaway create`.
+
+    Holds the chosen settings in memory; nothing is written until the modal is
+    submitted, so abandoning the panel leaves no partial giveaway behind.
+    """
+
+    def __init__(self, bot, engine, author_id):
+        super().__init__(timeout=600)
+        self._bot = bot
+        self._engine = engine
+        self._author_id = author_id
+        self._page = 1
+
+        # Settings, mirroring the dashboard's defaults.
+        self.channel_id = None
+        self.required_role_id = None
+        self.max_winners = 1
+        self.max_entries_per_user = 1
+        self.min_account_age_days = 0
+        self.min_server_days = 0
+        self.require_captcha = False
+        self.bonus_roles = {}
+        self.bonus_role_id = None
+
+        self._build()
+
+    # ── page construction ────────────────────────────────────────────────
+    def _build(self):
+        self.clear_items()
+        if self._page == 1:
+            self._build_page_one()
+        else:
+            self._build_page_two()
+
+    def _build_page_one(self):
+        # default_values keeps the picked channel/role visible after the message
+        # is edited — the components are rebuilt from scratch on every refresh,
+        # so without it the select would snap back to its placeholder and
+        # disagree with the summary embed.
+        channel = discord.ui.ChannelSelect(
+            placeholder="Channel to post the giveaway in…",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+            row=0,
+            default_values=([discord.Object(id=self.channel_id)] if self.channel_id else []),
+        )
+        channel.callback = self._on_channel
+        self.add_item(channel)
+
+        role = discord.ui.RoleSelect(
+            placeholder="Required role (optional) — leave unset for everyone",
+            row=1,
+            min_values=0,
+            default_values=([discord.Object(id=self.required_role_id)] if self.required_role_id else []),
+        )
+        role.callback = self._on_role
+        self.add_item(role)
+
+        winners = _int_select(
+            [(f"{n} winner{'s' if n != 1 else ''}", str(n)) for n in (1, 2, 3, 5, 10, 25)],
+            "Number of winners…",
+            self.max_winners,
+            row=2,
+        )
+        winners.callback = self._on_winners
+        self.add_item(winners)
+
+        per_user = _int_select(
+            [("1 entry per person", "1")] + [(f"Up to {n} entries each", str(n)) for n in (2, 3, 5, 10)],
+            "Entries per person…",
+            self.max_entries_per_user,
+            row=3,
+        )
+        per_user.callback = self._on_per_user
+        self.add_item(per_user)
+
+        nxt = discord.ui.Button(label="Next: alt checks & bonuses", style=discord.ButtonStyle.secondary, row=4)
+        nxt.callback = self._on_next
+        self.add_item(nxt)
+
+        start = discord.ui.Button(
+            label="Set title & duration",
+            style=discord.ButtonStyle.success,
+            row=4,
+            disabled=self.channel_id is None,
+        )
+        start.callback = self._on_configure
+        self.add_item(start)
+
+    def _build_page_two(self):
+        age = _int_select(_AGE_PRESETS, "Minimum account age…", self.min_account_age_days, row=0)
+        age.callback = self._on_age
+        self.add_item(age)
+
+        tenure = _int_select(_TENURE_PRESETS, "Minimum time in server…", self.min_server_days, row=1)
+        tenure.callback = self._on_tenure
+        self.add_item(tenure)
+
+        bonus_role = discord.ui.RoleSelect(
+            placeholder="Bonus entries: pick a role (optional)",
+            row=2,
+            min_values=0,
+            default_values=([discord.Object(id=self.bonus_role_id)] if self.bonus_role_id else []),
+        )
+        bonus_role.callback = self._on_bonus_role
+        self.add_item(bonus_role)
+
+        if self.bonus_role_id:
+            bonus_amount = _int_select(
+                [(f"+{n} extra entries", str(n)) for n in (1, 2, 3, 5, 10)],
+                "…and how many extra entries",
+                # Mark the amount already chosen for THIS role, so re-selecting
+                # a role shows what it is currently worth.
+                self.bonus_roles.get(str(self.bonus_role_id), 0),
+                row=3,
+            )
+            bonus_amount.callback = self._on_bonus_amount
+            self.add_item(bonus_amount)
+
+        captcha = discord.ui.Button(
+            label=f"Bot check: {'On' if self.require_captcha else 'Off'}",
+            style=discord.ButtonStyle.success if self.require_captcha else discord.ButtonStyle.secondary,
+            row=4,
+        )
+        captcha.callback = self._on_captcha
+        self.add_item(captcha)
+
+        back = discord.ui.Button(
+            # The channel lives on page one, so say where to go when it's unset
+            # rather than presenting a dead disabled button on this page.
+            label="Back" if self.channel_id else "Back — pick a channel",
+            style=discord.ButtonStyle.secondary if self.channel_id else discord.ButtonStyle.primary,
+            row=4,
+        )
+        back.callback = self._on_back
+        self.add_item(back)
+
+        start = discord.ui.Button(
+            label="Set title & duration",
+            style=discord.ButtonStyle.success,
+            row=4,
+            disabled=self.channel_id is None,
+        )
+        start.callback = self._on_configure
+        self.add_item(start)
+
+    # ── summary ──────────────────────────────────────────────────────────
+    def embed(self):
+        e = discord.Embed(
+            title="Create a giveaway",
+            description=(
+                "Choose where it posts and who can enter, then set the title and duration."
+                if self._page == 1
+                else "Optional checks that keep alt accounts and bots out."
+            ),
+            color=WAGERLABS_YELLOW,
+        )
+        e.add_field(
+            name="Channel",
+            value=f"<#{self.channel_id}>" if self.channel_id else "*required*",
+            inline=True,
+        )
+        e.add_field(name="Winners", value=str(self.max_winners), inline=True)
+        e.add_field(
+            name="Entries each",
+            value=str(self.max_entries_per_user),
+            inline=True,
+        )
+        e.add_field(
+            name="Required role",
+            value=f"<@&{self.required_role_id}>" if self.required_role_id else "Everyone",
+            inline=True,
+        )
+        e.add_field(
+            name="Account age",
+            value=f"{self.min_account_age_days}d+" if self.min_account_age_days else "Any",
+            inline=True,
+        )
+        e.add_field(
+            name="In server",
+            value=f"{self.min_server_days}d+" if self.min_server_days else "Any",
+            inline=True,
+        )
+        if self.bonus_roles:
+            e.add_field(
+                name="Bonus entries",
+                value=", ".join(f"<@&{rid}> +{n}" for rid, n in self.bonus_roles.items()),
+                inline=False,
+            )
+        if self.require_captcha:
+            e.add_field(
+                name="Bot check",
+                value="Entrants verify once on the web before joining.",
+                inline=False,
+            )
+        e.set_footer(text=f"Page {self._page} of 2")
+        return e
+
+    async def _refresh(self, interaction):
+        self._build()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    # ── callbacks ────────────────────────────────────────────────────────
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self._author_id:
+            await interaction.response.send_message("This panel isn't yours.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        # Nothing is written until the modal is submitted, so an expired panel
+        # has no giveaway behind it — disable the controls rather than leave
+        # them live and silently dropping the settings.
+        for item in self.children:
+            item.disabled = True
+
+    async def _on_channel(self, interaction):
+        values = interaction.data.get("values") or []
+        self.channel_id = int(values[0]) if values else None
+        await self._refresh(interaction)
+
+    async def _on_role(self, interaction):
+        values = interaction.data.get("values") or []
+        self.required_role_id = int(values[0]) if values else None
+        await self._refresh(interaction)
+
+    async def _on_winners(self, interaction):
+        self.max_winners = int(interaction.data["values"][0])
+        await self._refresh(interaction)
+
+    async def _on_per_user(self, interaction):
+        self.max_entries_per_user = int(interaction.data["values"][0])
+        await self._refresh(interaction)
+
+    async def _on_age(self, interaction):
+        self.min_account_age_days = int(interaction.data["values"][0])
+        await self._refresh(interaction)
+
+    async def _on_tenure(self, interaction):
+        self.min_server_days = int(interaction.data["values"][0])
+        await self._refresh(interaction)
+
+    async def _on_bonus_role(self, interaction):
+        values = interaction.data.get("values") or []
+        self.bonus_role_id = int(values[0]) if values else None
+        # Switching roles must not strand the previous one: a role left in the
+        # dict would still grant its bonus in the live giveaway, because the
+        # award path takes the max across every entry in bonus_roles.
+        if self.bonus_role_id:
+            self.bonus_roles = {rid: n for rid, n in self.bonus_roles.items() if rid == str(self.bonus_role_id)}
+        else:
+            self.bonus_roles = {}
+        await self._refresh(interaction)
+
+    async def _on_bonus_amount(self, interaction):
+        if self.bonus_role_id:
+            self.bonus_roles = {str(self.bonus_role_id): int(interaction.data["values"][0])}
+        await self._refresh(interaction)
+
+    async def _on_captcha(self, interaction):
+        self.require_captcha = not self.require_captcha
+        await self._refresh(interaction)
+
+    async def _on_next(self, interaction):
+        self._page = 2
+        await self._refresh(interaction)
+
+    async def _on_back(self, interaction):
+        self._page = 1
+        await self._refresh(interaction)
+
+    async def _on_configure(self, interaction):
+        if not self.channel_id:
+            await interaction.response.send_message("Pick a channel first.", ephemeral=True)
+            return
+        await interaction.response.send_modal(GiveawayDetailsModal(self._bot, self._engine, self.as_settings()))
+
+    def as_settings(self):
+        """The panel's state in the shape `_create_giveaway_from_template` reads.
+
+        No `name` key — that is what marks this as an ad-hoc create rather than
+        a saved template, and keeps the Template field off the summary embed.
+        """
+        return {
+            "entry_method": "discord",
+            "discord_channel_id": self.channel_id,
+            "max_winners": self.max_winners,
+            "max_entries_per_user": self.max_entries_per_user,
+            # The dashboard models "more than one entry" as a flag plus a cap;
+            # the panel collects only the cap, so derive the flag from it.
+            "allow_multiple_entries": self.max_entries_per_user > 1,
+            "required_role_id": self.required_role_id,
+            "bonus_roles": self.bonus_roles or None,
+            "min_account_age_days": self.min_account_age_days or None,
+            "min_server_days": self.min_server_days or None,
+            "require_captcha": self.require_captcha,
+            "keyword": None,
+            "messages_required": None,
+            "time_window_minutes": None,
+            "entry_prompt": None,
+        }
 
 
 class GiveawaySetupView(discord.ui.View):
@@ -430,6 +777,24 @@ def register_giveaway_commands(bot: commands.Bot, engine) -> None:
             )
             view = GiveawaySetupView(bot, engine, templates, interaction.user.id)
             await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @giveaway_group.command(
+        name="create",
+        description="Create and start a Discord giveaway without a saved template.",
+    )
+    async def giveaway_create(interaction: discord.Interaction) -> None:
+        guild_id = interaction.guild_id
+        guild_name = interaction.guild.name if interaction.guild else None
+
+        with server_context(guild_id, guild_name):
+            if not _may_manage(interaction):
+                await interaction.response.send_message(
+                    "You need Manage Server permission to create a giveaway.", ephemeral=True
+                )
+                return
+
+            view = GiveawayCreateView(bot, engine, interaction.user.id)
+            await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     bot.tree.add_command(giveaway_group)
     logger.debug("Registered /giveaway command group")
