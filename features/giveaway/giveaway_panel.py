@@ -1034,8 +1034,17 @@ async def process_giveaway_verification(bot, engine, payload):
 async def _edit_webhook_message(bot, interaction_token, content):
     """Helper to edit the original ephemeral interaction response."""
     try:
-        await bot.http.edit_webhook_message(
-            bot.user.id, interaction_token, "@original", content=content, components=[]  # Remove the verify button
-        )
+        webhook = discord.Webhook.partial(bot.user.id, interaction_token, client=bot)
+
+        if isinstance(content, str):
+            embed = discord.Embed(
+                description=content, color=discord.Color.red() if "❌" in content else discord.Color.green()
+            )
+        elif isinstance(content, discord.Embed):
+            embed = content
+        else:
+            embed = discord.Embed(description=str(content))
+
+        await webhook.edit_message("@original", embed=embed, view=None)
     except Exception as e:
         logger.warning(f"[giveaway] failed to edit ephemeral message: {e}")
