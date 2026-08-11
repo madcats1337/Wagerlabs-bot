@@ -98,6 +98,32 @@ def winner_label(winner) -> str:
     return f"**{name}**"
 
 
+def is_discord_hosted(engine, giveaway_id) -> bool:
+    """Whether this giveaway is entered through the Discord panel.
+
+    Discord-hosted giveaways have no relationship to stream chat — the entrants
+    are Discord members and the panel lives in a Discord channel — so their
+    winners must NOT be announced on Kick/Twitch. Chat-based giveaways
+    (keyword / active_chatter) still announce there.
+
+    Fails CLOSED (returns False) when the row can't be read, so an outage
+    degrades to the old behaviour rather than silently dropping announcements
+    for chat giveaways.
+    """
+    if giveaway_id is None:
+        return False
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT entry_method FROM giveaways WHERE id = :gid"),
+                {"gid": giveaway_id},
+            ).fetchone()
+        return bool(row) and (row[0] or "") == "discord"
+    except Exception as e:
+        logger.debug(f"[giveaway] entry_method lookup failed: {e}")
+        return False
+
+
 async def resolve_announce_channel(bot, engine, guild_id, giveaway_id=None):
     """Where a giveaway's winners should be announced.
 

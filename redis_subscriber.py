@@ -1933,9 +1933,12 @@ class RedisSubscriber:
                     ]
                 logger.info(f"✅ Giveaway {giveaway_id} stopped")
 
-                # Announce in Kick chat
-                if self.send_message_callback:
-                    await self.announce_in_chat("🎁 Giveaway has been stopped by moderators.", guild_id=guild_id)
+                # Announce in stream chat — skipped for Discord-hosted giveaways
+                # (their entrants are Discord members, not stream chatters).
+                from features.giveaway.giveaway_panel import is_discord_hosted as _is_dh
+
+                if self.send_message_callback and not _is_dh(engine, giveaway_id):
+                    await self.announce_in_chat("Giveaway has been stopped by moderators.", guild_id=guild_id)
 
             elif action == "giveaway_winner":
                 winner = data.get("winner_username")
@@ -2043,9 +2046,13 @@ class RedisSubscriber:
                     await channel.send(content=f"Congratulations {joined}!", embed=embed)
                     logger.info(f"✅ Announced giveaway winner(s) in Discord: {joined}")
 
-                # Announce in stream chat. Plain names: a <@id> mention would
-                # render as raw text on Kick/Twitch.
-                if self.send_message_callback:
+                # Announce in stream chat — but NOT for Discord-hosted giveaways:
+                # their entrants are Discord members, so a Kick/Twitch post is
+                # noise to an audience that could not have entered.
+                from features.giveaway.giveaway_panel import is_discord_hosted
+
+                if self.send_message_callback and not is_discord_hosted(engine, giveaway_id):
+                    # Plain names: a <@id> mention renders as raw text in chat.
                     plain = ", ".join(str(w.get("name") or "") for w in all_winners)
                     message = f"GIVEAWAY WINNER{'S' if plural else ''}: {plain} won {giveaway_title}!"
                     await self.announce_in_chat(message, guild_id=guild_id)

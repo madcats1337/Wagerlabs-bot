@@ -3056,17 +3056,22 @@ def _start_giveaway_expiry_loop(bot, engine):
                     except Exception as e:
                         logger.warning(f"[giveaway] Discord announce failed: {e}")
 
-                    # Stream chat + dashboard console. Chat gets plain names —
-                    # a <@id> mention would render as raw text on Kick/Twitch.
+                    # Stream chat — skipped for Discord-hosted giveaways, whose
+                    # entrants are Discord members rather than stream chatters.
+                    # Chat gets plain names: a <@id> mention would render as raw
+                    # text on Kick/Twitch.
                     try:
-                        plain = ", ".join(
-                            (w.get("display") or w.get("winner") or "") if isinstance(w, dict) else str(w)
-                            for w in winners
-                        )
-                        await send_stream_message(
-                            f"GIVEAWAY WINNER{'S' if len(winners) != 1 else ''}: {plain} won {title}!",
-                            guild_id=guild_id,
-                        )
+                        from features.giveaway.giveaway_panel import is_discord_hosted
+
+                        if not is_discord_hosted(engine, giveaway_id):
+                            plain = ", ".join(
+                                (w.get("display") or w.get("winner") or "") if isinstance(w, dict) else str(w)
+                                for w in winners
+                            )
+                            await send_stream_message(
+                                f"GIVEAWAY WINNER{'S' if len(winners) != 1 else ''}: {plain} won {title}!",
+                                guild_id=guild_id,
+                            )
                     except Exception as e:
                         logger.debug(f"[giveaway] chat announce skipped: {e}")
 
