@@ -275,7 +275,7 @@ class GiveawayManager:
             # so both sides of the comparison use the DB server clock. Comparing the
             # DB-populated `timestamp` against a Python `datetime.utcnow()` cutoff would
             # silently return 0 if the DB session timezone were ever behind UTC.
-            message_count = conn.execute(
+            message_count_row = conn.execute(
                 text(
                     """
                 SELECT COUNT(DISTINCT message_hash) as count

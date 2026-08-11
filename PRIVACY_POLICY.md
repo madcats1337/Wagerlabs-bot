@@ -357,6 +357,12 @@ Note: Raffle draw records may be retained for transparency.
 - Used for: Processing paid subscription payments and recurring billing
 - Data shared: Your payment method and billing details are provided directly to Stripe; we receive only subscription identifiers and status. We do not store full card details.
 
+**Cloudflare Turnstile:**
+- Privacy Policy: https://www.cloudflare.com/privacypolicy/
+- Used for: An optional one-time bot check before entering a giveaway, when the server operator enables it
+- Data shared: Your IP address and browser signals are sent to Cloudflare so it can score whether you are a real person. We do **not** store your IP address — we record only that your Discord account passed the check for that server, and when
+- Retention: A passed check is remembered for 30 days per server, after which you would be asked again
+
 **Gambling Platforms** (Shuffle, Stake, Stake.us, etc.):
 - Used for: Wager tracking and verification via public APIs
 - Data shared: Only your public account information and wager history

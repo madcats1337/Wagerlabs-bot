@@ -19,6 +19,7 @@ content (a V2 message cannot carry an embed).
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -34,6 +35,104 @@ ACCENT = 0xFACC15  # Wagerlabs yellow
 # is cosmetic, so eventual consistency within a few seconds is fine.
 _EDIT_DEBOUNCE_SECONDS = 5
 _pending_edits: set[int] = set()
+
+
+# How long a captcha pass is remembered for a (server, member) pair. Applied at
+# READ time so no cleanup job is needed.
+_VERIFY_VALID_DAYS = 30
+# The one-time verify link. Short enough that a shared link is useless, long
+# enough to solve a challenge on a phone.
+_VERIFY_TOKEN_TTL_SECONDS = 10 * 60
+
+
+def _captcha_configured() -> bool:
+    """Are the Turnstile keys present?
+
+    The dashboard serves the challenge page, so both services need the keys in
+    their environment. When they are missing the captcha gate must be SKIPPED —
+    handing a member a link that can never validate would silently take a
+    giveaway to zero entries.
+    """
+    import os
+
+    return bool(os.getenv("TURNSTILE_SITE_KEY") and os.getenv("TURNSTILE_SECRET_KEY"))
+
+
+def _is_verified(engine, guild_id, discord_id) -> bool:
+    """Has this member passed the captcha for this server recently?
+
+    Scoped per server on purpose: one solved challenge must not buy entry
+    across every tenant. Fails OPEN on a DB error — a verification lookup
+    failing must not block a giveaway.
+    """
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT 1 FROM giveaway_verified_members
+                    WHERE discord_server_id = :sid AND discord_id = :did
+                      AND verified_at > CURRENT_TIMESTAMP - (:days * INTERVAL '1 day')
+                    """
+                ),
+                {"sid": int(guild_id), "did": int(discord_id), "days": _VERIFY_VALID_DAYS},
+            ).fetchone()
+        return row is not None
+    except Exception as e:
+        logger.error(f"[giveaway] verify lookup failed for {discord_id}: {e}")
+        return True
+
+
+def _issue_verify_link(engine, guild_id, giveaway_id, discord_id):
+    """Mint a one-time verify URL, or None if one can't be built.
+
+    The Discord id is stored SERVER-SIDE against an opaque token and never
+    appears in the URL, so a shared link cannot verify someone else — it
+    always writes the row for whoever the token was minted for.
+    """
+    import os
+    import secrets
+
+    import redis as _redis
+
+    from utils.server_urls import get_server_public_page_url
+
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        logger.error("[giveaway] REDIS_URL not configured; cannot issue verify link")
+        return None
+    if "://" not in redis_url:
+        redis_url = f"redis://{redis_url}"
+
+    token = secrets.token_urlsafe(32)
+    client = None
+    try:
+        client = _redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
+        client.setex(
+            f"giveaway_verify:{token}",
+            _VERIFY_TOKEN_TTL_SECONDS,
+            json.dumps(
+                {
+                    "discord_server_id": str(guild_id),
+                    "giveaway_id": int(giveaway_id),
+                    "discord_id": str(discord_id),
+                },
+                separators=(",", ":"),
+            ),
+        )
+    except Exception as e:
+        logger.error(f"[giveaway] could not store verify token: {e}")
+        return None
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    # Resolves subdomain servers, free-tier (?server=slug) and the generic
+    # apex fallback — always returns a usable URL.
+    return get_server_public_page_url(engine, guild_id, f"/verify/{token}")
 
 
 def _fmt_deadline(ends_at) -> str:
@@ -221,7 +320,8 @@ def _active_discord_giveaway(engine, guild_id, message_id=None):
                     SELECT id, title, description, status, started_at, ends_at, ended_at,
                            max_winners, discord_channel_id, discord_message_id,
                            allow_multiple_entries, max_entries_per_user,
-                           required_role_id, entry_prompt, bonus_roles
+                           required_role_id, entry_prompt, bonus_roles,
+                           min_account_age_days, min_server_days, require_captcha
                     FROM giveaways
                     WHERE discord_server_id = :sid
                       AND discord_message_id = :mid
@@ -239,7 +339,8 @@ def _active_discord_giveaway(engine, guild_id, message_id=None):
                     SELECT id, title, description, status, started_at, ends_at, ended_at,
                            max_winners, discord_channel_id, discord_message_id,
                            allow_multiple_entries, max_entries_per_user,
-                           required_role_id, entry_prompt, bonus_roles
+                           required_role_id, entry_prompt, bonus_roles,
+                           min_account_age_days, min_server_days, require_captcha
                     FROM giveaways
                     WHERE discord_server_id = :sid
                       AND entry_method = 'discord'
@@ -388,6 +489,14 @@ class GiveawayPanelView(discord.ui.LayoutView):
                 )
                 return
 
+        # Alt/bot gates. Ordered cheapest-first and placed before the modal so
+        # nobody fills in an entry prompt only to be rejected afterwards.
+        # All three are optional; NULL/False means "no requirement".
+        blocked = await self._alt_gate_reason(giveaway, interaction)
+        if blocked:
+            await interaction.response.send_message(blocked, ephemeral=True)
+            return
+
         # Cheap pre-check so an ineligible member is told BEFORE being shown a
         # modal they would fill in for nothing. The authoritative check runs
         # again inside the write transaction.
@@ -406,6 +515,75 @@ class GiveawayPanelView(discord.ui.LayoutView):
             return
 
         await self._commit_entry(interaction, giveaway, answer=None)
+
+    async def _alt_gate_reason(self, giveaway, interaction):
+        """Why this member fails the alt/bot gates right now, or None if they pass.
+
+        Three optional gates, evaluated against the member's state at click time:
+        account age, server tenure, and a one-time captcha. Each returns its own
+        specific message naming the member's actual value — a bare "you cannot
+        enter" just generates support tickets.
+        """
+        member = interaction.user
+        guild_id = interaction.guild_id
+        now = datetime.now(timezone.utc)
+
+        # Account age. `created_at` is decoded from the snowflake, so this needs
+        # no API call and no privileged intent.
+        min_age = giveaway.get("min_account_age_days")
+        if min_age:
+            age_days = (now - member.created_at).days
+            if age_days < int(min_age):
+                return (
+                    f"Your Discord account must be at least {int(min_age)} days old to enter "
+                    f"this giveaway. Yours is {age_days} {'day' if age_days == 1 else 'days'} old."
+                )
+
+        # Server tenure. `joined_at` can be absent on an uncached member, so
+        # fetch once. If it still can't be resolved we fail OPEN and log —
+        # failing closed on a Discord API hiccup would block every entrant.
+        min_tenure = giveaway.get("min_server_days")
+        if min_tenure:
+            joined = getattr(member, "joined_at", None)
+            if joined is None and interaction.guild is not None:
+                try:
+                    member = await interaction.guild.fetch_member(member.id)
+                    joined = member.joined_at
+                except (discord.HTTPException, AttributeError) as e:
+                    logger.warning(f"[giveaway] joined_at fetch failed for {member.id}: {e}")
+            if joined is None:
+                logger.warning(f"[giveaway] no joined_at for {member.id}; tenure gate skipped")
+            else:
+                tenure_days = (now - joined).days
+                if tenure_days < int(min_tenure):
+                    return (
+                        f"You must have been in this server for at least {int(min_tenure)} days "
+                        f"to enter. You have been here {tenure_days} "
+                        f"{'day' if tenure_days == 1 else 'days'}."
+                    )
+
+        # Captcha. Runs last so only members who already passed the cheap gates
+        # pay the click-out cost. Verification is remembered per (server, member),
+        # so this is a one-time step rather than a per-giveaway one.
+        if giveaway.get("require_captcha") and not _is_verified(self.engine, guild_id, member.id):
+            if not _captcha_configured():
+                # Keys missing on the dashboard side: degrade to the age/tenure
+                # gates rather than handing out a link nobody can ever pass.
+                logger.error("[giveaway] TURNSTILE_SITE_KEY/SECRET_KEY unset; captcha gate skipped")
+                return None
+            url = _issue_verify_link(self.engine, guild_id, giveaway["id"], member.id)
+            if not url:
+                # Redis unavailable or no link could be built. Fail OPEN: a
+                # broken verification service must not silently kill a giveaway.
+                logger.error(f"[giveaway] could not issue verify link for {member.id}; allowing entry")
+                return None
+            return (
+                "One quick check before you enter — it takes a few seconds, and you only "
+                f"need to do it once for this server:\n{url}\n\n"
+                "Come back and press **Join giveaway** when you're done."
+            )
+
+        return None
 
     def _entry_block_reason(self, giveaway, guild_id, discord_id, per_join=1):
         """Why this member may not enter right now, or None if they may.

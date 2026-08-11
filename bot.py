@@ -9295,6 +9295,33 @@ async def on_ready():
                 """
                     )
                 )
+                # Alt/bot entry gates. All optional: NULL/FALSE means "no
+                # requirement", so pre-existing giveaways keep one-click entry.
+                conn.execute(
+                    text(
+                        """
+                    ALTER TABLE giveaways
+                    ADD COLUMN IF NOT EXISTS min_account_age_days INTEGER,
+                    ADD COLUMN IF NOT EXISTS min_server_days INTEGER,
+                    ADD COLUMN IF NOT EXISTS require_captcha BOOLEAN NOT NULL DEFAULT FALSE
+                """
+                    )
+                )
+                # Captcha verification is remembered per (server, member), not
+                # per giveaway — solve once, every later giveaway in that server
+                # skips the redirect. Expiry applied at READ time, no cleanup job.
+                conn.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS giveaway_verified_members (
+                        discord_server_id BIGINT NOT NULL,
+                        discord_id BIGINT NOT NULL,
+                        verified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (discord_server_id, discord_id)
+                    )
+                """
+                    )
+                )
                 conn.execute(
                     text(
                         """
@@ -9350,6 +9377,18 @@ async def on_ready():
                 )
                 # Additive for servers whose table predates the column.
                 conn.execute(text("ALTER TABLE giveaway_templates ADD COLUMN IF NOT EXISTS entry_prompt VARCHAR(45)"))
+                # Templates carry the alt-gate settings too, so a saved template
+                # reproduces the same entry requirements on every run.
+                conn.execute(
+                    text(
+                        """
+                    ALTER TABLE giveaway_templates
+                    ADD COLUMN IF NOT EXISTS min_account_age_days INTEGER,
+                    ADD COLUMN IF NOT EXISTS min_server_days INTEGER,
+                    ADD COLUMN IF NOT EXISTS require_captcha BOOLEAN NOT NULL DEFAULT FALSE
+                """
+                    )
+                )
                 conn.execute(
                     text(
                         """
