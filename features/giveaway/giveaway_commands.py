@@ -89,23 +89,10 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
 
     guild_id = interaction.guild_id
 
-    # One active giveaway per server, matching the dashboard's rule. Re-checked
-    # here rather than only at the panel, because a modal can sit open for
-    # minutes while someone else starts one.
-    with engine.connect() as conn:
-        active = conn.execute(
-            text("SELECT id FROM giveaways WHERE discord_server_id = :sid AND status = 'active' LIMIT 1"),
-            {"sid": guild_id},
-        ).fetchone()
-    if active:
-        return (
-            discord.Embed(
-                title="Could not start",
-                description="There is already an active giveaway. Stop it before starting another.",
-                color=WAGERLABS_YELLOW,
-            ),
-            None,
-        )
+    # Several giveaways may run at once. Each Discord-hosted one owns its own
+    # panel message and `_active_discord_giveaway` resolves entries by
+    # discord_message_id, so their entry pools stay separate; the manager cache
+    # and the expiry loop both iterate all active rows.
 
     bonus_roles = tpl.get("bonus_roles")
     with engine.begin() as conn:
