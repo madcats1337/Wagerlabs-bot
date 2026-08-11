@@ -196,7 +196,7 @@ def _issue_verify_link(engine, guild_id, giveaway_id, discord_id, interaction_to
 
     # Resolves subdomain servers, free-tier (?server=slug) and the generic
     # apex fallback — always returns a usable URL.
-    return get_server_public_page_url(engine, guild_id, f"/verify/{token}")
+    return f"https://verify.wagerlabs.app/verify/{token}"
 
 
 def _fmt_deadline(ends_at) -> str:
@@ -369,15 +369,34 @@ def _entry_count(engine, giveaway_id, guild_id) -> int:
     return int(row[0]) if row else 0
 
 
-def _active_discord_giveaway(engine, guild_id, message_id=None):
+def _active_discord_giveaway(engine, guild_id, message_id=None, giveaway_id=None):
     """The guild's live Discord-hosted giveaway, or None.
 
     Read fresh on every interaction — the persistent view is shared across all
     guilds and all giveaways, so this is the only source of truth.
     If message_id is provided, accurately finds the specific giveaway.
+    If giveaway_id is provided, looks up by ID directly.
     """
     with engine.connect() as conn:
-        if message_id:
+        if giveaway_id:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT id, title, description, status, started_at, ends_at, ended_at,
+                           max_winners, discord_channel_id, discord_message_id,
+                           allow_multiple_entries, max_entries_per_user,
+                           required_role_id, entry_prompt, bonus_roles
+                    FROM giveaways
+                    WHERE discord_server_id = :sid
+                      AND id = :gid
+                      AND entry_method = 'discord'
+                      AND status = 'active'
+                    LIMIT 1
+                    """
+                ),
+                {"sid": guild_id, "gid": giveaway_id},
+            ).fetchone()
+        elif message_id:
             row = conn.execute(
                 text(
                     """
@@ -518,14 +537,20 @@ class GiveawayPanelView(discord.ui.LayoutView):
         """Validate eligibility, then either commit the entry or open the modal."""
         guild_id = interaction.guild_id
         if not guild_id:
-            await interaction.response.send_message("This only works in a server.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=discord.Embed(description="❌ This only works in a server.", color=discord.Color.red()),
+                ephemeral=True,
+            )
             return
 
         giveaway = _active_discord_giveaway(
             self.engine, guild_id, interaction.message.id if interaction.message else None
         )
         if not giveaway:
-            await interaction.response.send_message("This giveaway has ended.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=discord.Embed(description="❌ This giveaway has ended.", color=discord.Color.red()),
+                ephemeral=True,
+            )
             return
 
         # Deadline is enforced here as well as by the expiry loop: a click can
@@ -534,7 +559,10 @@ class GiveawayPanelView(discord.ui.LayoutView):
         if ends_at:
             deadline = ends_at if ends_at.tzinfo else ends_at.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) >= deadline:
-                await interaction.response.send_message("This giveaway has ended.", ephemeral=True)
+                await interaction.response.send_message(
+                    embed=discord.Embed(description="❌ This giveaway has ended.", color=discord.Color.red()),
+                    ephemeral=True,
+                )
                 return
 
         # Role gate. Checked against the member's CURRENT roles at click time,
@@ -546,7 +574,10 @@ class GiveawayPanelView(discord.ui.LayoutView):
             role_ids = {r.id for r in getattr(member, "roles", [])}
             if int(required_role_id) not in role_ids:
                 await interaction.response.send_message(
-                    f"This giveaway is limited to <@&{int(required_role_id)}> members.",
+                    embed=discord.Embed(
+                        description=f"❌ This giveaway is limited to <@&{int(required_role_id)}> members.",
+                        color=discord.Color.red(),
+                    ),
                     ephemeral=True,
                 )
                 return
@@ -556,12 +587,15 @@ class GiveawayPanelView(discord.ui.LayoutView):
         # All three are optional; NULL/False means "no requirement".
         blocked_msg, verify_url = await self._alt_gate_reason(giveaway, interaction)
         if blocked_msg:
+            embed = discord.Embed(
+                description=blocked_msg, color=discord.Color.orange() if verify_url else discord.Color.red()
+            )
             if verify_url:
                 view = discord.ui.View()
                 view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=verify_url, label="Verify"))
-                await interaction.response.send_message(blocked_msg, view=view, ephemeral=True)
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
             else:
-                await interaction.response.send_message(blocked_msg, ephemeral=True)
+                await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
         # Cheap pre-check so an ineligible member is told BEFORE being shown a
@@ -571,7 +605,9 @@ class GiveawayPanelView(discord.ui.LayoutView):
             giveaway, guild_id, interaction.user.id, per_join=_tickets_per_join(giveaway, interaction.user)
         )
         if blocked:
-            await interaction.response.send_message(blocked, ephemeral=True)
+            await interaction.response.send_message(
+                embed=discord.Embed(description=f"❌ {blocked}", color=discord.Color.red()), ephemeral=True
+            )
             return
 
         prompt = (giveaway.get("entry_prompt") or "").strip()
