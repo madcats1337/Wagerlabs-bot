@@ -2,7 +2,7 @@
 
 Templates hold the reusable settings (entry method, winners, channel, role
 gate, bonus roles); each run supplies only the title, an optional description,
-and the duration.
+and the duration (or no duration at all, for a manual draw).
 
 The flow is two steps, and the split is forced by Discord's rules:
 
@@ -126,7 +126,10 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
                    :max_per_user, 'active', :created_by, :channel_id,
                    :duration, :max_winners, :required_role_id, CAST(:bonus AS JSONB),
                    :entry_prompt, CURRENT_TIMESTAMP,
-                   CURRENT_TIMESTAMP + (:duration * INTERVAL '1 minute'))
+                   -- NULL duration = no timer: ends_at stays NULL and the
+                   -- expiry loop ignores it, so it waits for a manual draw.
+                   CASE WHEN :duration IS NULL THEN NULL
+                        ELSE CURRENT_TIMESTAMP + (:duration * INTERVAL '1 minute') END)
                 RETURNING id
                 """
             ),
@@ -174,7 +177,12 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
 
     embed = discord.Embed(title="Giveaway started", description=f"**{title}**", color=WAGERLABS_YELLOW)
     embed.add_field(name="Template", value=tpl["name"], inline=True)
-    embed.add_field(name="Ends", value=f"<t:{_ends_at_epoch(engine, giveaway_id)}:R>", inline=True)
+    ends_epoch = _ends_at_epoch(engine, giveaway_id)
+    embed.add_field(
+        name="Ends",
+        value=f"<t:{ends_epoch}:R>" if ends_epoch else "No timer — draw manually",
+        inline=True,
+    )
     if is_discord and tpl.get("discord_channel_id"):
         embed.add_field(name="Channel", value=f"<#{int(tpl['discord_channel_id'])}>", inline=True)
     if is_discord and not posted:
@@ -245,7 +253,13 @@ class GiveawayDetailsModal(discord.ui.Modal):
                 component=self.description_input,
             )
         )
-        self.add_item(discord.ui.Label(text="Days", description="Leave blank for zero.", component=self.days_input))
+        self.add_item(
+            discord.ui.Label(
+                text="Days",
+                description="Leave all three blank for no timer (draw manually).",
+                component=self.days_input,
+            )
+        )
         self.add_item(discord.ui.Label(text="Hours", component=self.hours_input))
         self.add_item(discord.ui.Label(text="Minutes", component=self.minutes_input))
 
@@ -272,13 +286,11 @@ class GiveawayDetailsModal(discord.ui.Modal):
                 )
                 return
 
-            duration_minutes = days * 1440 + hours * 60 + minutes
-            if duration_minutes <= 0:
-                await interaction.response.send_message(
-                    "Set a duration: fill in at least one of days, hours or minutes.", ephemeral=True
-                )
-                return
-            if duration_minutes > 527040:  # ~1 year
+            # All three blank = no timer: the giveaway runs until it is drawn
+            # by hand from the dashboard console (ends_at stays NULL, so the
+            # expiry loop never picks it up).
+            duration_minutes = days * 1440 + hours * 60 + minutes or None
+            if duration_minutes and duration_minutes > 527040:  # ~1 year
                 await interaction.response.send_message("Duration must be under one year.", ephemeral=True)
                 return
 
@@ -364,7 +376,9 @@ class GiveawaySetupView(discord.ui.View):
             description=f"**{tpl['name']}**\n{_describe_template(tpl)}",
             color=WAGERLABS_YELLOW,
         )
-        embed.set_footer(text="Continue to set the title, description and duration.")
+        embed.set_footer(
+            text="Continue to set the title, description and duration. Leave the duration blank to draw manually."
+        )
         await interaction.response.edit_message(embed=embed, view=self)
 
     async def _on_configure(self, interaction: discord.Interaction):

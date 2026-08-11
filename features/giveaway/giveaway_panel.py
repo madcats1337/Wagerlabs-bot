@@ -72,6 +72,74 @@ def _fmt_stamp(value) -> str:
     return f"<t:{int(value.timestamp())}:f>"
 
 
+def winner_label(winner) -> str:
+    """How a winner should appear in a Discord announcement.
+
+    Prefers a real <@id> mention (which pings them and renders their current
+    name) and falls back to the stored display name for chat-only entrants who
+    have no Discord id.
+    """
+    if isinstance(winner, dict):
+        discord_id = winner.get("discord_id")
+        name = (
+            winner.get("display")
+            or winner.get("winner")
+            or winner.get("kick_username")
+            or winner.get("display_name")
+            or "Unknown"
+        )
+    else:
+        discord_id, name = None, str(winner)
+    if discord_id:
+        try:
+            return f"<@{int(discord_id)}>"
+        except (TypeError, ValueError):
+            pass
+    return f"**{name}**"
+
+
+async def resolve_announce_channel(bot, engine, guild_id, giveaway_id=None):
+    """Where a giveaway's winners should be announced.
+
+    The giveaway's OWN channel first — the one chosen when it was created — so
+    the announcement lands where the panel and the entrants are. Falls back to
+    the guild's raffle announcement channel only when the giveaway has none
+    (chat-only giveaways never set one).
+    """
+    channel_id = None
+    if giveaway_id is not None:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT discord_channel_id FROM giveaways WHERE id = :gid"),
+                    {"gid": giveaway_id},
+                ).fetchone()
+            if row and row[0]:
+                channel_id = int(row[0])
+        except Exception as e:
+            logger.debug(f"[giveaway] could not read giveaway channel: {e}")
+
+    if not channel_id:
+        try:
+            get_guild_settings = getattr(bot, "get_guild_settings", None)
+            settings = get_guild_settings(guild_id) if get_guild_settings else None
+            raw = getattr(settings, "raffle_announcement_channel_id", None) if settings else None
+            channel_id = int(raw) if raw else None
+        except Exception as e:
+            logger.debug(f"[giveaway] could not read raffle channel: {e}")
+
+    if not channel_id:
+        return None
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception:
+            return None
+    return channel
+
+
 def _tickets_per_join(giveaway, member) -> int:
     """How many tickets one join is worth for this member.
 

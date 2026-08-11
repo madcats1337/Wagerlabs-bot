@@ -3019,36 +3019,52 @@ def _start_giveaway_expiry_loop(bot, engine):
                             logger.debug(f"[giveaway] panel close-out skipped: {e}")
                         continue
 
+                    # Mentions ping the winners; the fallback is their name.
+                    from features.giveaway.giveaway_panel import resolve_announce_channel, winner_label
+
                     # Terminal panel listing every winner.
                     try:
                         from features.giveaway.giveaway_panel import refresh_panel
 
-                        await refresh_panel(bot, engine, guild_id, giveaway_id, ended=True, winners=winners)
+                        # The panel takes label strings; mentions render there too.
+                        await refresh_panel(
+                            bot,
+                            engine,
+                            guild_id,
+                            giveaway_id,
+                            ended=True,
+                            winners=[winner_label(w) for w in winners],
+                        )
                     except Exception as e:
                         logger.debug(f"[giveaway] panel winner update skipped: {e}")
 
                     # ONE announcement listing all winners, not N messages.
-                    names = ", ".join(f"**{w}**" for w in winners)
+                    names = ", ".join(winner_label(w) for w in winners)
                     try:
-                        guild_settings = get_guild_settings(guild_id)
-                        channel_id = getattr(guild_settings, "raffle_announcement_channel_id", None)
-                        channel = bot.get_channel(channel_id) if channel_id else None
+                        # The giveaway's OWN channel, not the shared raffle one.
+                        channel = await resolve_announce_channel(bot, engine, guild_id, giveaway_id)
                         if channel:
                             embed = discord.Embed(
-                                title="🎉 Giveaway Winner!" if len(winners) == 1 else "🎉 Giveaway Winners!",
+                                title="Giveaway Winner" if len(winners) == 1 else "Giveaway Winners",
                                 description=f"**{title}**",
                                 color=0xFFD700,
                             )
-                            embed.add_field(name="Winners", value=f"🏆 {names}", inline=False)
-                            await channel.send(embed=embed)
+                            embed.add_field(name="Winners", value=names, inline=False)
+                            # The mention must also appear in the message CONTENT:
+                            # Discord does not ping from inside an embed.
+                            await channel.send(content=names, embed=embed)
                     except Exception as e:
                         logger.warning(f"[giveaway] Discord announce failed: {e}")
 
-                    # Stream chat + dashboard console.
+                    # Stream chat + dashboard console. Chat gets plain names —
+                    # a <@id> mention would render as raw text on Kick/Twitch.
                     try:
-                        plain = ", ".join(winners)
+                        plain = ", ".join(
+                            (w.get("display") or w.get("winner") or "") if isinstance(w, dict) else str(w)
+                            for w in winners
+                        )
                         await send_stream_message(
-                            f"🎉 GIVEAWAY WINNER{'S' if len(winners) != 1 else ''}: {plain} won {title}! 🎊",
+                            f"GIVEAWAY WINNER{'S' if len(winners) != 1 else ''}: {plain} won {title}!",
                             guild_id=guild_id,
                         )
                     except Exception as e:
@@ -3060,7 +3076,12 @@ def _start_giveaway_expiry_loop(bot, engine):
                         data={
                             "discord_server_id": guild_id,
                             "giveaway_id": giveaway_id,
-                            "winners": winners,
+                            # Plain names: the payload is JSON, and the console
+                            # renders text, not Discord mentions.
+                            "winners": [
+                                (w.get("display") or w.get("winner")) if isinstance(w, dict) else str(w)
+                                for w in winners
+                            ],
                         },
                     )
                 except Exception as e:
@@ -9291,6 +9312,9 @@ async def on_ready():
                     )
                 )
                 conn.execute(text("ALTER TABLE giveaway_entries ALTER COLUMN kick_username DROP NOT NULL"))
+                # Winners are announced with a real Discord mention, which needs
+                # the entrant's snowflake.
+                conn.execute(text("ALTER TABLE giveaway_winners ADD COLUMN IF NOT EXISTS discord_id BIGINT"))
                 logger.debug("✅ Discord-hosted giveaway columns ready")
 
                 # Reusable giveaway settings (no title/description/duration —

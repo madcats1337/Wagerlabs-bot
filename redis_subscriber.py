@@ -1917,35 +1917,50 @@ class RedisSubscriber:
                 except Exception as panel_error:
                     logger.debug(f"[giveaway] panel winner update skipped: {panel_error}")
 
-                # Announce in Discord
-                announcement_channel_id = discord_channel_id
-                if not announcement_channel_id:
-                    # Fallback to guild settings if no specific channel is set
-                    guild_settings = None
-                    if hasattr(self.bot, "get_guild_settings"):
+                # Announce in the giveaway's OWN channel — the one chosen when it
+                # was created — so the announcement lands where the panel and the
+                # entrants are. The payload's channel wins when present;
+                # otherwise resolve_announce_channel reads it off the giveaway
+                # row and only then falls back to the guild's raffle channel.
+                from features.giveaway.giveaway_panel import resolve_announce_channel
+
+                channel = None
+                if discord_channel_id:
+                    channel = self.bot.get_channel(int(discord_channel_id))
+                if channel is None:
+                    channel = await resolve_announce_channel(self.bot, engine, guild_id, giveaway_id)
+
+                if channel:
+                    import discord
+
+                    # The winner's Discord id may not be in the payload (older
+                    # dashboard builds); fall back to the recorded winner row.
+                    if not winner_discord_id:
                         try:
-                            guild_settings = self.bot.get_guild_settings(guild_id)
-                        except Exception:
-                            guild_settings = None
-                    if guild_settings is None:
-                        guild_settings = getattr(self.bot, "settings_manager", None)
-                    if guild_settings is not None:
-                        announcement_channel_id = getattr(guild_settings, "raffle_announcement_channel_id", None)
+                            with engine.connect() as conn:
+                                row = conn.execute(
+                                    text(
+                                        """
+                                        SELECT discord_id FROM giveaway_winners
+                                        WHERE giveaway_id = :gid AND kick_username = :name
+                                        ORDER BY drawn_at DESC LIMIT 1
+                                        """
+                                    ),
+                                    {"gid": giveaway_id, "name": winner},
+                                ).fetchone()
+                            if row and row[0]:
+                                winner_discord_id = int(row[0])
+                        except Exception as e:
+                            logger.debug(f"[giveaway] winner discord_id lookup failed: {e}")
 
-                if announcement_channel_id:
-                    channel = self.bot.get_channel(announcement_channel_id)
-                    if channel:
-                        import discord
+                    mention = f"<@{int(winner_discord_id)}>" if winner_discord_id else f"**{winner}**"
+                    embed = discord.Embed(title="Giveaway Winner", description=f"**{giveaway_title}**", color=0xFFD700)
+                    embed.add_field(name="Winner", value=mention, inline=False)
 
-                        embed = discord.Embed(
-                            title="🎉 Giveaway Winner!", description=f"**{giveaway_title}**", color=0xFFD700
-                        )
-                        embed.add_field(name="Winner", value=f"🏆 **{winner}**", inline=False)
-                        embed.add_field(name="", value="Congratulations! 🎊", inline=False)
-
-                        content = f"Congratulations <@{winner_discord_id}>!" if winner_discord_id else None
-                        await channel.send(content=content, embed=embed)
-                        logger.info(f"✅ Announced giveaway winner in Discord: {winner}")
+                    # The mention must be in the message CONTENT to actually
+                    # ping — Discord does not notify from inside an embed.
+                    await channel.send(content=f"Congratulations {mention}!", embed=embed)
+                    logger.info(f"✅ Announced giveaway winner in Discord: {winner}")
 
                 # Announce in Kick chat
                 if self.send_message_callback:

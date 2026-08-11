@@ -316,7 +316,7 @@ class GiveawayManager:
                 text(
                     """
                 SELECT COALESCE(kick_username, discord_username) AS kick_username,
-                       kick_user_id, entry_count, entry_method, created_at,
+                       kick_user_id, discord_id, entry_count, entry_method, created_at,
                        COALESCE(display_name, kick_username, discord_username) AS display_name
                 FROM giveaway_entries
                 WHERE giveaway_id = :giveaway_id
@@ -373,10 +373,11 @@ class GiveawayManager:
         winner_index = int((result["random_value"] / 100.0) * len(weighted_entries))
         winner_index = min(winner_index, len(weighted_entries) - 1)
         winner_username = weighted_entries[winner_index]
-        winner_display = next(
-            (e.get("display_name") or e["kick_username"] for e in entries if e["kick_username"] == winner_username),
-            winner_username,
-        )
+        winner_entry = next((e for e in entries if e["kick_username"] == winner_username), None)
+        winner_display = (winner_entry or {}).get("display_name") or winner_username
+        # Carried onto the winners row so the announcement can @mention them —
+        # a kick_username cannot be resolved back to a Discord member.
+        winner_discord_id = (winner_entry or {}).get("discord_id")
 
         logger.info(
             f"Provably fair draw - Random value: {result['random_value']}, "
@@ -388,11 +389,16 @@ class GiveawayManager:
             conn.execute(
                 text(
                     """
-                INSERT INTO giveaway_winners (giveaway_id, discord_server_id, kick_username)
-                VALUES (:giveaway_id, :server_id, :winner)
+                INSERT INTO giveaway_winners (giveaway_id, discord_server_id, kick_username, discord_id)
+                VALUES (:giveaway_id, :server_id, :winner, :discord_id)
             """
                 ),
-                {"giveaway_id": giveaway_id, "server_id": str(self.guild_id), "winner": winner_username},
+                {
+                    "giveaway_id": giveaway_id,
+                    "server_id": str(self.guild_id),
+                    "winner": winner_username,
+                    "discord_id": winner_discord_id,
+                },
             )
             conn.execute(
                 text(
@@ -425,10 +431,14 @@ class GiveawayManager:
         if finalize:
             await self.complete(giveaway_id)
 
-        return {"winner": winner_username, "display": winner_display}
+        return {"winner": winner_username, "display": winner_display, "discord_id": winner_discord_id}
 
     async def draw_all_winners(self, giveaway_id=None):
-        """Draw up to `max_winners` winners in one pass, then complete."""
+        """Draw up to `max_winners` winners in one pass, then complete.
+
+        Returns a list of {"winner", "display", "discord_id"} — the discord_id
+        is what lets the announcement @mention each winner.
+        """
         if not giveaway_id:
             return []
 
@@ -439,16 +449,16 @@ class GiveawayManager:
             ).fetchone()
         max_winners = max(1, int(row[0])) if row else 1
 
-        drawn, display_names = [], []
+        drawn, winners = [], []
         for _ in range(max_winners):
             result = await self.draw_winner(giveaway_id=giveaway_id, exclude=drawn, finalize=False)
             if not result:
                 break
             drawn.append(result["winner"])
-            display_names.append(result["display"])
+            winners.append(result)
 
         await self.complete(giveaway_id)
-        return display_names
+        return winners
 
     async def complete(self, giveaway_id=None):
         """Mark the giveaway finished and drop it from the in-memory cache."""
