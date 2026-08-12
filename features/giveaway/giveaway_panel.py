@@ -34,6 +34,38 @@ logger = logging.getLogger(__name__)
 
 ACCENT = 0xFACC15  # Wagerlabs yellow
 
+# A Discord modal holds at most five components, and every entry question
+# becomes one TextInput in the join modal — so five is a hard ceiling.
+MAX_ENTRY_PROMPTS = 5
+
+# Discord caps a TextInput LABEL at 45 characters, which is what a question
+# becomes when a member joins.
+MAX_ENTRY_PROMPT_LEN = 45
+
+
+def entry_prompts_of(row):
+    """The questions a giveaway/template asks, as a clean ordered list.
+
+    Reads the `entry_prompts` JSONB array and falls back to the legacy scalar
+    `entry_prompt` — rows written before multi-question support (or by a
+    dashboard that hasn't been redeployed yet) only have the scalar. Never read
+    either column directly.
+    """
+    raw = (row or {}).get("entry_prompts")
+    if isinstance(raw, str):
+        # Some drivers hand back JSONB as text depending on the column type.
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            raw = None
+    if isinstance(raw, list):
+        prompts = [p.strip() for p in raw if isinstance(p, str) and p.strip()]
+        if prompts:
+            return prompts[:MAX_ENTRY_PROMPTS]
+    single = ((row or {}).get("entry_prompt") or "").strip()
+    return [single] if single else []
+
+
 # Panel edits are coalesced per giveaway: a burst of Join clicks would otherwise
 # issue one Discord edit each and hit the per-channel rate limit. The entry count
 # is cosmetic, so eventual consistency within a few seconds is fine.
@@ -427,7 +459,7 @@ def _active_discord_giveaway(engine, guild_id, message_id=None, giveaway_id=None
                     SELECT id, title, description, status, started_at, ends_at, ended_at,
                            max_winners, discord_channel_id, discord_message_id,
                            allow_multiple_entries, max_entries_per_user,
-                           required_role_id, entry_prompt, bonus_roles
+                           required_role_id, entry_prompt, entry_prompts, bonus_roles
                     FROM giveaways
                     WHERE discord_server_id = :sid
                       AND id = :gid
@@ -445,7 +477,7 @@ def _active_discord_giveaway(engine, guild_id, message_id=None, giveaway_id=None
                     SELECT id, title, description, status, started_at, ends_at, ended_at,
                            max_winners, discord_channel_id, discord_message_id,
                            allow_multiple_entries, max_entries_per_user,
-                           required_role_id, entry_prompt, bonus_roles
+                           required_role_id, entry_prompt, entry_prompts, bonus_roles
                     FROM giveaways
                     WHERE discord_server_id = :sid
                       AND discord_message_id = :mid
@@ -463,7 +495,7 @@ def _active_discord_giveaway(engine, guild_id, message_id=None, giveaway_id=None
                     SELECT id, title, description, status, started_at, ends_at, ended_at,
                            max_winners, discord_channel_id, discord_message_id,
                            allow_multiple_entries, max_entries_per_user,
-                           required_role_id, entry_prompt, bonus_roles
+                           required_role_id, entry_prompt, entry_prompts, bonus_roles
                     FROM giveaways
                     WHERE discord_server_id = :sid
                       AND entry_method = 'discord'
@@ -659,14 +691,14 @@ class GiveawayPanelView(discord.ui.LayoutView):
             )
             return
 
-        prompt = (giveaway.get("entry_prompt") or "").strip()
-        if prompt:
+        prompts = entry_prompts_of(giveaway)
+        if prompts:
             # A modal must be the FIRST response to the interaction - it cannot
             # follow a defer or a send_message.
-            await interaction.response.send_modal(GiveawayEntryModal(self, giveaway, prompt))
+            await interaction.response.send_modal(GiveawayEntryModal(self, giveaway, prompts))
             return
 
-        await self._commit_entry(interaction, giveaway, answer=None)
+        await self._commit_entry(interaction, giveaway)
 
     async def _alt_gate_reason(self, giveaway, interaction, skip_captcha=False):
         """Why this member fails the alt/bot gates right now, or None if they pass.
@@ -755,8 +787,12 @@ class GiveawayPanelView(discord.ui.LayoutView):
             # needs an answer, everything else is committed automatically. Say
             # which one applies rather than leaving the member guessing whether
             # to come back and press Join again.
-            if (giveaway.get("entry_prompt") or "").strip():
-                tail = "Once you pass, you can answer the entry question and finish entering here."
+            prompts = entry_prompts_of(giveaway)
+            if prompts:
+                tail = (
+                    "Once you pass, you can answer the entry question"
+                    f"{'s' if len(prompts) > 1 else ''} and finish entering here."
+                )
             else:
                 tail = "Once you pass, you are entered automatically — no need to press Join again."
             return (
@@ -795,11 +831,18 @@ class GiveawayPanelView(discord.ui.LayoutView):
             return f"You have reached the maximum of {max_per_user} entries."
         return None
 
-    def _do_commit_entry(self, guild_id, user, giveaway, answer=None):
+    def _do_commit_entry(self, guild_id, user, giveaway, answers=None):
         giveaway_id = giveaway["id"]
         display = user.display_name or user.name
         allow_multiple = bool(giveaway.get("allow_multiple_entries"))
         max_per_user = int(giveaway.get("max_entries_per_user") or 1)
+
+        # Both shapes are written: the array is authoritative, and the legacy
+        # scalar carries answer #1 so a dashboard that hasn't been redeployed
+        # yet still shows something for the winner.
+        answers = [a for a in (answers or [])]
+        answers_json = json.dumps(answers) if answers else None
+        answer = answers[0] if answers else None
 
         entries_to_add = _tickets_per_join(giveaway, user)
 
@@ -826,11 +869,17 @@ class GiveawayPanelView(discord.ui.LayoutView):
                         """
                         UPDATE giveaway_entries
                         SET entry_count = entry_count + :entries_to_add,
-                            entry_answer = COALESCE(:answer, entry_answer)
+                            entry_answer = COALESCE(:answer, entry_answer),
+                            entry_answers = COALESCE(CAST(:answers AS JSONB), entry_answers)
                         WHERE id = :id
                         """
                     ),
-                    {"id": existing[0], "answer": answer, "entries_to_add": entries_to_add},
+                    {
+                        "id": existing[0],
+                        "answer": answer,
+                        "answers": answers_json,
+                        "entries_to_add": entries_to_add,
+                    },
                 )
                 new_count = int(existing[1]) + entries_to_add
             else:
@@ -839,8 +888,10 @@ class GiveawayPanelView(discord.ui.LayoutView):
                         """
                         INSERT INTO giveaway_entries
                           (giveaway_id, discord_server_id, discord_id, discord_username,
-                           display_name, entry_method, entry_count, profile_pic_url, entry_answer)
-                        VALUES (:gid, :sid, :did, :uname, :display, 'discord', :entries_to_add, :pfp, :answer)
+                           display_name, entry_method, entry_count, profile_pic_url, entry_answer,
+                           entry_answers)
+                        VALUES (:gid, :sid, :did, :uname, :display, 'discord', :entries_to_add, :pfp, :answer,
+                                CAST(:answers AS JSONB))
                         """
                     ),
                     {
@@ -851,6 +902,7 @@ class GiveawayPanelView(discord.ui.LayoutView):
                         "display": display,
                         "pfp": str(user.display_avatar.url) if user.display_avatar else None,
                         "answer": answer,
+                        "answers": answers_json,
                         "entries_to_add": entries_to_add,
                     },
                 )
@@ -875,12 +927,12 @@ class GiveawayPanelView(discord.ui.LayoutView):
 
         return True, msg
 
-    async def _commit_entry(self, interaction: discord.Interaction, giveaway, answer=None):
+    async def _commit_entry(self, interaction: discord.Interaction, giveaway, answers=None):
         """Record the entry and acknowledge. Safe to call from the modal too."""
         guild_id = interaction.guild_id
         user = interaction.user
 
-        success, msg = self._do_commit_entry(guild_id, user, giveaway, answer)
+        success, msg = self._do_commit_entry(guild_id, user, giveaway, answers)
 
         await interaction.response.send_message(msg, ephemeral=True)
 
@@ -889,30 +941,43 @@ class GiveawayPanelView(discord.ui.LayoutView):
 
 
 class GiveawayEntryModal(discord.ui.Modal):
-    """Collects the operator-configured text answer when a member joins.
+    """Collects the operator-configured text answers when a member joins.
+
+    Every configured question becomes one TextInput, all in the SAME modal —
+    Discord allows at most five components, which is exactly the cap enforced
+    when the questions are saved, so they always fit in one popup and an entry
+    is never left half-answered across two interactions.
 
     Holds a reference to the panel view purely to reuse its commit path; all
     giveaway state is passed in per-interaction, so nothing here is captured
     across restarts.
     """
 
-    def __init__(self, view, giveaway, prompt):
+    def __init__(self, view, giveaway, prompts):
         super().__init__(title=(giveaway.get("title") or "Giveaway")[:45])
         self._view = view
         self._giveaway = giveaway
-        # Discord caps a TextInput label at 45 chars; entry_prompt is stored
-        # VARCHAR(45) so this never silently truncates.
-        self.answer = discord.ui.TextInput(
-            label=prompt[:45],
-            required=True,
-            max_length=300,
-            style=discord.TextStyle.short,
-        )
-        self.add_item(self.answer)
+        self._answers = []
+        # Defensive slice: a row written before the cap was enforced could
+        # carry more questions than a modal can hold, and Discord rejects the
+        # whole modal rather than dropping the extras.
+        for prompt in prompts[:MAX_ENTRY_PROMPTS]:
+            # Discord caps a TextInput label at 45 chars; questions are
+            # validated to that length on save so this never truncates.
+            field = discord.ui.TextInput(
+                label=prompt[:MAX_ENTRY_PROMPT_LEN],
+                required=True,
+                max_length=300,
+                style=discord.TextStyle.short,
+            )
+            self._answers.append(field)
+            self.add_item(field)
 
     async def on_submit(self, interaction: discord.Interaction):
-        value = (self.answer.value or "").strip()
-        await self._view._commit_entry(interaction, self._giveaway, answer=value or None)
+        # Positional: answers[i] belongs to prompts[i], which is how the
+        # dashboard pairs them back up for display.
+        answers = [(field.value or "").strip() for field in self._answers]
+        await self._view._commit_entry(interaction, self._giveaway, answers=answers)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         logger.error(f"[giveaway] entry modal error: {error}", exc_info=True)
@@ -1008,14 +1073,14 @@ class GiveawayAnswerButton(
             )
             return
 
-        prompt = (giveaway.get("entry_prompt") or "").strip()
-        if not prompt:
-            # The operator cleared the prompt after this button was issued —
+        prompts = entry_prompts_of(giveaway)
+        if not prompts:
+            # The operator cleared the questions after this button was issued —
             # there is nothing left to ask, so just enter them.
             await view._commit_entry(interaction, giveaway)
             return
 
-        await interaction.response.send_modal(GiveawayEntryModal(view, giveaway, prompt))
+        await interaction.response.send_modal(GiveawayEntryModal(view, giveaway, prompts))
 
 
 async def schedule_panel_refresh(bot, engine, guild_id, giveaway_id):
@@ -1058,7 +1123,7 @@ async def refresh_panel(bot, engine, guild_id, giveaway_id, ended=False, winners
                 """
                 SELECT id, title, description, status, started_at, ends_at, ended_at,
                        max_winners, discord_channel_id, discord_message_id,
-                       required_role_id, entry_prompt, bonus_roles
+                       required_role_id, entry_prompt, entry_prompts, bonus_roles
                 FROM giveaways
                 WHERE id = :gid AND discord_server_id = :sid
                 """
@@ -1175,18 +1240,19 @@ async def process_giveaway_verification(bot, engine, payload):
             await _edit_webhook_message(bot, interaction_token, f"❌ {blocked}")
             return
 
-        prompt = (giveaway.get("entry_prompt") or "").strip()
-        if prompt:
+        prompts = entry_prompts_of(giveaway)
+        if prompts:
             # A modal cannot be opened by editing a message, so swap the spent
             # Verify button for one that can open it. The entry is NOT committed
             # here: this giveaway asks a question, and an entry without the
             # answer would defeat the point of having asked.
             answer_view = discord.ui.View(timeout=None)
             answer_view.add_item(GiveawayAnswerButton(engine, giveaway_id))
+            asks = "a question" if len(prompts) == 1 else f"{len(prompts)} questions"
             await _edit_webhook_message(
                 bot,
                 interaction_token,
-                "✅ Verified. This giveaway asks a question before you enter — "
+                f"✅ Verified. This giveaway asks {asks} before you enter — "
                 "press **Answer & enter** to finish. You are not entered yet.",
                 view=answer_view,
             )

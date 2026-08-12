@@ -9354,7 +9354,11 @@ async def on_ready():
                     ALTER TABLE giveaway_entries
                     ADD COLUMN IF NOT EXISTS discord_username VARCHAR(255),
                     ADD COLUMN IF NOT EXISTS display_name VARCHAR(255),
-                    ADD COLUMN IF NOT EXISTS entry_answer TEXT
+                    ADD COLUMN IF NOT EXISTS entry_answer TEXT,
+                    -- Answers to a multi-question giveaway, positionally
+                    -- aligned with giveaways.entry_prompts. `entry_answer`
+                    -- stays populated with answer #1 for older readers.
+                    ADD COLUMN IF NOT EXISTS entry_answers JSONB
                 """
                     )
                 )
@@ -9392,6 +9396,24 @@ async def on_ready():
                 )
                 # Additive for servers whose table predates the column.
                 conn.execute(text("ALTER TABLE giveaway_templates ADD COLUMN IF NOT EXISTS entry_prompt VARCHAR(45)"))
+                # Up to 5 entry questions (Discord's cap on modal components).
+                # The scalar entry_prompt is kept in sync with question #1 so an
+                # older service still finds a working prompt. Mirrors the
+                # dashboard's run_migrations(); either service may boot first.
+                conn.execute(text("ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS entry_prompts JSONB"))
+                conn.execute(text("ALTER TABLE giveaway_templates ADD COLUMN IF NOT EXISTS entry_prompts JSONB"))
+                for _gw_table in ("giveaways", "giveaway_templates"):
+                    conn.execute(
+                        text(
+                            f"""
+                        UPDATE {_gw_table}
+                        SET entry_prompts = jsonb_build_array(entry_prompt)
+                        WHERE entry_prompts IS NULL
+                          AND entry_prompt IS NOT NULL
+                          AND btrim(entry_prompt) <> ''
+                    """
+                        )
+                    )
                 # NOTE: templates deliberately carry NO alt-gate columns —
                 # entry rules are a server-wide bot_settings policy.
                 conn.execute(

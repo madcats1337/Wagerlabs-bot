@@ -47,7 +47,7 @@ def _fetch_templates_full(engine, guild_id):
                 SELECT id, name, entry_method, max_winners, allow_multiple_entries,
                        max_entries_per_user, required_role_id, discord_channel_id,
                        keyword, messages_required, time_window_minutes, bonus_roles,
-                       entry_prompt
+                       entry_prompt, entry_prompts
                 FROM giveaway_templates
                 WHERE discord_server_id = :sid
                 ORDER BY name ASC
@@ -67,7 +67,7 @@ def _fetch_template(engine, template_id, guild_id):
                 SELECT id, name, entry_method, max_winners, allow_multiple_entries,
                        max_entries_per_user, required_role_id, discord_channel_id,
                        keyword, messages_required, time_window_minutes, bonus_roles,
-                       entry_prompt
+                       entry_prompt, entry_prompts
                 FROM giveaway_templates
                 WHERE id = :tid AND discord_server_id = :sid
                 """
@@ -92,7 +92,10 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
     """
     import json as _json
 
+    from .giveaway_panel import entry_prompts_of
+
     guild_id = interaction.guild_id
+    prompts = entry_prompts_of(tpl)
 
     # Several giveaways may run at once. Each Discord-hosted one owns its own
     # panel message and `_active_discord_giveaway` resolves entries by
@@ -111,13 +114,13 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
                    messages_required, time_window_minutes, allow_multiple_entries,
                    max_entries_per_user, status, created_by, discord_channel_id,
                    duration_minutes, max_winners, required_role_id, bonus_roles,
-                   entry_prompt, started_at, ends_at)
+                   entry_prompt, entry_prompts, started_at, ends_at)
                 VALUES
                   (:sid, :title, :description, :entry_method, :keyword,
                    :messages_required, :time_window_minutes, :allow_multiple,
                    :max_per_user, 'active', :created_by, :channel_id,
                    :duration, :max_winners, :required_role_id, CAST(:bonus AS JSONB),
-                   :entry_prompt, CURRENT_TIMESTAMP,
+                   :entry_prompt, CAST(:entry_prompts AS JSONB), CURRENT_TIMESTAMP,
                    -- NULL duration = no timer: ends_at stays NULL and the
                    -- expiry loop ignores it, so it waits for a manual draw.
                    CASE WHEN :duration IS NULL THEN NULL
@@ -141,7 +144,10 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
                 "max_winners": max(1, int(tpl.get("max_winners") or 1)),
                 "required_role_id": tpl.get("required_role_id"),
                 "bonus": _json.dumps(bonus_roles) if bonus_roles else None,
-                "entry_prompt": tpl.get("entry_prompt"),
+                # Both shapes are written: the array is authoritative, the
+                # scalar carries question #1 for a service that predates it.
+                "entry_prompt": prompts[0][:45] if prompts else None,
+                "entry_prompts": _json.dumps(prompts) if prompts else None,
                 # Alt/bot gates are NOT per-giveaway: they are a server-wide
                 # policy in bot_settings, read fresh on every Join click by
                 # giveaway_panel._entry_rules().
@@ -183,8 +189,12 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
     )
     if is_discord and tpl.get("discord_channel_id"):
         embed.add_field(name="Channel", value=f"<#{int(tpl['discord_channel_id'])}>", inline=True)
-    if is_discord and tpl.get("entry_prompt"):
-        embed.add_field(name="Entry question", value=tpl["entry_prompt"], inline=True)
+    if is_discord and prompts:
+        embed.add_field(
+            name="Entry question" if len(prompts) == 1 else "Entry questions",
+            value=("\n".join(f"{i}. {p}" for i, p in enumerate(prompts, 1)) if len(prompts) > 1 else prompts[0]),
+            inline=True,
+        )
     if is_discord and not posted:
         embed.add_field(
             name="Note",
@@ -197,6 +207,8 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
 
 def _describe_template(tpl) -> str:
     """One-glance summary of what a template will do, for the setup panel."""
+    from .giveaway_panel import entry_prompts_of
+
     bits = []
     method = tpl.get("entry_method") or "discord"
     bits.append(
@@ -212,8 +224,11 @@ def _describe_template(tpl) -> str:
     if isinstance(bonus, dict) and bonus:
         parts = [f"<@&{int(rid)}> +{int(extra)}" for rid, extra in list(bonus.items())[:3]]
         bits.append("bonus: " + ", ".join(parts))
-    if tpl.get("entry_prompt"):
-        bits.append(f'asks "{tpl["entry_prompt"]}"')
+    prompts = entry_prompts_of(tpl)
+    if len(prompts) == 1:
+        bits.append(f'asks "{prompts[0]}"')
+    elif prompts:
+        bits.append(f"asks {len(prompts)} questions")
     return " · ".join(bits)
 
 
@@ -353,39 +368,54 @@ def _opts(label_value_pairs, current):
 
 
 class GiveawayPromptModal(discord.ui.Modal):
-    """The entry question for the `/giveaway create` panel.
+    """The entry questions for the `/giveaway create` panel.
 
-    Its own modal rather than a sixth field on GiveawayDetailsModal, which is
+    Its own modal rather than extra fields on GiveawayDetailsModal, which is
     already at Discord's five-component ceiling. Submitting edits the panel in
     place: a modal opened FROM a component may respond by editing the message it
-    was opened from, so the operator lands back on the panel with the question
+    was opened from, so the operator lands back on the panel with the questions
     shown rather than on a separate confirmation.
+
+    All five question slots are shown at once — the same ceiling that caps the
+    questions themselves — so there is no add/remove dance inside a modal (which
+    cannot re-render). Blank slots are dropped and the rest close up, so the
+    operator can clear #1 and keep #2 without stranding an empty question.
     """
 
     def __init__(self, view):
-        super().__init__(title="Entry question")
+        from .giveaway_panel import MAX_ENTRY_PROMPT_LEN, MAX_ENTRY_PROMPTS
+
+        super().__init__(title="Entry questions")
         self._view = view
-        self.prompt_input = discord.ui.TextInput(
-            placeholder="e.g. Your Steam trade link",
-            # 45 is both the entry_prompt column width and Discord's cap on a
-            # TextInput label — which is exactly what this text becomes when a
-            # member joins — so it can never silently truncate.
-            max_length=45,
-            required=False,
-            default=view.entry_prompt or None,
-        )
-        self.add_item(
-            discord.ui.Label(
-                text="Question",
-                description="Shown as the field label when a member joins. Leave blank for no question.",
-                component=self.prompt_input,
+        self._inputs = []
+        existing = list(view.entry_prompts)
+        for index in range(MAX_ENTRY_PROMPTS):
+            field = discord.ui.TextInput(
+                placeholder="e.g. Your Steam trade link" if index == 0 else "Optional",
+                # 45 is both the entry_prompt column width and Discord's cap on
+                # a TextInput label — which is exactly what this text becomes
+                # when a member joins — so it can never silently truncate.
+                max_length=MAX_ENTRY_PROMPT_LEN,
+                required=False,
+                default=existing[index] if index < len(existing) else None,
             )
-        )
+            self._inputs.append(field)
+            self.add_item(
+                discord.ui.Label(
+                    text=f"Question {index + 1}",
+                    description=(
+                        "Shown as a field label when a member joins. Leave blank for no question."
+                        if index == 0
+                        else None
+                    ),
+                    component=field,
+                )
+            )
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Blank clears it — that is the only way back to "no question" once one
-        # has been set, since the panel has no separate remove control.
-        self._view.entry_prompt = (self.prompt_input.value or "").strip() or None
+        # Blanks are dropped, so clearing every box is the way back to "no
+        # questions" — the panel has no separate remove control.
+        self._view.entry_prompts = [(f.value or "").strip() for f in self._inputs if (f.value or "").strip()]
         self._view._rerender()
         await interaction.response.edit_message(view=self._view)
 
@@ -417,7 +447,8 @@ class GiveawayCreateView(discord.ui.LayoutView):
         self.channel_id = None
         self.required_role_id = None
         self.max_winners = 1
-        self.entry_prompt = None
+        # Ordered entry questions (max 5 — Discord's modal component cap).
+        self.entry_prompts = []
         self.bonus_roles = {}
         self.bonus_role_id = None
 
@@ -484,14 +515,20 @@ class GiveawayCreateView(discord.ui.LayoutView):
         # ── Entry question ──
         # A button rather than an inline field: free text cannot be typed into a
         # select, and the details modal is already at the five-component cap.
-        prompt_state = f'asks "{self.entry_prompt}"' if self.entry_prompt else "no question"
+        if not self.entry_prompts:
+            prompt_state = "no questions"
+        elif len(self.entry_prompts) == 1:
+            prompt_state = f'asks "{self.entry_prompts[0]}"'
+        else:
+            prompt_state = "asks " + ", ".join(f'"{p}"' for p in self.entry_prompts)
         container.add_item(
             discord.ui.TextDisplay(
-                f"**Entry question** · {prompt_state}" "\n-# Ask for a text answer when a member joins. Optional."
+                f"**Entry questions** · {prompt_state}"
+                "\n-# Ask for text answers when a member joins. Up to 5, all in one popup. Optional."
             )
         )
         prompt = discord.ui.Button(
-            label="Edit entry question" if self.entry_prompt else "Add an entry question",
+            label="Edit entry questions" if self.entry_prompts else "Add entry questions",
             style=discord.ButtonStyle.secondary,
         )
         prompt.callback = self._on_entry_prompt
@@ -640,7 +677,9 @@ class GiveawayCreateView(discord.ui.LayoutView):
             "keyword": None,
             "messages_required": None,
             "time_window_minutes": None,
-            "entry_prompt": self.entry_prompt,
+            # `_create_giveaway_from_template` reads this through
+            # entry_prompts_of() and derives the legacy scalar itself.
+            "entry_prompts": self.entry_prompts or None,
         }
 
 
@@ -790,7 +829,7 @@ def _fetch_started_giveaway(engine, giveaway_id, guild_id):
                 """
                 SELECT id, title, description, status, started_at, ends_at, ended_at,
                        max_winners, discord_channel_id, discord_message_id,
-                       required_role_id, entry_prompt, bonus_roles
+                       required_role_id, entry_prompt, entry_prompts, bonus_roles
                 FROM giveaways
                 WHERE id = :gid AND discord_server_id = :sid
                 """
