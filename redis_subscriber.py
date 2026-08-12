@@ -1898,6 +1898,25 @@ class RedisSubscriber:
 
                     logger.info(f"✅ Giveaway {giveaway_id} started: {giveaway_title}")
 
+            elif action == "giveaway_updated":
+                # An operator edited a RUNNING giveaway on the dashboard (title,
+                # description, winner count, role gate). Re-render the live panel
+                # so entrants see the change on the message they already have.
+                #
+                # The panel builder re-reads the row itself, so nothing from the
+                # payload is trusted here beyond which giveaway to refresh —
+                # that also means a dropped event self-corrects on the next join.
+                fields = data.get("fields") or []
+                logger.info(
+                    f"✏️  [giveaway] {giveaway_id} edited ({', '.join(fields) or 'no fields'}); refreshing panel"
+                )
+                try:
+                    from features.giveaway.giveaway_panel import refresh_panel
+
+                    await refresh_panel(self.bot, engine, guild_id, giveaway_id)
+                except Exception as e:
+                    logger.warning(f"[giveaway] panel refresh after edit failed: {e}")
+
             elif action == "giveaway_stopped":
                 logger.info(f"⏹️  Stopping giveaway {giveaway_id} for guild {guild_id}")
 
