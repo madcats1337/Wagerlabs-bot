@@ -9301,9 +9301,10 @@ async def on_ready():
                 # dashboard's run_migrations() owns the backfill + DROP; this
                 # service only reads the settings, so there is nothing to add
                 # here. Do NOT re-add the columns.
-                # Captcha verification is remembered per (server, member), not
-                # per giveaway — solve once, every later giveaway in that server
-                # skips the redirect. Expiry applied at READ time, no cleanup job.
+                # Captcha verification is remembered per (server, GIVEAWAY,
+                # member): one solved challenge must not buy entry into every
+                # later giveaway, so entrants re-verify once per giveaway.
+                # Expiry applied at READ time, no cleanup job.
                 conn.execute(
                     text(
                         """
@@ -9691,9 +9692,13 @@ async def on_ready():
             # BEFORE this restart re-bind their handler. The callback resolves
             # the guild + giveaway from the interaction and the DB.
             try:
-                from features.giveaway.giveaway_panel import GiveawayPanelView
+                from features.giveaway.giveaway_panel import GiveawayAnswerButton, GiveawayPanelView
 
                 bot.add_view(GiveawayPanelView.template(engine))
+                # The post-captcha "Answer & enter" button carries its giveaway id
+                # in the custom_id, so it registers as a dynamic item rather than a
+                # fixed template view.
+                bot.add_dynamic_items(GiveawayAnswerButton)
                 logger.debug(f"✅ Giveaway panel persistent view registered (handles all guilds)")
             except Exception as e:
                 logger.warning(f"⚠️ Giveaway panel view registration failed (non-fatal): {e}")

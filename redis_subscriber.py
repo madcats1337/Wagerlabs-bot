@@ -73,6 +73,38 @@ def get_engine():
     return _engine
 
 
+# Every channel the subscriber listens on. ONE list, used by both the initial
+# subscribe and the resubscribe-after-error path.
+#
+# These were previously two hand-maintained copies and they drifted, silently:
+# `dashboard:giveaway_verified` was added only to the resubscribe copy, so a bot
+# that never hit a listener error was never subscribed to it at all and captcha
+# passes were published to nobody (giveaway auto-entry did nothing). `bot_events`
+# drifted the other way. A new channel goes HERE and nowhere else — adding one to
+# a single call site is the bug this constant exists to prevent.
+SUBSCRIBED_CHANNELS = (
+    "dashboard:slot_requests",
+    "dashboard:timed_messages",
+    "dashboard:gtb",
+    "dashboard:management",
+    "dashboard:raffle",
+    "dashboard:commands",
+    "dashboard:point_shop",
+    "dashboard:notifications",
+    "dashboard:bot_settings",
+    "dashboard:giveaway",
+    "dashboard:stream_notification",
+    "dashboard:subscriptions",
+    "dashboard:tournament",
+    "dashboard:clips",
+    "dashboard:giveaway_verified",
+    # bot_events: Twitch chat (via EventSub webhook in the Gunicorn process) is
+    # forwarded here for the bot to process. Kick chat still uses the direct
+    # WebSocket (not this channel).
+    "bot_events",
+)
+
+
 def build_raffle_kick_message(winner: dict, prize_description: str) -> str:
     """Build the Kick-chat announcement line for a raffle winner.
 
@@ -3164,27 +3196,7 @@ Congratulations! Please contact an admin to claim your prize! 🎊
             return
 
         # Subscribe to all dashboard channels (webhook events disabled - using direct WebSocket)
-        await asyncio.to_thread(
-            self.pubsub.subscribe,
-            "dashboard:slot_requests",
-            "dashboard:timed_messages",
-            "dashboard:gtb",
-            "dashboard:management",
-            "dashboard:raffle",
-            "dashboard:commands",
-            "dashboard:point_shop",
-            "dashboard:notifications",
-            "dashboard:bot_settings",
-            "dashboard:giveaway",
-            "dashboard:stream_notification",
-            "dashboard:subscriptions",
-            "dashboard:tournament",
-            "dashboard:clips",
-            # bot_events: Twitch chat (via EventSub webhook in the Gunicorn process)
-            # is forwarded here for the bot to process. Kick chat still uses the
-            # direct WebSocket (not this channel).
-            "bot_events",
-        )
+        await asyncio.to_thread(self.pubsub.subscribe, *SUBSCRIBED_CHANNELS)
 
         if signing_enabled():
             logger.info("🎧 Redis subscriber listening (message signatures REQUIRED)...")
@@ -3278,26 +3290,8 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                 # Reconnect after delay
                 await asyncio.sleep(5)
                 if self.enabled:
-                    # Resubscribe after error
-                    await asyncio.to_thread(
-                        self.pubsub.subscribe,
-                        "dashboard:slot_requests",
-                        "dashboard:timed_messages",
-                        "dashboard:gtb",
-                        "dashboard:management",
-                        "dashboard:raffle",
-                        "dashboard:commands",
-                        "dashboard:point_shop",
-                        "dashboard:notifications",
-                        "dashboard:bot_settings",
-                        "dashboard:giveaway",
-                        "dashboard:stream_notification",
-                        "dashboard:subscriptions",
-                        "dashboard:tournament",
-                        "dashboard:clips",
-                        "dashboard:giveaway_verified",
-                        # 'bot_events' removed - no longer using webhooks
-                    )
+                    # Resubscribe after error — same list as the initial subscribe.
+                    await asyncio.to_thread(self.pubsub.subscribe, *SUBSCRIBED_CHANNELS)
 
 
 async def start_redis_subscriber(bot, send_message_callback=None):

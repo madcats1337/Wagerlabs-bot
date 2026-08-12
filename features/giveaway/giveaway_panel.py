@@ -13,6 +13,10 @@ Persistence model (the part that matters):
   * The callback is therefore stateless: it resolves everything from
     `interaction.guild_id` + the DB. Nothing about a specific giveaway may be
     captured in the view, because the template instance has no giveaway.
+  * `GiveawayAnswerButton` is the one control that must know WHICH giveaway it
+    belongs to (it opens that giveaway's entry-prompt modal). It carries the id
+    in its custom_id and registers via `bot.add_dynamic_items()` instead, which
+    keeps it stateless on the same terms.
 
 Rendered with Components V2 — a LayoutView only, no embed and no top-level
 content (a V2 message cannot carry an embed).
@@ -619,15 +623,20 @@ class GiveawayPanelView(discord.ui.LayoutView):
 
         await self._commit_entry(interaction, giveaway, answer=None)
 
-    async def _alt_gate_reason(self, giveaway, interaction):
+    async def _alt_gate_reason(self, giveaway, interaction, skip_captcha=False):
         """Why this member fails the alt/bot gates right now, or None if they pass.
         Returns a tuple of (message, verify_url). If blocked but no verify URL, verify_url is None.
         If passed, returns (None, None).
 
         Three optional gates, evaluated against the member's state at click time:
-        account age, server tenure, and a one-time captcha. Each returns its own
-        specific message naming the member's actual value — a bare "you cannot
-        enter" just generates support tickets.
+        account age, server tenure, and a captcha. Each returns its own specific
+        message naming the member's actual value — a bare "you cannot enter"
+        just generates support tickets.
+
+        `skip_captcha` is set by the post-verification path, which has just
+        recorded the pass itself and must NOT re-derive it from a fresh read: a
+        replica lag or a lookup blip there would mint a second verify link and
+        strand the member on a dead end instead of entering them.
 
         The rules are SERVER-WIDE (bot_settings), not per-giveaway, and are read
         fresh on every click so a dashboard change applies immediately.
@@ -675,9 +684,15 @@ class GiveawayPanelView(discord.ui.LayoutView):
                     )
 
         # Captcha. Runs last so only members who already passed the cheap gates
-        # pay the click-out cost. Verification is remembered per (server, giveaway, member),
-        # so this is a one-time step rather than a per-entry one.
-        if rules["require_captcha"] and not _is_verified(self.engine, guild_id, giveaway["id"], member.id):
+        # pay the click-out cost. Verification is remembered per (server,
+        # GIVEAWAY, member) — one solved challenge must not buy entry into every
+        # later giveaway — so it recurs once per giveaway, and the copy below
+        # must not promise otherwise.
+        if (
+            rules["require_captcha"]
+            and not skip_captcha
+            and not _is_verified(self.engine, guild_id, giveaway["id"], member.id)
+        ):
             if not _captcha_configured():
                 # Keys missing on the dashboard side: degrade to the age/tenure
                 # gates rather than handing out a link nobody can ever pass.
@@ -691,9 +706,17 @@ class GiveawayPanelView(discord.ui.LayoutView):
                 # broken verification service must not silently kill a giveaway.
                 logger.error(f"[giveaway] could not issue verify link for {member.id}; allowing entry")
                 return None, None
+            # What happens AFTER the pass differs: an entry-prompt giveaway still
+            # needs an answer, everything else is committed automatically. Say
+            # which one applies rather than leaving the member guessing whether
+            # to come back and press Join again.
+            if (giveaway.get("entry_prompt") or "").strip():
+                tail = "Once you pass, you can answer the entry question and finish entering here."
+            else:
+                tail = "Once you pass, you are entered automatically — no need to press Join again."
             return (
-                "One quick check before you enter — it takes a few seconds, and you only "
-                "need to do it once for this server. Please click the Verify button below to complete the captcha.",
+                "One quick check before you enter — it takes a few seconds, and it is required "
+                f"once for each giveaway. Please click the Verify button below to complete the captcha. {tail}",
                 url,
             )
 
@@ -852,6 +875,104 @@ class GiveawayEntryModal(discord.ui.Modal):
             await interaction.response.send_message("Something went wrong.", ephemeral=True)
 
 
+class GiveawayAnswerButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"giveaway_answer:(?P<giveaway_id>\d+)",
+):
+    """Finishes an entry that still owes an entry-prompt answer.
+
+    A modal must be the FIRST response to an interaction, so one cannot be
+    opened by editing the ephemeral a member is looking at once their captcha
+    lands. This button gives them somewhere to open it from, instead of telling
+    them to go back to the panel and press Join a second time.
+
+    The giveaway id rides in the custom_id and the engine is resolved at dispatch
+    time, so nothing is captured in the constructor and already-issued buttons
+    keep working across a restart (registered once via `bot.add_dynamic_items`).
+    """
+
+    def __init__(self, engine, giveaway_id):
+        self.engine = engine
+        self.giveaway_id = int(giveaway_id)
+        super().__init__(
+            discord.ui.Button(
+                label="Answer & enter",
+                style=discord.ButtonStyle.success,
+                custom_id=f"giveaway_answer:{int(giveaway_id)}",
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match, /):
+        # Imported here rather than at module scope: redis_subscriber imports
+        # this module lazily, and a top-level import would close the cycle.
+        from redis_subscriber import get_engine
+
+        return cls(get_engine(), int(match["giveaway_id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        guild_id = interaction.guild_id
+        if not guild_id:
+            await interaction.response.send_message(
+                embed=discord.Embed(description="❌ This only works in a server.", color=discord.Color.red()),
+                ephemeral=True,
+            )
+            return
+
+        # Re-read everything: the button may have been sitting on an ephemeral
+        # for minutes, and the captcha pass is not a licence to skip the gates
+        # that can have changed since.
+        giveaway = _active_discord_giveaway(self.engine, guild_id, None, giveaway_id=self.giveaway_id)
+        if not giveaway:
+            await interaction.response.send_message(
+                embed=discord.Embed(description="❌ This giveaway has ended.", color=discord.Color.red()),
+                ephemeral=True,
+            )
+            return
+
+        ends_at = giveaway.get("ends_at")
+        if ends_at:
+            deadline = ends_at if ends_at.tzinfo else ends_at.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) >= deadline:
+                await interaction.response.send_message(
+                    embed=discord.Embed(description="❌ This giveaway has ended.", color=discord.Color.red()),
+                    ephemeral=True,
+                )
+                return
+
+        required_role_id = giveaway.get("required_role_id")
+        if required_role_id:
+            role_ids = {r.id for r in getattr(interaction.user, "roles", [])}
+            if int(required_role_id) not in role_ids:
+                await interaction.response.send_message(
+                    embed=discord.Embed(
+                        description=f"❌ This giveaway is limited to <@&{int(required_role_id)}> members.",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+        view = GiveawayPanelView(self.engine)
+        blocked = view._entry_block_reason(
+            giveaway, guild_id, interaction.user.id, per_join=_tickets_per_join(giveaway, interaction.user)
+        )
+        if blocked:
+            await interaction.response.send_message(
+                embed=discord.Embed(description=f"❌ {blocked}", color=discord.Color.red()), ephemeral=True
+            )
+            return
+
+        prompt = (giveaway.get("entry_prompt") or "").strip()
+        if not prompt:
+            # The operator cleared the prompt after this button was issued —
+            # there is nothing left to ask, so just enter them.
+            await view._commit_entry(interaction, giveaway)
+            return
+
+        await interaction.response.send_modal(GiveawayEntryModal(view, giveaway, prompt))
+
+
 async def schedule_panel_refresh(bot, engine, guild_id, giveaway_id):
     """Coalesced panel edit — at most one per _EDIT_DEBOUNCE_SECONDS per giveaway."""
     if giveaway_id in _pending_edits:
@@ -994,11 +1115,13 @@ async def process_giveaway_verification(bot, engine, payload):
         mock_interaction = MockInteraction(guild_id, member, guild)
         view = GiveawayPanelView(engine)
 
-        # Check alt gates (skipping captcha since we just verified it)
-        blocked_msg, _ = await view._alt_gate_reason(giveaway, mock_interaction)
+        # The remaining alt gates (account age, tenure). The captcha gate is
+        # skipped EXPLICITLY rather than by trusting a re-read of the row the
+        # dashboard just wrote: if that lookup came back empty or errored, the
+        # gate would mint a second verify link and leave the member on a dead
+        # end, which is indistinguishable from auto-entry never firing.
+        blocked_msg, _ = await view._alt_gate_reason(giveaway, mock_interaction, skip_captcha=True)
         if blocked_msg:
-            # If we got a blocked message that IS NOT the captcha request
-            # Note: _is_verified will now return True for this user, so captcha gate is skipped
             await _edit_webhook_message(bot, interaction_token, f"❌ {blocked_msg}")
             return
 
@@ -1009,12 +1132,18 @@ async def process_giveaway_verification(bot, engine, payload):
 
         prompt = (giveaway.get("entry_prompt") or "").strip()
         if prompt:
-            # Modals can't be triggered after the fact via webhook edits.
-            # We must instruct them to click Join again.
+            # A modal cannot be opened by editing a message, so swap the spent
+            # Verify button for one that can open it. The entry is NOT committed
+            # here: this giveaway asks a question, and an entry without the
+            # answer would defeat the point of having asked.
+            answer_view = discord.ui.View(timeout=None)
+            answer_view.add_item(GiveawayAnswerButton(engine, giveaway_id))
             await _edit_webhook_message(
                 bot,
                 interaction_token,
-                "✅ Verification complete. Please press **Join giveaway** again to answer the entry prompt.",
+                "✅ Verified. This giveaway asks a question before you enter — "
+                "press **Answer & enter** to finish. You are not entered yet.",
+                view=answer_view,
             )
             return
 
@@ -1031,8 +1160,17 @@ async def process_giveaway_verification(bot, engine, payload):
         )
 
 
-async def _edit_webhook_message(bot, interaction_token, content):
-    """Helper to edit the original ephemeral interaction response."""
+async def _edit_webhook_message(bot, interaction_token, content, view=None):
+    """Replace the original ephemeral interaction response.
+
+    `view=None` clears the components, which is what most outcomes want — the
+    Verify button is spent the moment the member is through it. Pass a view to
+    swap in a follow-up control instead.
+
+    Logged at ERROR because a failure here is exactly what "nothing happened
+    after I passed the captcha" looks like from the member's side: they are left
+    holding the original Verify prompt with no sign the entry went through.
+    """
     try:
         webhook = discord.Webhook.partial(bot.user.id, interaction_token, client=bot)
 
@@ -1045,6 +1183,6 @@ async def _edit_webhook_message(bot, interaction_token, content):
         else:
             embed = discord.Embed(description=str(content))
 
-        await webhook.edit_message("@original", embed=embed, view=None)
+        await webhook.edit_message("@original", embed=embed, view=view)
     except Exception as e:
-        logger.warning(f"[giveaway] failed to edit ephemeral message: {e}")
+        logger.error(f"[giveaway] failed to edit ephemeral message: {e}", exc_info=True)
