@@ -870,7 +870,11 @@ class GiveawayPanelView(discord.ui.LayoutView):
                         UPDATE giveaway_entries
                         SET entry_count = entry_count + :entries_to_add,
                             entry_answer = COALESCE(:answer, entry_answer),
-                            entry_answers = COALESCE(CAST(:answers AS JSONB), entry_answers)
+                            entry_answers = COALESCE(CAST(:answers AS JSONB), entry_answers),
+                            -- Refresh on re-entry: rows written before avatars
+                            -- were stored have a NULL pic and would otherwise
+                            -- never get one, and a member may have changed it.
+                            profile_pic_url = COALESCE(:pfp, profile_pic_url)
                         WHERE id = :id
                         """
                     ),
@@ -879,6 +883,7 @@ class GiveawayPanelView(discord.ui.LayoutView):
                         "answer": answer,
                         "answers": answers_json,
                         "entries_to_add": entries_to_add,
+                        "pfp": str(user.display_avatar.url) if user.display_avatar else None,
                     },
                 )
                 new_count = int(existing[1]) + entries_to_add
