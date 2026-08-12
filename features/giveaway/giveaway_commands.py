@@ -183,6 +183,8 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
     )
     if is_discord and tpl.get("discord_channel_id"):
         embed.add_field(name="Channel", value=f"<#{int(tpl['discord_channel_id'])}>", inline=True)
+    if is_discord and tpl.get("entry_prompt"):
+        embed.add_field(name="Entry question", value=tpl["entry_prompt"], inline=True)
     if is_discord and not posted:
         embed.add_field(
             name="Note",
@@ -350,6 +352,49 @@ def _opts(label_value_pairs, current):
     ]
 
 
+class GiveawayPromptModal(discord.ui.Modal):
+    """The entry question for the `/giveaway create` panel.
+
+    Its own modal rather than a sixth field on GiveawayDetailsModal, which is
+    already at Discord's five-component ceiling. Submitting edits the panel in
+    place: a modal opened FROM a component may respond by editing the message it
+    was opened from, so the operator lands back on the panel with the question
+    shown rather than on a separate confirmation.
+    """
+
+    def __init__(self, view):
+        super().__init__(title="Entry question")
+        self._view = view
+        self.prompt_input = discord.ui.TextInput(
+            placeholder="e.g. Your Steam trade link",
+            # 45 is both the entry_prompt column width and Discord's cap on a
+            # TextInput label — which is exactly what this text becomes when a
+            # member joins — so it can never silently truncate.
+            max_length=45,
+            required=False,
+            default=view.entry_prompt or None,
+        )
+        self.add_item(
+            discord.ui.Label(
+                text="Question",
+                description="Shown as the field label when a member joins. Leave blank for no question.",
+                component=self.prompt_input,
+            )
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Blank clears it — that is the only way back to "no question" once one
+        # has been set, since the panel has no separate remove control.
+        self._view.entry_prompt = (self.prompt_input.value or "").strip() or None
+        self._view._rerender()
+        await interaction.response.edit_message(view=self._view)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.error(f"[giveaway] entry question modal error: {error}", exc_info=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Something went wrong.", ephemeral=True)
+
+
 class GiveawayCreateView(discord.ui.LayoutView):
     """Ephemeral settings panel for `/giveaway create`.
 
@@ -372,6 +417,7 @@ class GiveawayCreateView(discord.ui.LayoutView):
         self.channel_id = None
         self.required_role_id = None
         self.max_winners = 1
+        self.entry_prompt = None
         self.bonus_roles = {}
         self.bonus_role_id = None
 
@@ -434,6 +480,22 @@ class GiveawayCreateView(discord.ui.LayoutView):
         )
         role.callback = self._on_role
         container.add_item(discord.ui.ActionRow(role))
+
+        # ── Entry question ──
+        # A button rather than an inline field: free text cannot be typed into a
+        # select, and the details modal is already at the five-component cap.
+        prompt_state = f'asks "{self.entry_prompt}"' if self.entry_prompt else "no question"
+        container.add_item(
+            discord.ui.TextDisplay(
+                f"**Entry question** · {prompt_state}" "\n-# Ask for a text answer when a member joins. Optional."
+            )
+        )
+        prompt = discord.ui.Button(
+            label="Edit entry question" if self.entry_prompt else "Add an entry question",
+            style=discord.ButtonStyle.secondary,
+        )
+        prompt.callback = self._on_entry_prompt
+        container.add_item(discord.ui.ActionRow(prompt))
 
         # Alt/bot checks are deliberately NOT here: they are a server-wide
         # policy set once on the dashboard (Giveaway Management -> Entry rules)
@@ -527,6 +589,11 @@ class GiveawayCreateView(discord.ui.LayoutView):
         self.max_winners = self._first_id(interaction) or 1
         await self._apply(interaction)
 
+    async def _on_entry_prompt(self, interaction):
+        # A modal must be the FIRST response, so this cannot go through _apply.
+        # The modal re-renders the panel itself on submit.
+        await interaction.response.send_modal(GiveawayPromptModal(self))
+
     async def _on_bonus_role(self, interaction):
         self.bonus_role_id = self._first_id(interaction)
         # Switching roles must not strand the previous one: a role left in the
@@ -573,7 +640,7 @@ class GiveawayCreateView(discord.ui.LayoutView):
             "keyword": None,
             "messages_required": None,
             "time_window_minutes": None,
-            "entry_prompt": None,
+            "entry_prompt": self.entry_prompt,
         }
 
 
