@@ -358,6 +358,44 @@ def _tickets_per_join(giveaway, member) -> int:
     return 1 + max(0, extra)
 
 
+# Enough to show a normal setup in full without letting an operator with a long
+# bonus list push the panel body around; the rest collapse into a count.
+_MAX_BONUS_ROLES_SHOWN = 5
+
+
+def _format_bonus_roles(bonus_roles) -> str:
+    """The panel's bonus-entry line, or "" when there is nothing to show.
+
+    Ordered by DESCENDING bonus because the highest match is the one that
+    actually applies — `_tickets_per_join` takes the max rather than stacking —
+    so the first pair a member reads is the one they would get.
+
+    Rows that are not a positive whole number of entries are skipped rather than
+    rendered: `bonus_roles` is operator-supplied JSON, and one bad value must not
+    break the panel for everybody.
+    """
+    if not isinstance(bonus_roles, dict) or not bonus_roles:
+        return ""
+
+    pairs = []
+    for role_id, bonus in bonus_roles.items():
+        try:
+            rid, extra = int(role_id), int(bonus)
+        except (TypeError, ValueError):
+            continue
+        if extra > 0:
+            pairs.append((rid, extra))
+    if not pairs:
+        return ""
+
+    pairs.sort(key=lambda pair: (-pair[1], pair[0]))
+    shown = ", ".join(f"<@&{rid}> +{extra}" for rid, extra in pairs[:_MAX_BONUS_ROLES_SHOWN])
+    hidden = len(pairs) - _MAX_BONUS_ROLES_SHOWN
+    if hidden > 0:
+        shown += f" and {hidden} more"
+    return f"Bonus entries: {shown}"
+
+
 def _entry_count(engine, giveaway_id, guild_id) -> int:
     with engine.connect() as conn:
         row = conn.execute(
@@ -478,6 +516,13 @@ class GiveawayPanelView(discord.ui.LayoutView):
             if deadline:
                 meta.append(f"ends {deadline}")
             lines.append("\n" + " · ".join(meta))
+
+            # Bonus roles sit ABOVE the requirement: one is an incentive to
+            # enter and the other is a restriction on entering, so they read
+            # better in that order than interleaved.
+            bonus_line = _format_bonus_roles(g.get("bonus_roles"))
+            if bonus_line:
+                lines.append(bonus_line)
 
             # State the gate up front so members know before clicking, rather
             # than only discovering it from the ephemeral refusal.
