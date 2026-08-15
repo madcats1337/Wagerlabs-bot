@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Last Updated:** July 2026
+**Last Updated:** August 2026
 
 **Service:** Wagerlabs - Chat Bot (Kick & Twitch), Discord Bot, Admin Dashboard & Browser Extension
 
@@ -92,9 +92,9 @@ You can create a Wagerlabs account in one of three ways, and we collect only wha
 The Wagerlabs Browser Extension is an optional companion to your Admin Dashboard. It is installed in your own browser and works only with your own dashboard.
 
 **What the Extension accesses:**
-- **Dashboard session cookie:** the Extension reuses your existing wagerlabs.app login session to make authenticated requests to your dashboard's API. It does not read, store, or transmit cookies for any site other than your wagerlabs.app dashboard.
+- **OAuth 2.0 Authentication:** the Extension uses OAuth 2.0 Authorization Code + PKCE to securely obtain short-lived bearer tokens for your wagerlabs.app dashboard. It does not use, read, store, or transmit session cookies.
 - **Local cache (in your browser only):** which dashboard server you are connected to, your extension preferences, and a short-lived copy of your active bonus hunt and bot status so the popup and overlay render instantly. This stays in the browser's local extension storage and is not sent to third parties.
-- **Slot titles on casino pages:** on supported casino sites (Stake, Shuffle), the Extension reads the slot/game title from the page you are viewing so you can add that slot to your bonus hunt. It reads only the slot title and only on those sites; it does not read other page content, form fields, or your account details on those sites.
+- **Game tracking on casino pages:** on supported casino sites (Stake, Shuffle, etc.), the Extension dynamically tracks your spins, bets, and bonus triggers (including payouts) by reading game events from provider iframes (like Pragmatic Play, NetEnt, Hacksaw) so that you can accurately record bonus hunts. It reads only game-related telemetry; it does not read other page content, form fields, or your account details on those sites.
 
 **What the Extension does NOT do:**
 - It does not track your browsing history or activity across the web.
@@ -114,6 +114,14 @@ If you purchase a paid subscription, payment is processed by **Stripe, Inc.**, o
 - The date your current billing period ends, and whether the subscription is set to cancel at period end
 
 **What Stripe handles and may collect** to process your payment includes your payment method details, billing name, and related transaction information, in accordance with Stripe's own privacy policy (https://stripe.com/privacy). We receive from Stripe only the non-card information needed to provision and manage your subscription (such as the identifiers and status above).
+
+### 2.6 AI Support Chat
+
+The dashboard provides an automated support chat feature powered by a self-hosted Flowise instance and a third-party Large Language Model (Google Gemini).
+
+**What we collect and share:**
+- Any questions, text, or information you type into the support chat widget are sent to Google's Gemini API for processing to generate an answer.
+- **Do not submit sensitive personal information**, such as full payment card details, passwords, or personal identification numbers, into the support chat.
 
 ## 3. How We Use Your Information
 
@@ -141,6 +149,7 @@ If you purchase a paid subscription, payment is processed by **Stripe, Inc.**, o
 - Configure raffle periods and settings
 - Verify gambling platform accounts
 - Monitor bot health and status
+- Provide automated user assistance via the AI Support Chat
 
 **Browser Extension Functions:**
 - Authenticate to your own dashboard using your existing login session
@@ -224,6 +233,10 @@ If you purchase a paid subscription, payment is processed by **Stripe, Inc.**, o
 - Administrative action logs retained for 90 days minimum
 - Configuration history retained indefinitely
 - Login records retained for security purposes
+
+**Support Chat Data:**
+- Chat transcripts are retained indefinitely in our `support_chat_messages` and `support_chats` database tables for quality review and to maintain your conversation history.
+- You can request deletion of this chat history at any time.
 
 **Subscription & Billing Data:**
 - Subscription records (tier, status, Stripe identifiers, period end) retained while the server exists and for a reasonable period afterward for accounting and tax purposes

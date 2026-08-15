@@ -22,9 +22,8 @@ from sqlalchemy import text
 logger = logging.getLogger(__name__)
 
 # Cumulative feature -> tier map. MUST match Admin-Dashboard/utils/tiers.py.
-FREE = ["bonus_hunt", "slot_requests", "gtb", "widgets"]
+FREE = ["bonus_hunt", "slot_requests", "gtb", "widgets", "extension"]
 TIER2 = FREE + [
-    "extension",
     "point_shop",
     "point_rewards",
     "commands",
