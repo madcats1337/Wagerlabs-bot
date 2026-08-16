@@ -122,7 +122,9 @@ CREATE TABLE IF NOT EXISTS raffle_shuffle_links (
     linked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     verified BOOLEAN DEFAULT FALSE,  -- Admin verification
     verified_by_discord_id BIGINT,
-    verified_at TIMESTAMP
+    verified_at TIMESTAMP,
+    platform VARCHAR(50) DEFAULT 'shuffle',
+    howl_uid VARCHAR(255)
 );
 
 -- Ticket transaction log (audit trail)
