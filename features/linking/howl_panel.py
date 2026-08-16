@@ -544,7 +544,23 @@ class HowlPanel:
             )
             if not has_logo:
                 logger.warning(f"[Howl] {_LOGO_PATH} not found — posting panel without the logotype banner.")
-            message = await channel.send(**_build_panel_message_kwargs(view, has_logo=has_logo, for_send=True))
+
+            try:
+                message = await channel.send(**_build_panel_message_kwargs(view, has_logo=has_logo, for_send=True))
+            except discord.Forbidden as e:
+                if has_logo:
+                    logger.warning(
+                        f"[Howl] Missing permissions to send with logo (likely 'Attach Files'). Retrying without logo..."
+                    )
+                    # Recreate view without logo to avoid missing attachment references
+                    view_no_logo = HowlPanelView(
+                        self.bot, self.engine, self.settings_getter, howl_emoji=self.howl_emoji, show_logo=False
+                    )
+                    message = await channel.send(
+                        **_build_panel_message_kwargs(view_no_logo, has_logo=False, for_send=True)
+                    )
+                else:
+                    raise e
 
             self.panel_guild_id = channel.guild.id
             self.panel_channel_id = channel.id
