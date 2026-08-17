@@ -126,7 +126,7 @@ def _fetch_affiliate_rows(url, api_key, days):
 
     for name in ambiguous:
         by_name.pop(name, None)
-        logger.warning(f"[HowlBackfill] username '{name}' maps to multiple UIDs — will not backfill it")
+        logger.warning(f"[HowlBackfill] username '{name}' maps to multiple UIDs - will not backfill it")
 
     return by_name
 
@@ -181,10 +181,10 @@ def backfill_howl_uid(engine, server_id=None, days=DEFAULT_LOOKBACK_DAYS, dry_ru
 
     stats["candidates"] = len(candidates)
     if not candidates:
-        logger.info("[HowlBackfill] no legacy rows with a NULL howl_uid — nothing to do")
+        logger.info("[HowlBackfill] no legacy rows with a NULL howl_uid - nothing to do")
         return stats
     if not guild_ids:
-        logger.warning("[HowlBackfill] no server has a howl_api_key configured — cannot resolve any UIDs")
+        logger.warning("[HowlBackfill] no server has a howl_api_key configured - cannot resolve any UIDs")
         return stats
 
     # raffle_shuffle_links is not server-scoped, so a name is resolved against
@@ -200,12 +200,12 @@ def backfill_howl_uid(engine, server_id=None, days=DEFAULT_LOOKBACK_DAYS, dry_ru
             logger.error(f"[HowlBackfill] could not decrypt howl_api_key for server {gid}: {e}")
             continue
         if not api_key:
-            logger.warning(f"[HowlBackfill] server {gid} has no usable howl_api_key — skipping")
+            logger.warning(f"[HowlBackfill] server {gid} has no usable howl_api_key - skipping")
             continue
 
         fetched = _fetch_affiliate_rows(url, api_key, days)
         if fetched is None:
-            logger.error(f"[HowlBackfill] server {gid}: affiliate fetch failed — its users stay NULL")
+            logger.error(f"[HowlBackfill] server {gid}: affiliate fetch failed - its users stay NULL")
             continue
         logger.info(f"[HowlBackfill] server {gid}: {len(fetched)} affiliate usernames in the last {days}d")
         for name, uid in fetched.items():
@@ -240,12 +240,14 @@ def backfill_howl_uid(engine, server_id=None, days=DEFAULT_LOOKBACK_DAYS, dry_ru
             ).fetchone()
             if holder and int(holder[0]) != int(discord_id):
                 stats["skipped_conflict"] += 1
-                logger.warning(f"[HowlBackfill] '{username}' → UID {uid} already held by discord {holder[0]} — skipped")
+                logger.warning(
+                    f"[HowlBackfill] '{username}' -> UID {uid} already held by discord {holder[0]} - skipped"
+                )
                 continue
 
             if dry_run:
                 stats["updated"] += 1
-                logger.info(f"[HowlBackfill] DRY RUN would set '{username}' (discord {discord_id}) → UID {uid}")
+                logger.info(f"[HowlBackfill] DRY RUN would set '{username}' (discord {discord_id}) -> UID {uid}")
                 continue
 
             conn.execute(
@@ -257,7 +259,7 @@ def backfill_howl_uid(engine, server_id=None, days=DEFAULT_LOOKBACK_DAYS, dry_ru
             )
         if not dry_run:
             stats["updated"] += 1
-            logger.info(f"[HowlBackfill] '{username}' (discord {discord_id}) → UID {uid}")
+            logger.info(f"[HowlBackfill] '{username}' (discord {discord_id}) -> UID {uid}")
 
     verb = "would update" if dry_run else "updated"
     logger.info(
