@@ -12,7 +12,7 @@ from discord.ext import tasks
 from sqlalchemy import text
 
 from .config import AUTO_LEADERBOARD_UPDATE_INTERVAL
-from .reward_settings import platform_display_name
+from .reward_settings import platform_display_name, platform_display_name_for_server
 
 logger = logging.getLogger(__name__)
 
@@ -133,8 +133,11 @@ class AutoLeaderboard:
             start_date = stats["start_date"]
             end_date = stats["end_date"]
 
-            # Resolve the configured wager platform name for this server's messages.
-            platform = "Shuffle"
+            # Resolve the configured wager platform name for this server's
+            # messages. Falls back to reading bot_settings directly rather than
+            # to a hardcoded "Shuffle": when get_guild_settings isn't available
+            # a Howl server would otherwise be told to wager on Shuffle.
+            platform = platform_display_name_for_server(self.engine, self.server_id, logger=logger)
             # Global raffle details (server-wide bot_settings). Shown on the
             # leaderboard when set; blank falls back to the default heading.
             raffle_title = ""
@@ -142,7 +145,7 @@ class AutoLeaderboard:
             getter = getattr(self.bot, "get_guild_settings", None)
             if callable(getter) and self.server_id is not None:
                 guild_settings = getter(self.server_id)
-                platform = platform_display_name(guild_settings)
+                platform = platform_display_name(guild_settings, default=platform)
                 try:
                     # Truncate defensively: Discord caps embed titles at 256
                     # chars and rejects the whole embed past that — a too-long
@@ -285,7 +288,7 @@ class AutoLeaderboard:
                 value=(
                     f"⏱️ **Watch Streams** - {watchtime_tickets} tickets per hour\n"
                     f"🎁 **Gift Subs** - {gifted_sub_tickets} tickets per sub\n"
-                    f"🎲 **Shuffle Wagers** - {wager_tickets} tickets per $1000 wagered\n"
+                    f"🎲 **{platform} Wagers** - {wager_tickets} tickets per $1000 wagered\n"
                     "⭐ **Bonus** - Admin awarded for events\n\n"
                     "Use `!tickets` to check your balance!"
                 ),

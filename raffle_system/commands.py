@@ -124,7 +124,7 @@ class RaffleCommands(commands.Cog):
 **Breakdown**:
 • Watchtime: {tickets['watchtime_tickets']} tickets
 • Gifted Subs: {tickets['gifted_sub_tickets']} tickets
-• Shuffle Wagers: {tickets['shuffle_wager_tickets']} tickets
+• {platform} Wagers: {tickets['shuffle_wager_tickets']} tickets
 • Bonus: {tickets['bonus_tickets']} tickets
 
 Use `/leaderboard` to see top participants!
@@ -565,6 +565,8 @@ Get ready to participate when the period starts!
             managers = self._get_guild_managers(ctx)
             ticket_manager = managers["ticket_manager"]
             raffle_draw = managers["raffle_draw"]
+            # Name the server's actual wager platform in the breakdown below.
+            platform = platform_display_name(self._get_guild_settings(ctx))
 
             admin_id = ctx.author.id
 
@@ -628,7 +630,7 @@ Get ready to participate when the period starts!
 **Breakdown**:
 • Watchtime: {winner_tickets.get('watchtime_tickets', 0)} tickets
 • Gifted Subs: {winner_tickets.get('gifted_sub_tickets', 0)} tickets
-• Shuffle Wagers: {winner_tickets.get('shuffle_wager_tickets', 0)} tickets
+• {platform} Wagers: {winner_tickets.get('shuffle_wager_tickets', 0)} tickets
 • Bonus: {winner_tickets.get('bonus_tickets', 0)} tickets
 
 Congratulations! 🎊
@@ -662,6 +664,8 @@ Congratulations! 🎊
             managers = self._get_guild_managers(ctx)
             ticket_manager = managers["ticket_manager"]
             raffle_draw = managers["raffle_draw"]
+            # Name the server's actual wager platform in the breakdown below.
+            platform = platform_display_name(self._get_guild_settings(ctx))
 
             if user:
                 # Show user-specific stats
@@ -739,7 +743,7 @@ Congratulations! 🎊
 • Gift events: {gift_events}
 • Total subs gifted: {total_subs}
 
-**Shuffle Wagers**: {tickets['shuffle_wager_tickets']} tickets
+**{platform} Wagers**: {tickets['shuffle_wager_tickets']} tickets
 • Total wagered: ${total_wager:.2f}
 
 **Bonus**: {tickets['bonus_tickets']} tickets

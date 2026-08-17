@@ -71,6 +71,28 @@ def platform_display_name(settings, default="Shuffle"):
     return _PLATFORM_DISPLAY_NAMES.get(raw, raw.title())
 
 
+def platform_display_name_for_server(engine, server_id, default="Shuffle", logger=None):
+    """`platform_display_name` for callers that hold an engine, not a settings manager.
+
+    Same mapping and same fallback; reads `wager_platform_name` directly so
+    surfaces like the auto-updating leaderboard embed name the platform the
+    server actually tracks instead of hardcoding "Shuffle".
+    """
+    if engine is None:
+        return default
+    try:
+        with engine.connect() as conn:
+            raw = _get_setting_value(conn, "wager_platform_name", server_id)
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to read wager_platform_name for server {server_id}: {e}")
+        return default
+    raw = (raw or "").strip().lower()
+    if not raw:
+        return default
+    return _PLATFORM_DISPLAY_NAMES.get(raw, raw.title())
+
+
 def platform_campaign_code(settings):
     """Return the campaign/affiliate code for the server's ACTIVE wager platform.
 
