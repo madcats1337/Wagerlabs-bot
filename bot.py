@@ -1874,6 +1874,16 @@ try:
             )
         )
 
+        # Bind tiers to a Discord role ID rather than a role NAME, so a role
+        # renamed in Discord keeps granting. Mirrors the dashboard's
+        # run_migrations() — either service may boot first.
+        conn.execute(text("ALTER TABLE watchtime_roles ADD COLUMN IF NOT EXISTS role_id BIGINT;"))
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS idx_watchtime_roles_role " "ON watchtime_roles(discord_server_id, role_id);"
+            )
+        )
+
         # Insert default roles if table is empty
         role_count = conn.execute(text("SELECT COUNT(*) FROM watchtime_roles")).fetchone()[0]
         if role_count == 0:
@@ -3141,23 +3151,34 @@ def get_active_chatters_count(guild_id: Optional[int] = None):
 # -------------------------
 # Role configuration helper
 # -------------------------
-def load_watchtime_roles():
-    """Load watchtime role configuration from database."""
+def load_watchtime_roles(guild_id=None):
+    """Load one guild's watchtime tier configuration.
+
+    `guild_id` scopes the query: without it this returned EVERY server's rows to
+    every guild, so one server's thresholds drove another's grants. Callers in
+    the per-guild role updater always pass it.
+
+    Each row carries `role_id` (the binding, set by the dashboard's tier-role
+    editor) and `role_name` (a label, and the fallback lookup for legacy rows
+    written by `/roles add` before role ids existed).
+    """
     try:
         with engine.connect() as conn:
             roles = conn.execute(
                 text(
                     """
-                SELECT role_name, minutes_required
+                SELECT role_name, minutes_required, role_id
                 FROM watchtime_roles
                 WHERE enabled = TRUE
-                ORDER BY display_order ASC
+                  AND (:guild_id IS NULL OR discord_server_id = :guild_id)
+                ORDER BY display_order ASC, minutes_required ASC
             """
-                )
+                ),
+                {"guild_id": guild_id},
             ).fetchall()
 
             if roles:
-                role_list = [{"name": r[0], "minutes": r[1]} for r in roles]
+                role_list = [{"name": r[0], "minutes": r[1], "role_id": r[2]} for r in roles]
                 logger.debug(f"🎯 Loaded {len(role_list)} watchtime roles from database")
                 return role_list
             else:
@@ -3166,6 +3187,50 @@ def load_watchtime_roles():
     except Exception as e:
         logger.warning(f"⚠️ Could not load roles from database: {e}")
         return WATCHTIME_ROLES
+
+
+def watchtime_roles_enabled(guild_id):
+    """Master switch for watchtime tier roles (dashboard toggle).
+
+    Defaults to TRUE when the setting has never been written — tier roles
+    predate the toggle, so an absent row must keep granting.
+    """
+    if guild_id is None:
+        return True
+    try:
+        with engine.connect() as conn:
+            value = conn.execute(
+                text(
+                    "SELECT value FROM bot_settings "
+                    "WHERE key = 'watchtime_roles_enabled' AND discord_server_id = :guild_id"
+                ),
+                {"guild_id": guild_id},
+            ).scalar()
+    except Exception as e:
+        # Fail OPEN: a transient DB error must not silently stop granting roles.
+        logger.warning(f"⚠️ Could not read watchtime_roles_enabled: {e}")
+        return True
+    if value is None:
+        return True
+    return str(value).strip().lower() == "true"
+
+
+def resolve_watchtime_role(guild, role_info):
+    """Resolve a tier row to a discord.Role.
+
+    Prefers `role_id` so a role renamed in Discord keeps granting; falls back to
+    the name for legacy rows that predate the id column.
+    """
+    role_id = role_info.get("role_id")
+    if role_id:
+        try:
+            role = guild.get_role(int(role_id))
+        except (TypeError, ValueError):
+            role = None
+        if role:
+            return role
+    name = role_info.get("name")
+    return discord.utils.get(guild.roles, name=name) if name else None
 
 
 # -------------------------
@@ -4786,17 +4851,22 @@ async def update_roles_task():
                     logger.warning(f"⚠️ Bot lacks manage_roles permission!")
                     continue
 
-                # Load current role configuration from database
-                current_roles = load_watchtime_roles()
+                # Master switch (dashboard → Profile Settings → tier roles).
+                if not watchtime_roles_enabled(guild.id):
+                    continue
 
-                # Cache role objects and validate they exist
+                # Load current role configuration from database
+                current_roles = load_watchtime_roles(guild.id)
+
+                # Cache role objects and validate they exist. Keyed by the tier's
+                # position so two tiers can't collide on an identical role_name.
                 role_cache = {}
-                for role_info in current_roles:
-                    role = discord.utils.get(guild.roles, name=role_info["name"])
+                for idx, role_info in enumerate(current_roles):
+                    role = resolve_watchtime_role(guild, role_info)
                     if not role:
-                        logger.warning(f"⚠️ Role {role_info['name']} not found in server!")
+                        logger.warning(f"⚠️ Role {role_info.get('name')} not found in server!")
                         continue
-                    role_cache[role_info["name"]] = role
+                    role_cache[idx] = role
 
                 # Get linked users with watchtime for this guild
                 with engine.connect() as conn:
@@ -4819,8 +4889,8 @@ async def update_roles_task():
                         continue
 
                     # Assign all eligible roles
-                    for role_info in current_roles:
-                        role = role_cache.get(role_info["name"])
+                    for idx, role_info in enumerate(current_roles):
+                        role = role_cache.get(idx)
                         if role and minutes >= role_info["minutes"] and role not in member.roles:
                             try:
                                 await member.add_roles(role, reason=f"Reached {role_info['minutes']} min watchtime")
@@ -7249,7 +7319,7 @@ async def cmd_watchtime(ctx, target: str = None):
     hours = minutes / 60
 
     # Load current role configuration
-    current_roles = load_watchtime_roles()
+    current_roles = load_watchtime_roles(guild_id)
 
     # Check which roles they've earned
     earned_roles = []
@@ -7723,15 +7793,29 @@ async def manage_roles(ctx, action: str = None, role_name: str = None, minutes: 
                     {"guild_id": guild_id},
                 ).fetchone()[0]
 
+                # Capture the role's id when the name matches a real role, so
+                # rows added here bind the same way the dashboard editor does
+                # (and survive a later rename). Unmatched names still insert —
+                # the streamer may be creating the role afterwards — and fall
+                # back to name lookup until they rebind it on the dashboard.
+                matched = discord.utils.get(ctx.guild.roles, name=role_name) if ctx.guild else None
+
                 # Insert new role
                 conn.execute(
                     text(
                         """
-                    INSERT INTO watchtime_roles (role_name, minutes_required, display_order, enabled, discord_server_id)
-                    VALUES (:name, :minutes, :order, TRUE, :guild_id)
+                    INSERT INTO watchtime_roles
+                        (role_name, minutes_required, display_order, enabled, discord_server_id, role_id)
+                    VALUES (:name, :minutes, :order, TRUE, :guild_id, :role_id)
                 """
                     ),
-                    {"name": role_name, "minutes": minutes, "order": max_order + 1, "guild_id": guild_id},
+                    {
+                        "name": role_name,
+                        "minutes": minutes,
+                        "order": max_order + 1,
+                        "guild_id": guild_id,
+                        "role_id": matched.id if matched else None,
+                    },
                 )
 
             await ctx.send(f"✅ Added role **{role_name}** at **{minutes:,} minutes** ({minutes/60:.1f} hours)")
@@ -9463,11 +9547,10 @@ async def on_ready():
             # Validate roles exist. DEBUG only — the update_roles_task background loop
             # re-checks and reports missing roles at WARNING on its first tick, so
             # logging them here too would double every missing-role warning at boot.
-            current_roles = load_watchtime_roles()
-            existing_roles = {role.name for role in guild.roles}
+            current_roles = load_watchtime_roles(guild.id)
             for role_config in current_roles:
-                if role_config["name"] not in existing_roles:
-                    logger.debug(f"⚠️ Role {role_config['name']} does not exist in the server!")
+                if not resolve_watchtime_role(guild, role_config):
+                    logger.debug(f"⚠️ Role {role_config.get('name')} does not exist in the server!")
 
         # Per-guild role-check loop done — clear so the global task-start block below
         # isn't tagged with the last guild.

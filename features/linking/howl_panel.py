@@ -261,9 +261,12 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
             break
 
     if not matched:
+        raw_code = (settings.get("howl_campaign_code") if settings else "") or ""
+        campaign_code = next((c.strip() for c in raw_code.split(",") if c.strip()), "")
+        signup_hint = f"on code **{campaign_code}**" if campaign_code else "on our code"
         await interaction.followup.send(
             f"❌ UID **{entered}** wasn't found in our Howl affiliate stats. Make sure you signed up "
-            f"under our affiliate on Howl.gg, then try again.",
+            f"{signup_hint} on Howl.gg, then try again.",
             ephemeral=True,
         )
         return
@@ -445,12 +448,26 @@ class HowlVerifyModal(Modal, title="Verify Your Howl Account"):
 
 
 class HowlPanelView(LayoutView):
-    def __init__(self, bot, engine, settings_getter, howl_emoji=None, show_logo=True):
+    def __init__(self, bot, engine, settings_getter, howl_emoji=None, show_logo=True, campaign_code=None):
         super().__init__(timeout=None)
         self.bot = bot
         self.engine = engine
         self.settings_getter = settings_getter
         self.howl_emoji = howl_emoji or FALLBACK_EMOJI
+
+        # howl_campaign_code may hold several comma-separated codes (they all
+        # count for wager tracking). The panel names the FIRST one — it's the
+        # sign-up instruction, and a list of codes reads as a choice the viewer
+        # has to make. Servers with no code set get the generic wording.
+        code = next((c.strip() for c in (campaign_code or "").split(",") if c.strip()), "")
+        signup_line = (
+            f'Sign up under code **"{code}"** to unlock rewards!'
+            if code
+            else "Sign up under our code to unlock rewards!"
+        )
+        bullet_line = (
+            f"• Make sure you signed up on code **{code}**" if code else "• Make sure you signed up on our code"
+        )
 
         container = Container(accent_colour=ACCENT_COLOR)
         if show_logo and MediaGalleryItem is not None:
@@ -458,7 +475,7 @@ class HowlPanelView(LayoutView):
         container.add_item(TextDisplay("## Verify Your Howl Account"))
         container.add_item(
             TextDisplay(
-                "Verify that you're one of our Howl.gg affiliates to unlock your reward role!\n\n"
+                f"{signup_line}\n\n"
                 "**How to Verify:**\n"
                 "Click the **'Verify Howl Account'** button below and enter your "
                 "Howl.gg UID. We'll check it against our affiliate stats and "
@@ -468,7 +485,7 @@ class HowlPanelView(LayoutView):
         container.add_item(
             TextDisplay(
                 "**📋 Before you start**\n"
-                "• Make sure you signed up on Howl.gg under our affiliate\n"
+                f"{bullet_line}\n"
                 "• Enter your **exact** Howl UID (found in your account settings)\n"
                 "• One Howl account per Discord user"
             )
@@ -535,6 +552,18 @@ class HowlPanel:
         except Exception as e:
             logger.error(f"Failed to load Howl panel info for guild {self.guild_id}: {e}")
 
+    def _campaign_code(self, guild_id=None):
+        """Per-guild howl_campaign_code, read fresh so panel copy tracks the dashboard."""
+        gid = guild_id if guild_id is not None else self.guild_id
+        if gid is None or not self.settings_getter:
+            return ""
+        try:
+            settings = self.settings_getter(gid)
+            return (settings.get("howl_campaign_code") if settings else "") or ""
+        except Exception as e:
+            logger.error(f"Failed to read howl_campaign_code for guild {gid}: {e}")
+            return ""
+
     def _save_panel_info(self, guild_id: int, channel_id: int, message_id: int):
         if not self.engine:
             return
@@ -564,8 +593,14 @@ class HowlPanel:
     async def create_panel(self, channel: discord.TextChannel):
         try:
             has_logo = os.path.isfile(_LOGO_PATH)
+            campaign_code = self._campaign_code(channel.guild.id)
             view = HowlPanelView(
-                self.bot, self.engine, self.settings_getter, howl_emoji=self.howl_emoji, show_logo=has_logo
+                self.bot,
+                self.engine,
+                self.settings_getter,
+                howl_emoji=self.howl_emoji,
+                show_logo=has_logo,
+                campaign_code=campaign_code,
             )
             if not has_logo:
                 logger.warning(f"[Howl] {_LOGO_PATH} not found — posting panel without the logotype banner.")
@@ -579,7 +614,12 @@ class HowlPanel:
                     )
                     # Recreate view without logo to avoid missing attachment references
                     view_no_logo = HowlPanelView(
-                        self.bot, self.engine, self.settings_getter, howl_emoji=self.howl_emoji, show_logo=False
+                        self.bot,
+                        self.engine,
+                        self.settings_getter,
+                        howl_emoji=self.howl_emoji,
+                        show_logo=False,
+                        campaign_code=campaign_code,
                     )
                     message = await channel.send(
                         **_build_panel_message_kwargs(view_no_logo, has_logo=False, for_send=True)
@@ -644,6 +684,7 @@ async def setup_howl_panel_system(bot, engine, settings_getter):
                         settings_getter,
                         howl_emoji=howl_emoji,
                         show_logo=has_logo,
+                        campaign_code=panel._campaign_code(guild_id),
                     )
                     await message.edit(
                         **_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo)
