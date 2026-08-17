@@ -6,7 +6,9 @@ Two topics, chosen with a required command choice:
   * ``shop`` — how to spend them, in the Discord storefront and the web shop.
 
 Both replies are Components V2 (``LayoutView`` + ``Container``), matching the
-link/verify/shop panels rather than the older ``discord.Embed`` help commands.
+link/verify/shop panels rather than the older ``discord.Embed`` help commands,
+and are posted PUBLICLY: they are the server's reference explainers for the
+points system, meant to be read by the whole channel and left up.
 
 The copy is generated from the server's LIVE configuration — the actual points
 rate, the real shop channel, the real shop URL — so it can never drift from what
@@ -250,7 +252,7 @@ def register_loyalty_points_command(bot: commands.Bot, engine) -> None:
             # Reads the DB before replying, so acknowledge the interaction first
             # or Discord closes it at 3s with "application did not respond".
             try:
-                await interaction.response.defer(ephemeral=True)
+                await interaction.response.defer()
             except Exception as exc:
                 logger.warning("Could not defer /loyaltypoints: %s", exc)
 
@@ -265,6 +267,8 @@ def register_loyalty_points_command(bot: commands.Bot, engine) -> None:
                     _has_shop_items(engine, guild_id),
                 )
 
-            # Ephemeral: this is a help reply to one viewer, not a channel post.
-            await interaction.followup.send(view=view, ephemeral=True)
+            # Posted publicly: these are the server's reference explainers for
+            # the points system, meant to be readable by everyone in the channel
+            # (and left up), not a private reply to whoever ran the command.
+            await interaction.followup.send(view=view)
             logger.debug("Handled /loyaltypoints %s", topic.value)
