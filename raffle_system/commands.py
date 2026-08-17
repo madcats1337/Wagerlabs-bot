@@ -157,6 +157,76 @@ Use `/leaderboard` to see top participants!
             logger.error(f"Error in /fair command: {e}")
             await ctx.send("❌ Could not build the verification link. Please try again.")
 
+    @commands.hybrid_command(name="howraffle", aliases=["rafflehelp", "howtoraffle"])
+    @app_commands.default_permissions(administrator=True)
+    @commands.has_permissions(administrator=True)
+    async def how_raffle_works(self, ctx):
+        """
+        [ADMIN] Post an embed explaining how the raffle works and how tickets are earned
+        Usage: /howraffle
+        """
+        try:
+            guild_id = ctx.guild.id if ctx.guild else None
+            watchtime_tickets, gifted_sub_tickets, wager_tickets = get_ticket_reward_settings(
+                self.engine, guild_id, logger
+            )
+            settings = self._get_guild_settings(ctx)
+            platform = platform_display_name(settings)
+            code = settings.shuffle_campaign_code
+            fair_url = get_server_public_page_url(self.engine, guild_id, "/provably-fair")
+
+            embed = discord.Embed(
+                title="How the Raffle Works",
+                description=(
+                    "Tickets are earned automatically while you support the stream. "
+                    "Every ticket is a separate entry in the draw, so the more you "
+                    "collect, the better your chances."
+                ),
+                color=discord.Color.blurple(),
+            )
+            embed.add_field(
+                name="Earning Tickets",
+                value=(
+                    f"**Watch time** — {watchtime_tickets} tickets per hour watched\n"
+                    f"**Gifted subs** — {gifted_sub_tickets} tickets per sub gifted\n"
+                    f"**{platform} wagers** — {wager_tickets} tickets per $1,000 wagered "
+                    f"using code `{code}`\n"
+                    "**Bonus** — awarded by the team for events and giveaways"
+                ),
+                inline=False,
+            )
+            embed.add_field(
+                name="The Draw",
+                value=(
+                    "Raffles run in periods with a set start and end date. Once a period "
+                    "ends, the number of winners is set and each one is drawn at random "
+                    "from all entries, then revealed one at a time.\n"
+                    "Holding more tickets increases your odds but never guarantees a win, "
+                    "and a winner is removed from the pool before the next draw, so the "
+                    "same person cannot win twice in one raffle.\n"
+                    f"Draws are provably fair and can be [verified here]({fair_url})."
+                ),
+                inline=False,
+            )
+            embed.add_field(
+                name="Getting Started",
+                value=(
+                    "Link your streaming account so watch time and wagers are credited to "
+                    "you, then track your progress with the commands below.\n"
+                    "`/tickets` — your balance, rank and win chance\n"
+                    "`/leaderboard` — current standings\n"
+                    "`/raffleinfo` — the active period and its dates"
+                ),
+                inline=False,
+            )
+            embed.set_footer(text="Wagerlabs")
+
+            await ctx.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error showing raffle explainer: {e}")
+            await ctx.send("❌ Error loading raffle information. Please try again.")
+
     @commands.hybrid_command(name="leaderboard")
     async def leaderboard(self, ctx, limit: int = 10):
         """View the raffle ticket leaderboard."""

@@ -999,17 +999,42 @@ class RedisSubscriber:
                 # Reuse the shared engine (was create_engine per repost - leaked a pool).
                 engine = get_engine()
 
-                # setup_auto_leaderboard picks the channel ID from
-                # settings_manager when not passed explicitly, and posts an
-                # initial leaderboard message (or finds an existing one to
-                # update) before kicking off its periodic task.
-                lb = setup_auto_leaderboard(self.bot, engine, channel_id=None, server_id=guild_id)
-                if lb:
-                    await lb.initialize()
-                    await lb.update_leaderboard()
-                    logger.info(f"✅ Leaderboard posted/refreshed for guild {guild_id}")
+                guild_key = int(guild_id) if guild_id is not None else None
+                existing = getattr(self.bot, "auto_leaderboards", {}).get(guild_key)
+
+                if existing:
+                    # An AutoLeaderboard (and its periodic task) already exists
+                    # for this guild from startup. Re-point it at the newly saved
+                    # channel and re-initialize IN PLACE - calling
+                    # setup_auto_leaderboard again would start a SECOND
+                    # tasks.loop that can never be cancelled (the loop is a
+                    # closure local), stacking one more updater per save.
+                    new_channel_id = None
+                    if hasattr(self.bot, "settings_manager") and self.bot.settings_manager:
+                        new_channel_id = self.bot.settings_manager.raffle_leaderboard_channel_id
+                    if new_channel_id and int(new_channel_id) != int(existing.channel_id or 0):
+                        existing.channel_id = int(new_channel_id)
+                        # Force a fresh message in the new channel instead of
+                        # editing the old channel's message.
+                        existing.message_id = None
+                    if await existing.initialize():
+                        await existing.update_leaderboard()
+                        logger.info(f"✅ Leaderboard posted/refreshed for guild {guild_id}")
+                    else:
+                        logger.warning(f"⚠️ Could not initialize leaderboard for guild {guild_id}")
                 else:
-                    logger.warning(f"⚠️ Auto-leaderboard not configured for guild {guild_id}")
+                    # First time for this guild: setup_auto_leaderboard reads the
+                    # channel ID from settings_manager, initializes (posting or
+                    # adopting a message) in its task's before_loop, and starts
+                    # the periodic updater. It is async - must be awaited.
+                    lb = await setup_auto_leaderboard(self.bot, engine, channel_id=None, server_id=guild_key)
+                    if lb:
+                        if not hasattr(self.bot, "auto_leaderboards"):
+                            self.bot.auto_leaderboards = {}
+                        self.bot.auto_leaderboards[guild_key] = lb
+                        logger.info(f"✅ Leaderboard started for guild {guild_id}")
+                    else:
+                        logger.warning(f"⚠️ Auto-leaderboard not configured for guild {guild_id}")
             except Exception as e:
                 logger.error(f"❌ Error handling leaderboard_post: {e}")
                 import traceback
@@ -1547,16 +1572,29 @@ class RedisSubscriber:
             if hasattr(self.bot, "settings_manager") and self.bot.settings_manager:
                 try:
                     self.bot.settings_manager.refresh()
-                    logger.info("✅ Bot settings refreshed from database")
+                    logger.info("✅ Global bot settings refreshed (discord_server_id IS NULL)")
 
-                    # Log the updated values
+                    # Log the updated values. These are the GLOBAL (server-less)
+                    # rows only - the dashboard writes per-guild rows keyed by
+                    # discord_server_id, which are refreshed in block 2 below.
+                    # Empty/None here does NOT mean a guild's setting is unset or
+                    # was deleted; it means no global default row exists. Logged
+                    # as "(unset globally)" so this can't be misread as data loss.
                     settings = self.bot.settings_manager
-                    logger.info(f"   • kick_channel: {settings.kick_channel}")
-                    logger.info(f"   • kick_chatroom_id: {settings.kick_chatroom_id}")
-                    logger.info(f"   • slot_calls_channel_id: {settings.slot_calls_channel_id}")
-                    logger.info(f"   • raffle_auto_draw: {settings.raffle_auto_draw}")
-                    logger.info(f"   • raffle_announcement_channel_id: {settings.raffle_announcement_channel_id}")
-                    logger.info(f"   • raffle_leaderboard_channel_id: {settings.raffle_leaderboard_channel_id}")
+
+                    def _g(value):
+                        return value if value not in (None, "") else "(unset globally)"
+
+                    logger.info(f"   • [global] kick_channel: {_g(settings.kick_channel)}")
+                    logger.info(f"   • [global] kick_chatroom_id: {_g(settings.kick_chatroom_id)}")
+                    logger.info(f"   • [global] slot_calls_channel_id: {_g(settings.slot_calls_channel_id)}")
+                    logger.info(f"   • [global] raffle_auto_draw: {settings.raffle_auto_draw}")
+                    logger.info(
+                        f"   • [global] raffle_announcement_channel_id: {_g(settings.raffle_announcement_channel_id)}"
+                    )
+                    logger.info(
+                        f"   • [global] raffle_leaderboard_channel_id: {_g(settings.raffle_leaderboard_channel_id)}"
+                    )
 
                     # Update bot attributes for channel IDs that can be hot-reloaded
                     if settings.slot_calls_channel_id:
