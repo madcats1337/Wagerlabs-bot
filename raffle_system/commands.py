@@ -17,7 +17,7 @@ from utils.log_context import set_server
 from utils.server_urls import get_server_public_page_url
 
 from .draw import RaffleDraw
-from .reward_settings import get_ticket_reward_settings, platform_display_name
+from .reward_settings import get_ticket_reward_settings, platform_campaign_code, platform_display_name
 from .shuffle_tracker import ShuffleWagerTracker
 from .tickets import TicketManager
 
@@ -90,15 +90,18 @@ class RaffleCommands(commands.Cog):
             )
             settings = self._get_guild_settings(ctx)
             platform = platform_display_name(settings)
-            code = settings.shuffle_campaign_code
+            code = platform_campaign_code(settings)
 
             if not tickets or tickets["total_tickets"] == 0:
+                wager_hint = f"• Wagering on {platform}"
+                if code:
+                    wager_hint += f" with code '{code}'"
+                wager_hint += f" ({wager_tickets} tickets per $1000)"
                 await ctx.send(
                     f"❌ {ctx.author.mention} You don't have any raffle tickets yet!\n"
                     f"Earn tickets by:\n"
                     f"• Watching streams ({watchtime_tickets} tickets per hour)\n"
-                    f"• Gifting subs ({gifted_sub_tickets} tickets per sub)\n"
-                    f"• Wagering on {platform} with code '{code}' ({wager_tickets} tickets per $1000)"
+                    f"• Gifting subs ({gifted_sub_tickets} tickets per sub)\n" + wager_hint
                 )
                 return
 
@@ -172,7 +175,12 @@ Use `/leaderboard` to see top participants!
             )
             settings = self._get_guild_settings(ctx)
             platform = platform_display_name(settings)
-            code = settings.shuffle_campaign_code
+            # Per-platform key: Howl servers usually have no code at all, so the
+            # "using code X" clause is omitted rather than showing a wrong one.
+            code = platform_campaign_code(settings)
+            wager_line = f"**{platform} wagers** — {wager_tickets} tickets per $1,000 wagered"
+            if code:
+                wager_line += f" using code `{code}`"
             fair_url = get_server_public_page_url(self.engine, guild_id, "/provably-fair")
 
             embed = discord.Embed(
@@ -189,8 +197,7 @@ Use `/leaderboard` to see top participants!
                 value=(
                     f"**Watch time** — {watchtime_tickets} tickets per hour watched\n"
                     f"**Gifted subs** — {gifted_sub_tickets} tickets per sub gifted\n"
-                    f"**{platform} wagers** — {wager_tickets} tickets per $1,000 wagered "
-                    f"using code `{code}`\n"
+                    f"{wager_line}\n"
                     "**Bonus** — awarded by the team for events and giveaways"
                 ),
                 inline=False,
@@ -308,7 +315,10 @@ Use `/leaderboard` to see top participants!
             )
             settings = self._get_guild_settings(ctx)
             platform = platform_display_name(settings)
-            code = settings.shuffle_campaign_code
+            code = platform_campaign_code(settings)
+            # Howl servers typically have no campaign code — omit the "(code 'x')"
+            # suffix entirely rather than printing a wrong/borrowed one.
+            code_suffix = f" (code '{code}')" if code else ""
 
             # Debug logging
             logger.info(f"[raffleinfo] guild_id={ctx.guild.id}, server_id={managers['ticket_manager'].server_id}")
@@ -342,7 +352,7 @@ Use `/leaderboard` to see top participants!
 **How to Earn Tickets** (once period starts):
 ⏱️ **Watch Streams** - {watchtime_tickets} tickets per hour
 🎁 **Gift Subs** - {gifted_sub_tickets} tickets per sub
-🎲 **{platform} Wagers** - {wager_tickets} tickets per $1000 wagered (code '{code}')
+🎲 **{platform} Wagers** - {wager_tickets} tickets per $1000 wagered{code_suffix}
 ⭐ **Bonus** - Admin awarded for events
 
 **Commands**:
@@ -388,7 +398,7 @@ Get ready to participate when the period starts!
 **How to Earn Tickets**:
 ⏱️ **Watch Streams** - {watchtime_tickets} tickets per hour
 🎁 **Gift Subs** - {gifted_sub_tickets} tickets per sub
-🎲 **{platform} Wagers** - {wager_tickets} tickets per $1000 wagered (code '{code}')
+🎲 **{platform} Wagers** - {wager_tickets} tickets per $1000 wagered{code_suffix}
 ⭐ **Bonus** - Admin awarded for events
 
 **Commands**:

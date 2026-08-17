@@ -14,7 +14,9 @@ GIFTED_SUB_TICKETS = 15  # 1 gifted sub = 15 tickets
 # Primary: WAGER_AFFILIATE_URL, Fallback: SHUFFLE_AFFILIATE_URL (legacy)
 WAGER_PLATFORM_NAME = os.getenv("WAGER_PLATFORM_NAME", "shuffle").lower()
 WAGER_AFFILIATE_URL = os.getenv("WAGER_AFFILIATE_URL") or os.getenv("SHUFFLE_AFFILIATE_URL", "")
-WAGER_CAMPAIGN_CODE = os.getenv("WAGER_CAMPAIGN_CODE") or os.getenv("SHUFFLE_CAMPAIGN_CODE", "lele")
+# No hardcoded default — an unset code must read as "unset", not as one
+# specific tenant's Shuffle code (this used to default to "lele").
+WAGER_CAMPAIGN_CODE = os.getenv("WAGER_CAMPAIGN_CODE") or os.getenv("SHUFFLE_CAMPAIGN_CODE", "")
 WAGER_TICKETS_PER_1000_USD = int(os.getenv("WAGER_TICKETS_PER_1000_USD", "20"))
 
 # Backwards compatibility aliases

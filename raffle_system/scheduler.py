@@ -13,7 +13,7 @@ from utils.log_context import set_server
 
 from .database import create_new_period, get_current_period
 from .draw import RaffleDraw
-from .reward_settings import get_ticket_reward_settings, platform_display_name
+from .reward_settings import get_ticket_reward_settings, platform_campaign_code, platform_display_name
 
 logger = logging.getLogger(__name__)
 
@@ -448,12 +448,16 @@ Please contact an admin to claim your prize! 🎊
 
             # Resolve the configured wager platform + campaign code for this server.
             platform = "Shuffle"
-            code = "lele"
+            code = ""
             getter = getattr(self.bot, "get_guild_settings", None)
             if callable(getter) and self.discord_server_id is not None:
                 settings = getter(self.discord_server_id)
                 platform = platform_display_name(settings)
-                code = settings.shuffle_campaign_code
+                # Per-platform key (howl_campaign_code vs shuffle_campaign_code);
+                # "" when unset, so the "(code 'x')" clause is dropped instead of
+                # advertising another tenant's code.
+                code = platform_campaign_code(settings)
+            code_suffix = f" (code '{code}')" if code else ""
 
             # Resolve the per-server display number from the global period id.
             period_display = new_period_id
@@ -477,7 +481,7 @@ Please contact an admin to claim your prize! 🎊
 **How to Earn Tickets**:
 • Watch streams: {watchtime_tickets} tickets per hour
 • Gift subs: {gifted_sub_tickets} tickets per sub
-• Wager on {platform} (code '{code}'): {wager_tickets} tickets per $1000
+• Wager on {platform}{code_suffix}: {wager_tickets} tickets per $1000
 
 Use `!tickets` to check your balance!
 Good luck! 🍀

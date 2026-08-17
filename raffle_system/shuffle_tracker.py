@@ -163,7 +163,11 @@ class ShuffleWagerTracker:
                 # resolve to "" — the task's empty-URL guard then skips this server
                 # instead of fetching "   ".
                 self.affiliate_url = self._resolve_shuffle_url(self.bot_settings.shuffle_affiliate_url)
-                self.campaign_code = self.bot_settings.shuffle_campaign_code or "lele"
+                # No "lele" fallback: that is one tenant's code and silently
+                # tracked THEIR referrals on any server that hadn't set one.
+                # "" means "unset" and is handled by the campaign-filter guard
+                # in _fetch_and_process (it skips rather than matching ['']).
+                self.campaign_code = self.bot_settings.shuffle_campaign_code or ""
                 self.tickets_per_1000 = self.bot_settings.shuffle_tickets_per_1000 or 20
         else:
             # Fallback to environment variables
@@ -179,7 +183,8 @@ class ShuffleWagerTracker:
                 self.affiliate_url = self._resolve_shuffle_url(
                     os.getenv("WAGER_AFFILIATE_URL") or os.getenv("SHUFFLE_AFFILIATE_URL", "")
                 )
-                self.campaign_code = os.getenv("WAGER_CAMPAIGN_CODE") or os.getenv("SHUFFLE_CAMPAIGN_CODE", "lele")
+                # No hardcoded default (was "lele" — one tenant's code).
+                self.campaign_code = os.getenv("WAGER_CAMPAIGN_CODE") or os.getenv("SHUFFLE_CAMPAIGN_CODE", "")
                 self.tickets_per_1000 = int(os.getenv("WAGER_TICKETS_PER_1000_USD", "20"))
 
     def refresh_settings(self):
@@ -454,7 +459,18 @@ class ShuffleWagerTracker:
             if self.platform_name == "howl":
                 filtered_data = wager_data
             else:
-                campaign_codes = [code.strip().lower() for code in self.campaign_code.split(",")]
+                # An UNSET shuffle code must not silently match nothing: "".split(",")
+                # is [''], which no row's campaignCode equals, so every wager would be
+                # dropped with only a DEBUG line. Skip the poll loudly instead - the
+                # server needs a code configured before Shuffle wagers can be tracked.
+                campaign_codes = [c.strip().lower() for c in self.campaign_code.split(",") if c.strip()]
+                if not campaign_codes:
+                    logger.warning(
+                        f"[Shuffle Tracker] No campaign code configured for server "
+                        f"{self.server_id} - skipping wager poll (set one in "
+                        f"Profile Settings -> Affiliate)"
+                    )
+                    return {"status": "no_campaign_code", "updates": 0}
                 filtered_data = [user for user in wager_data if user.get("campaignCode", "").lower() in campaign_codes]
 
             if not filtered_data:

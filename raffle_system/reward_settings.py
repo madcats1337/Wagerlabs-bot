@@ -71,6 +71,34 @@ def platform_display_name(settings, default="Shuffle"):
     return _PLATFORM_DISPLAY_NAMES.get(raw, raw.title())
 
 
+def platform_campaign_code(settings):
+    """Return the campaign/affiliate code for the server's ACTIVE wager platform.
+
+    The code is stored under a DIFFERENT key per platform, mirroring
+    ShuffleTracker._load_settings():
+
+      - howl    -> `howl_campaign_code`, no default (Howl's affiliate API is
+                   keyed by the API key; a code is optional and often unset)
+      - shuffle -> `shuffle_campaign_code` (via the settings property, which
+                   also covers `wager_campaign_code` and the env fallbacks)
+
+    Returns "" when the active platform has no code configured. Callers must
+    treat "" as "this server doesn't use a code" and omit it from user-facing
+    copy — do NOT fall back to `settings.shuffle_campaign_code` here: that
+    property ends in a hardcoded "lele", which is one specific tenant's Shuffle
+    code and is wrong to show on any other server (and on every Howl server).
+    """
+    if settings is None:
+        return ""
+    try:
+        platform = (settings.get("wager_platform_name") or "").strip().lower()
+        if platform == "howl":
+            return (settings.get("howl_campaign_code") or "").strip()
+        return (settings.shuffle_campaign_code or "").strip()
+    except Exception:
+        return ""
+
+
 def get_ticket_reward_settings(engine, server_id=None, logger=None):
     """Return (watchtime_tickets, gifted_sub_tickets, wager_tickets) as display-safe strings."""
     watchtime_tickets = "10"

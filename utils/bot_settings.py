@@ -391,12 +391,19 @@ class BotSettingsManager:
         Supports multiple codes separated by comma (e.g., 'lele,maikelele,lele2')
         """
         # Priority: wager_campaign_code (DB) -> shuffle_campaign_code (DB) -> env vars
+        #
+        # Returns "" when nothing is configured. There is deliberately NO
+        # hardcoded default: this used to end in `or "lele"`, which is ONE
+        # tenant's Shuffle code and leaked onto every server that hadn't set
+        # one (including Howl servers, which key off howl_campaign_code
+        # entirely). Callers must treat "" as "no code configured" and omit it
+        # from user-facing copy rather than substituting a placeholder.
         return (
             self.get("wager_campaign_code")
             or self.get("shuffle_campaign_code")
             or self.get("wager_campaign_code", env_fallback="WAGER_CAMPAIGN_CODE")
             or self.get("shuffle_campaign_code", env_fallback="SHUFFLE_CAMPAIGN_CODE")
-            or "lele"
+            or ""
         )
 
     @property

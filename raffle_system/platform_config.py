@@ -61,7 +61,8 @@ class MultiPlatformWagerConfig:
         """
         # Check for WAGER_AFFILIATE_URL first (modern), then legacy SHUFFLE_AFFILIATE_URL
         wager_url = os.getenv("WAGER_AFFILIATE_URL") or os.getenv("SHUFFLE_AFFILIATE_URL")
-        wager_code = os.getenv("WAGER_CAMPAIGN_CODE") or os.getenv("SHUFFLE_CAMPAIGN_CODE", "lele")
+        # No hardcoded default (was "lele" — one tenant's code).
+        wager_code = os.getenv("WAGER_CAMPAIGN_CODE") or os.getenv("SHUFFLE_CAMPAIGN_CODE", "")
         wager_platform = os.getenv("WAGER_PLATFORM_NAME", "shuffle").lower()
         wager_tickets = int(os.getenv("WAGER_TICKETS_PER_1000_USD", "20"))
 
