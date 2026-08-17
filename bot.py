@@ -2889,6 +2889,15 @@ try:
 except Exception as e:
     logger.warning(f"Could not register /giveaway commands: {e}")
 
+# /loyaltypoints earn|shop — viewer explainers for the points system. Same local
+# tree, so the existing global sync publishes it.
+try:
+    from features.points.loyalty_points_command import register_loyalty_points_command
+
+    register_loyalty_points_command(bot, engine)
+except Exception as e:
+    logger.warning(f"Could not register /loyaltypoints command: {e}")
+
 
 @bot.before_invoke
 async def deduplicate_command(ctx):
