@@ -164,6 +164,19 @@ async def _fetch_howl_affiliate_data(affiliate_url: str, api_key: str):
         return None
 
 
+def _describe_link(username, howl_uid):
+    """Describe an existing Howl link for the user.
+
+    Links made before the panel switched to UID entry have howl_uid NULL, so
+    prefer the stored username and only fall back to the UID.
+    """
+    name = (username or "").strip()
+    if name:
+        return name
+    uid = str(howl_uid).strip() if howl_uid is not None else ""
+    return f"UID {uid}" if uid else "a Howl account"
+
+
 async def verify_and_grant(interaction: discord.Interaction, engine, settings_getter, entered_uid: str):
     discord_id = interaction.user.id
     guild = interaction.guild
@@ -177,12 +190,15 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
     try:
         with engine.connect() as conn:
             existing = conn.execute(
-                text("SELECT howl_uid FROM raffle_shuffle_links " "WHERE discord_id = :d AND platform = 'howl'"),
+                text(
+                    "SELECT shuffle_username, howl_uid FROM raffle_shuffle_links "
+                    "WHERE discord_id = :d AND platform = 'howl'"
+                ),
                 {"d": discord_id},
             ).fetchone()
         if existing:
             await interaction.response.send_message(
-                f"✅ You're already verified as UID **{existing[0]}**!", ephemeral=True
+                f"✅ You're already verified as **{_describe_link(existing[0], existing[1])}**!", ephemeral=True
             )
             return
     except Exception as e:
@@ -280,7 +296,9 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
         return
     if status == "discord_already_linked":
         await interaction.followup.send(
-            f"✅ You're already verified as UID **{result.get('existing_uid')}**!", ephemeral=True
+            f"✅ You're already verified as "
+            f"**{_describe_link(result.get('existing_username'), result.get('existing_uid'))}**!",
+            ephemeral=True,
         )
         return
     if status != "success":
@@ -308,11 +326,18 @@ def _insert_verified_link(engine, howl_username, kick_name, discord_id, howl_uid
                 return {"status": "already_linked", "existing_discord_id": existing[0]}
 
             discord_existing = conn.execute(
-                text("SELECT howl_uid FROM raffle_shuffle_links " "WHERE discord_id = :d AND platform = 'howl'"),
+                text(
+                    "SELECT shuffle_username, howl_uid FROM raffle_shuffle_links "
+                    "WHERE discord_id = :d AND platform = 'howl'"
+                ),
                 {"d": discord_id},
             ).fetchone()
             if discord_existing:
-                return {"status": "discord_already_linked", "existing_uid": discord_existing[0]}
+                return {
+                    "status": "discord_already_linked",
+                    "existing_username": discord_existing[0],
+                    "existing_uid": discord_existing[1],
+                }
 
             # Fallback: if somehow howl_uid wasn't set but they have a shuffle_username linked
             existing_user = conn.execute(
