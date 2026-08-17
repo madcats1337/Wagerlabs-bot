@@ -18,6 +18,36 @@ from .reward_settings import get_ticket_reward_settings, platform_campaign_code,
 logger = logging.getLogger(__name__)
 
 
+def _end_of_month(start):
+    """23:59:59 on the last day of `start`'s month."""
+    if start.month == 12:
+        next_month = start.replace(year=start.year + 1, month=1)
+    else:
+        next_month = start.replace(month=start.month + 1)
+    return next_month - timedelta(seconds=1)
+
+
+def _next_month_start(when):
+    """Midnight on the 1st of the month AFTER `when`'s month."""
+    first = when.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if first.month == 12:
+        return first.replace(year=first.year + 1, month=1)
+    return first.replace(month=first.month + 1)
+
+
+def _spans_whole_month(start, end):
+    """True when (start, end) looks like one calendar month.
+
+    Matches how monthly periods are written here — 1st at 00:00:00 through the
+    last day at 23:59:59 — and tolerates a small slop so a period created a few
+    seconds off (or via the dashboard's date-only inputs) still reads as monthly
+    and keeps rolling on month boundaries.
+    """
+    if start.day != 1:
+        return False
+    return abs((end - _end_of_month(start)).total_seconds()) <= 86400
+
+
 class RaffleScheduler:
     """Manages automatic raffle period transitions"""
 
@@ -173,19 +203,29 @@ class RaffleScheduler:
         Auto-renew recovery for periods that ended without a transition.
 
         Called from check_period_transition when no period is active and
-        auto_renew is ON. Rolls into a fresh monthly period once the latest
-        period's SCHEDULED end has passed:
+        auto_renew is ON. Rolls into a fresh period — same LENGTH as the one
+        that just ended — once the latest period's SCHEDULED end has passed:
           • no periods at all → raffle never started, stay dormant
-          • latest end_date still in the future (drawn/ended early) → stay
-            dormant until the scheduled end passes, then renew
-          • latest end_date passed → create the current month's period
+          • latest period was ended BY A PERSON → stay dormant permanently
+          • latest end_date still in the future (drawn early) → stay dormant
+            until the scheduled end passes, then renew
+          • latest end_date passed → create the next period
 
-        Returns the transition dict from _create_monthly_period, or None.
+        Returns the transition dict from _create_renewal_period, or None.
         """
+        # `ended_manually` is read through a guarded column check rather than
+        # selected directly: the two services deploy independently, so the bot
+        # can run against a database whose migration hasn't landed yet. A bare
+        # SELECT of a missing column raises, and check_period_transition's
+        # except-block would turn that into "no renewal" for every server until
+        # the dashboard caught up.
+        has_flag = self._has_ended_manually_column()
+        flag_select = "COALESCE(ended_manually, FALSE)" if has_flag else "FALSE"
+
         if self.discord_server_id is not None:
             query = text(
-                """
-                SELECT end_date FROM raffle_periods
+                f"""
+                SELECT end_date, {flag_select} FROM raffle_periods
                 WHERE discord_server_id = :server_id
                 ORDER BY end_date DESC
                 LIMIT 1
@@ -193,7 +233,7 @@ class RaffleScheduler:
             )
             params = {"server_id": self.discord_server_id}
         else:
-            query = text("SELECT end_date FROM raffle_periods ORDER BY end_date DESC LIMIT 1")
+            query = text(f"SELECT end_date, {flag_select} FROM raffle_periods ORDER BY end_date DESC LIMIT 1")
             params = {}
 
         with self.engine.begin() as conn:
@@ -204,40 +244,178 @@ class RaffleScheduler:
             return None
 
         latest_end = row[0]
+        ended_manually = bool(row[1])
         if isinstance(latest_end, str):
             latest_end = datetime.fromisoformat(latest_end)
 
+        if ended_manually:
+            # A person pressed "End Current Period" (or ran !raffleend). Ending
+            # the raffle is an explicit decision and auto-renew must not undo
+            # it — previously the flag didn't exist, so renewal fired as soon as
+            # the ORIGINAL end_date passed and resurrected the raffle. Starting
+            # the next period is now the operator's call.
+            logger.debug(
+                f"[Server {self.discord_server_id}] Latest period was ended manually — "
+                f"staying dormant (start the next one from the dashboard)"
+            )
+            return None
+
         if datetime.now() <= latest_end:
-            # Ended early (draw or manual end). Renew when the schedule says the
-            # period would have ended, not immediately — otherwise "End Current
-            # Period" would be undone within a minute.
+            # Drawn early: the winner is picked but the period's scheduled end
+            # hasn't arrived. Renew on schedule, not immediately.
             return None
 
         logger.info(
             f"[Server {self.discord_server_id}] Auto-renew ON — latest period's end passed, creating next monthly period"
         )
-        return self._create_monthly_period()
+        return self._create_renewal_period()
 
-    def _create_monthly_period(self):
-        """Create a new monthly raffle period starting on 1st of current month"""
+    def _has_ended_manually_column(self):
+        """Whether raffle_periods.ended_manually exists yet (cached per instance).
+
+        Lets the bot run safely against a database that hasn't received the
+        migration (the dashboard applies it on boot, and the two services deploy
+        independently). Absent column ⇒ treated as "nothing ended manually",
+        which is the pre-migration behaviour.
+        """
+        cached = getattr(self, "_ended_manually_column", None)
+        if cached is not None:
+            return cached
+        try:
+            with self.engine.begin() as conn:
+                found = conn.execute(
+                    text(
+                        """
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'raffle_periods' AND column_name = 'ended_manually'
+                        """
+                    )
+                ).fetchone()
+            present = bool(found)
+        except Exception as e:
+            logger.warning(f"Could not check for raffle_periods.ended_manually: {e}")
+            present = False
+        if not present:
+            logger.info(
+                "raffle_periods.ended_manually is missing — manual-end protection is inactive "
+                "until the dashboard migration runs"
+            )
+        # Only cache a positive result: once the migration lands mid-process the
+        # next check picks it up instead of staying degraded until a restart.
+        if present:
+            self._ended_manually_column = True
+        return present
+
+    def _latest_period_dates(self):
+        """(start_date, end_date) of this server's most recent period, or None.
+
+        Used to carry the operator's chosen period LENGTH into the next period.
+        """
+        if self.discord_server_id is not None:
+            query = text(
+                """
+                SELECT start_date, end_date FROM raffle_periods
+                WHERE discord_server_id = :server_id
+                ORDER BY end_date DESC
+                LIMIT 1
+                """
+            )
+            params = {"server_id": self.discord_server_id}
+        else:
+            query = text("SELECT start_date, end_date FROM raffle_periods ORDER BY end_date DESC LIMIT 1")
+            params = {}
+
+        try:
+            with self.engine.begin() as conn:
+                row = conn.execute(query, params).fetchone()
+        except Exception as e:
+            logger.warning(f"Could not read latest period dates: {e}")
+            return None
+        if not row or row[0] is None or row[1] is None:
+            return None
+
+        start, end = row[0], row[1]
+        if isinstance(start, str):
+            start = datetime.fromisoformat(start)
+        if isinstance(end, str):
+            end = datetime.fromisoformat(end)
+        return start, end
+
+    def _next_period_window(self, previous_start, previous_end, now=None):
+        """Start/end for the period that follows (previous_start, previous_end).
+
+        The new period keeps the LENGTH the operator configured — a 7-day period
+        renews as 7 days, a 2-week period as 2 weeks. Renewal used to always
+        build a calendar month here, which silently discarded the dates chosen
+        on the dashboard and made short periods impossible to sustain.
+
+        A period that is (within a day of) a whole calendar month keeps calendar
+        semantics — it rolls to the 1st..end-of-next-month — so existing monthly
+        raffles land on month boundaries rather than drifting by the 28/30/31-day
+        difference.
+        """
+        now = now or datetime.now()
+        start = previous_end + timedelta(seconds=1)
+
+        if previous_start is not None and _spans_whole_month(previous_start, previous_end):
+            # Step off the PREVIOUS month rather than off `start`: a date-only
+            # end (Aug 31 00:00:00, what the dashboard's date inputs produce)
+            # puts `start` inside the same month, and snapping it to day 1 would
+            # recreate the month that just finished.
+            month_start = _next_month_start(previous_start)
+            return month_start, _end_of_month(month_start)
+
+        duration = previous_end - previous_start if previous_start is not None else None
+        if duration is None or duration <= timedelta(0):
+            # Degenerate/unknown length: fall back to the next calendar month
+            # rather than creating a zero-length period that ends immediately.
+            month_start = _next_month_start(now)
+            return month_start, _end_of_month(month_start)
+
+        return start, start + duration
+
+    def _create_renewal_period(self):
+        """Create the next period, preserving the previous period's length.
+
+        Falls back to a month starting NOW when this server has no previous
+        period to take a length from.
+
+        Never backdates. Renewal used to start the period at "the 1st of the
+        current month" whatever the date actually was, so a renewal that fired
+        on the 17th produced a period that had already been running for 16 days
+        and ended two weeks later — the shape of the bad row this fixed.
+        """
         try:
             now = datetime.now()
 
-            # Start on 1st of current month at midnight
-            start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-            # End on last day of month at 23:59:59
-            # Get first day of next month, then subtract 1 second
-            if start.month == 12:
-                next_month = start.replace(year=start.year + 1, month=1)
+            previous = self._latest_period_dates()
+            if previous:
+                start, end = self._next_period_window(previous[0], previous[1], now=now)
             else:
-                next_month = start.replace(month=start.month + 1)
+                start = now
+                end = _end_of_month(now)
 
-            end = next_month - timedelta(seconds=1)
+            # A renewal recovering late (service down, a period left un-renewed
+            # for days) must not open a period that already started in the past:
+            # a monthly renewal firing on the 17th would otherwise create an
+            # Aug 1 - Aug 31 window that is already half spent, and viewers get
+            # a "month" with two weeks in it. Re-anchor to now, keeping LENGTH.
+            #
+            # Skips the whole-calendar-month case ONLY when it is genuinely
+            # starting now-ish (renewal fired on time at the boundary), which is
+            # the common path and the one that must stay month-aligned.
+            if start < now - timedelta(hours=1):
+                length = end - start
+                start = now
+                end = start + (length if length > timedelta(0) else timedelta(days=30))
+                logger.info(
+                    f"[Server {self.discord_server_id}] Late renewal — anchoring the new period to now "
+                    f"({start:%b %d} - {end:%b %d, %Y}) instead of backdating its start"
+                )
 
             period_id = create_new_period(self.engine, start, end, discord_server_id=self.discord_server_id)
             logger.info(
-                f"✅ Auto-created monthly period #{period_id} ({start.strftime('%b %d')} - {end.strftime('%b %d, %Y')})"
+                f"✅ Auto-created period #{period_id} ({start.strftime('%b %d')} - {end.strftime('%b %d, %Y')})"
             )
 
             return {
@@ -343,26 +521,16 @@ class RaffleScheduler:
                 logger.warning(f"⚠️  Tickets preserved! Winner NOT drawn for period #{old_period['id']}")
                 logger.warning("   Use !raffledraw or dashboard to draw winner before cleanup")
 
-            # New period starts on 1st of next month
+            # The next period keeps the LENGTH the operator configured for the
+            # one that just ended (a monthly period still rolls to the 1st).
+            old_start = old_period["start_date"]
             old_end = old_period["end_date"]
+            if isinstance(old_start, str):
+                old_start = datetime.fromisoformat(old_start)
             if isinstance(old_end, str):
                 old_end = datetime.fromisoformat(old_end)
 
-            # Calculate next month
-            if old_end.month == 12:
-                start = old_end.replace(
-                    year=old_end.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0
-                )
-            else:
-                start = old_end.replace(month=old_end.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
-
-            # End on last day of that month at 23:59:59
-            if start.month == 12:
-                next_month = start.replace(year=start.year + 1, month=1)
-            else:
-                next_month = start.replace(month=start.month + 1)
-
-            end = next_month - timedelta(seconds=1)
+            start, end = self._next_period_window(old_start, old_end)
 
             new_period_id = create_new_period(
                 self.engine, start, end, clear_tickets=clear_tickets, discord_server_id=self.discord_server_id
@@ -370,7 +538,7 @@ class RaffleScheduler:
             transition_info["new_period_id"] = new_period_id
 
             logger.info(
-                f"✅ New monthly period #{new_period_id} created ({start.strftime('%b %d')} - {end.strftime('%b %d, %Y')})"
+                f"✅ New period #{new_period_id} created ({start.strftime('%b %d')} - {end.strftime('%b %d, %Y')})"
             )
             logger.info("Auto-renew ON — next period rolled over automatically")
 

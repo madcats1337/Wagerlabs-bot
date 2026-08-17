@@ -17,7 +17,7 @@ RAFFLE_SCHEMA_SQL = """
 -- RAFFLE SYSTEM DATABASE SCHEMA
 -- ============================================
 
--- Monthly raffle periods
+-- Raffle periods
 CREATE TABLE IF NOT EXISTS raffle_periods (
     id SERIAL PRIMARY KEY,
     discord_server_id BIGINT NOT NULL,  -- Multi-server support
@@ -25,8 +25,15 @@ CREATE TABLE IF NOT EXISTS raffle_periods (
     end_date TIMESTAMP NOT NULL,
     status VARCHAR(20) DEFAULT 'active',  -- active, ended, archived
     total_tickets INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- TRUE when a person ended this period (dashboard button or !raffleend)
+    -- rather than it lapsing at end_date. Auto-renew must not roll a manually
+    -- ended period over. Mirrored in the dashboard's run_migrations().
+    ended_manually BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+-- Existing installs: the CREATE above is a no-op once the table exists.
+ALTER TABLE raffle_periods ADD COLUMN IF NOT EXISTS ended_manually BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- User ticket balances (resets monthly)
 CREATE TABLE IF NOT EXISTS raffle_tickets (

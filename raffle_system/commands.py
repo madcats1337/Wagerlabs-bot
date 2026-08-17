@@ -816,12 +816,27 @@ Use `/rafflestats @user` to see individual stats
                     await ctx.send("❌ No active raffle period to end!")
                     return
 
-                # End the period
+                # End the period. ended_manually stops auto-renew from rolling
+                # it over — renewal keys off the scheduled end_date, so without
+                # the flag this period would be re-created automatically.
+                #
+                # The column is set only when it exists: this UPDATE runs inside
+                # the enclosing transaction, so referencing a column the
+                # dashboard's migration hasn't added yet would abort the whole
+                # end. Ending the period is the operation the admin asked for
+                # and must not fail on the deploy window.
+                has_flag = conn.execute(
+                    text(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_name = 'raffle_periods' AND column_name = 'ended_manually'"
+                    )
+                ).fetchone()
+                set_manual = ", ended_manually = TRUE" if has_flag else ""
                 conn.execute(
                     text(
-                        """
+                        f"""
                     UPDATE raffle_periods
-                    SET status = 'ended', end_date = CURRENT_TIMESTAMP
+                    SET status = 'ended', end_date = CURRENT_TIMESTAMP{set_manual}
                     WHERE id = :period_id
                 """
                     ),
