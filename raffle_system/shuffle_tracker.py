@@ -667,15 +667,25 @@ class ShuffleWagerTracker:
                             text(
                                 """
                             INSERT INTO raffle_shuffle_wagers
-                                (period_id, shuffle_username, kick_name, discord_id,
-                                 total_wager_usd, last_known_wager, tickets_awarded, platform)
+                                (period_id, discord_server_id, shuffle_username, kick_name,
+                                 discord_id, total_wager_usd, last_known_wager,
+                                 tickets_awarded, platform)
                             VALUES
-                                (:period_id, :username, :kick_name, :discord_id,
-                                 :wager, :wager, 0, :platform)
+                                (:period_id, :server_id, :username, :kick_name,
+                                 :discord_id, :wager, :wager, 0, :platform)
                         """
                             ),
                             {
                                 "period_id": period_id,
+                                # MUST be supplied explicitly. This column used to be
+                                # left out, and the live schema carried a hardcoded
+                                # DEFAULT of one specific guild's id — so every
+                                # tenant's rows were stamped with THAT server and the
+                                # dashboard's per-server /wagers query returned
+                                # nothing for everyone else (howl servers showed an
+                                # empty table). The default is dropped in
+                                # migrate_fix_wager_server_id_default().
+                                "server_id": self.server_id,
                                 "username": shuffle_username,
                                 "kick_name": kick_name,
                                 "discord_id": discord_id,

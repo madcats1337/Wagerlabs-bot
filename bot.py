@@ -98,6 +98,7 @@ from raffle_system.database import (
     migrate_add_created_at_to_shuffle_wagers,
     migrate_add_panel_type_to_link_panels,
     migrate_add_platform_to_wager_tables,
+    migrate_fix_wager_server_id_default,
     migrate_make_shuffle_links_kick_name_nullable,
     migrate_one_active_period_per_server,
     setup_raffle_database,
@@ -9631,6 +9632,10 @@ async def on_ready():
             # Run migrations
             migrate_add_created_at_to_shuffle_wagers(engine)
             migrate_add_platform_to_wager_tables(engine)
+            # Drops the hardcoded discord_server_id DEFAULT that stamped every
+            # tenant's wagers onto one guild, and re-stamps existing rows from
+            # their period's real owner.
+            migrate_fix_wager_server_id_default(engine)
             # Must run AFTER migrate_add_platform_to_wager_tables (needs the platform column)
             migrate_platform_scope_raffle_constraints(engine)
             # Stream-link platform scoping (Kick + Twitch per Discord user per server)
