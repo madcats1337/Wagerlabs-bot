@@ -18,6 +18,18 @@ ROLL_BRACKETS = [
     (lambda r: True, 0.0, "💀 Total Loss"),  # 40-61 inclusive
 ]
 
+# Human-readable mirror of ROLL_BRACKETS, used by `/roll info`. Kept beside the
+# brackets so the two are edited together; `test_roll_table_matches_brackets`
+# fails if a range here ever stops describing what the brackets actually pay.
+ROLL_TABLE = [
+    ("1 or 100", 5.0, "Jackpot"),
+    ("2-5 or 96-99", 3.0, "Excellent"),
+    ("6-15 or 86-95", 2.0, "Great"),
+    ("16-25 or 76-85", 1.5, "Good"),
+    ("26-39 or 62-75", 0.5, "Partial loss"),
+    ("40-61", 0.0, "Total loss"),
+]
+
 
 def random_value_to_roll(random_value: float) -> int:
     """

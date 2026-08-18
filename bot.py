@@ -61,6 +61,7 @@ from features.discord_app_commands import (
     sync_global_slash_commands,
 )
 from features.games.gambling import setup_gambling
+from features.games.gambling.migrations import migrate_gambling_provably_fair
 from features.games.gtb_panel import setup_gtb_panel
 
 # Guess the Balance import
@@ -8372,7 +8373,9 @@ async def command_list(ctx):
         value=(
             "`/bj <amount>` - Play blackjack\n"
             "`/roll <amount>` - Roll 1-100 for multiplied payout\n"
-            "`/double <amount>` - Double or nothing"
+            "`/double <amount>` - Double or nothing\n"
+            "`/bj info`, `/roll info`, `/double info` - How each game works\n"
+            "`/seed` - View, set or rotate your provably-fair seeds"
         ),
         inline=False,
     )
@@ -9647,6 +9650,8 @@ async def on_ready():
             # Commit-reveal columns (raffle_periods seed/commitment + draw commitment).
             # After add_provably_fair_to_draws so raffle_draws already has its base PF columns.
             migrate_add_commit_reveal_to_periods(engine)
+            # Gambling commit-reveal seeds + per-bet commitment columns.
+            migrate_gambling_provably_fair(engine)
             migrate_make_shuffle_links_kick_name_nullable(engine)
             migrate_add_panel_type_to_link_panels(engine)
             # Enforce one active raffle period per server (safety net behind the
