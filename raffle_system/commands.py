@@ -1408,9 +1408,13 @@ Use `/rafflestats @user` to see individual stats
                             text(
                                 """
                             INSERT INTO raffle_watchtime_converted
-                                (period_id, kick_name, minutes_converted, tickets_awarded)
+                                (period_id, discord_server_id, kick_name,
+                                 minutes_converted, tickets_awarded)
                             VALUES
-                                (:period_id, :kick_name, :minutes, 0)
+                                (:period_id,
+                                 -- discord_server_id is NOT NULL; derive the owner from the period.
+                                 (SELECT discord_server_id FROM raffle_periods WHERE id = :period_id),
+                                 :kick_name, :minutes, 0)
                         """
                             ),
                             {"period_id": period_id, "kick_name": kick_name, "minutes": tracked_minutes},
@@ -2005,9 +2009,13 @@ Use `/rafflestats @user` to see individual stats
                             text(
                                 """
                             INSERT INTO raffle_watchtime_converted
-                                (period_id, kick_name, minutes_converted, tickets_awarded)
+                                (period_id, discord_server_id, kick_name,
+                                 minutes_converted, tickets_awarded)
                             VALUES
-                                (:period_id, :kick_name, :minutes, 0)
+                                (:period_id,
+                                 -- discord_server_id is NOT NULL; derive the owner from the period.
+                                 (SELECT discord_server_id FROM raffle_periods WHERE id = :period_id),
+                                 :kick_name, :minutes, 0)
                         """
                             ),
                             {"period_id": period_id, "kick_name": kick_name, "minutes": tracked_minutes},

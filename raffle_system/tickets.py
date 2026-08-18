@@ -159,13 +159,18 @@ class TicketManager:
                     text(
                         """
                     INSERT INTO raffle_ticket_log
-                        (period_id, discord_id, kick_name, ticket_change, source, description)
+                        (period_id, discord_server_id, discord_id, kick_name,
+                         ticket_change, source, description)
                     VALUES
-                        (:period_id, :discord_id, :kick_name, :change, :source, :desc)
+                        (:period_id, :server_id, :discord_id, :kick_name, :change, :source, :desc)
                 """
                     ),
                     {
                         "period_id": period_id,
+                        # NOT NULL with a per-guild DEFAULT: omitting it filed the
+                        # row under one hardcoded guild. Reuse the id already
+                        # resolved from the period above.
+                        "server_id": discord_server_id,
                         "discord_id": discord_id,
                         "kick_name": kick_name,
                         "change": tickets,
@@ -256,9 +261,14 @@ class TicketManager:
                     text(
                         """
                     INSERT INTO raffle_ticket_log
-                        (period_id, discord_id, kick_name, ticket_change, source, description)
+                        (period_id, discord_server_id, discord_id, kick_name,
+                         ticket_change, source, description)
                     VALUES
-                        (:period_id, :discord_id, :kick_name, :change, 'admin_removal', :reason)
+                        (:period_id,
+                         -- The period owns the row; deriving the tenant from it
+                         -- is correct by construction and needs nothing in scope.
+                         (SELECT discord_server_id FROM raffle_periods WHERE id = :period_id),
+                         :discord_id, :kick_name, :change, 'admin_removal', :reason)
                 """
                     ),
                     {

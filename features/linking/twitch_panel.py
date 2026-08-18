@@ -142,8 +142,12 @@ class TwitchLinkPanel:
                 conn.execute(
                     text(
                         """
-                        INSERT INTO link_panels (guild_id, channel_id, message_id, emoji, panel_type, created_at)
-                        VALUES (:guild_id, :channel_id, :message_id, '🟣', :ptype, CURRENT_TIMESTAMP)
+                        INSERT INTO link_panels
+                            (guild_id, discord_server_id, channel_id, message_id,
+                             emoji, panel_type, created_at)
+                        -- discord_server_id is NOT NULL; for a panel it is the guild itself.
+                        VALUES (:guild_id, :guild_id, :channel_id, :message_id,
+                                '🟣', :ptype, CURRENT_TIMESTAMP)
                         """
                     ),
                     {

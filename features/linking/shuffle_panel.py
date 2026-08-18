@@ -298,7 +298,7 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
         logger.error(f"Error looking up Kick name for {discord_id}: {e}")
 
     # 4b. Persist the verified link (verified by the user themselves)
-    result = _insert_verified_link(engine, matched_username, kick_name, discord_id)
+    result = _insert_verified_link(engine, matched_username, kick_name, discord_id, guild_id)
     status = result.get("status")
 
     if status == "already_linked":
@@ -324,7 +324,7 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
     )
 
 
-def _insert_verified_link(engine, shuffle_username, kick_name, discord_id):
+def _insert_verified_link(engine, shuffle_username, kick_name, discord_id, guild_id):
     """Insert a verified raffle_shuffle_links row (self-verified).
 
     Uses the same status contract as ShuffleWagerTracker.link_shuffle_account so the
@@ -357,13 +357,17 @@ def _insert_verified_link(engine, shuffle_username, kick_name, discord_id):
                 text(
                     """
                     INSERT INTO raffle_shuffle_links
-                        (shuffle_username, kick_name, discord_id, platform, verified, verified_by_discord_id, verified_at)
+                        (shuffle_username, discord_server_id, kick_name, discord_id,
+                         platform, verified, verified_by_discord_id, verified_at)
+                    -- discord_server_id is NOT NULL; the linking guild owns the row.
                     VALUES
-                        (:shuffle_username, :kick_name, :discord_id, 'shuffle', TRUE, :verified_by, CURRENT_TIMESTAMP)
+                        (:shuffle_username, :server_id, :kick_name, :discord_id, 'shuffle',
+                         TRUE, :verified_by, CURRENT_TIMESTAMP)
                     """
                 ),
                 {
                     "shuffle_username": shuffle_username,
+                    "server_id": guild_id,
                     "kick_name": kick_name,
                     "discord_id": discord_id,
                     "verified_by": discord_id,  # self-verified
@@ -573,8 +577,12 @@ class ShufflePanel:
                 conn.execute(
                     text(
                         """
-                        INSERT INTO link_panels (guild_id, channel_id, message_id, emoji, panel_type, created_at)
-                        VALUES (:guild_id, :channel_id, :message_id, '🎰', :ptype, CURRENT_TIMESTAMP)
+                        INSERT INTO link_panels
+                            (guild_id, discord_server_id, channel_id, message_id,
+                             emoji, panel_type, created_at)
+                        -- discord_server_id is NOT NULL; for a panel it is the guild itself.
+                        VALUES (:guild_id, :guild_id, :channel_id, :message_id,
+                                '🎰', :ptype, CURRENT_TIMESTAMP)
                         """
                     ),
                     {

@@ -289,7 +289,7 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
     except Exception as e:
         logger.error(f"Error looking up Kick name for {discord_id}: {e}")
 
-    result = _insert_verified_link(engine, matched_username, kick_name, discord_id, matched_uid)
+    result = _insert_verified_link(engine, matched_username, kick_name, discord_id, matched_uid, guild_id)
     status = result.get("status")
 
     if status == "already_linked":
@@ -318,7 +318,7 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
     )
 
 
-def _insert_verified_link(engine, howl_username, kick_name, discord_id, howl_uid):
+def _insert_verified_link(engine, howl_username, kick_name, discord_id, howl_uid, guild_id):
     try:
         with engine.begin() as conn:
             existing = conn.execute(
@@ -356,13 +356,17 @@ def _insert_verified_link(engine, howl_username, kick_name, discord_id, howl_uid
                 text(
                     """
                     INSERT INTO raffle_shuffle_links
-                        (shuffle_username, kick_name, discord_id, platform, verified, verified_by_discord_id, verified_at, howl_uid)
+                        (shuffle_username, discord_server_id, kick_name, discord_id,
+                         platform, verified, verified_by_discord_id, verified_at, howl_uid)
+                    -- discord_server_id is NOT NULL; the linking guild owns the row.
                     VALUES
-                        (:howl_username, :kick_name, :discord_id, 'howl', TRUE, :verified_by, CURRENT_TIMESTAMP, :howl_uid)
+                        (:howl_username, :server_id, :kick_name, :discord_id, 'howl',
+                         TRUE, :verified_by, CURRENT_TIMESTAMP, :howl_uid)
                     """
                 ),
                 {
                     "howl_username": howl_username,
+                    "server_id": guild_id,
                     "kick_name": kick_name,
                     "discord_id": discord_id,
                     "verified_by": discord_id,
@@ -576,8 +580,12 @@ class HowlPanel:
                 conn.execute(
                     text(
                         """
-                        INSERT INTO link_panels (guild_id, channel_id, message_id, emoji, panel_type, created_at)
-                        VALUES (:guild_id, :channel_id, :message_id, '🐺', :ptype, CURRENT_TIMESTAMP)
+                        INSERT INTO link_panels
+                            (guild_id, discord_server_id, channel_id, message_id,
+                             emoji, panel_type, created_at)
+                        -- discord_server_id is NOT NULL; for a panel it is the guild itself.
+                        VALUES (:guild_id, :guild_id, :channel_id, :message_id,
+                                '🐺', :ptype, CURRENT_TIMESTAMP)
                         """
                     ),
                     {

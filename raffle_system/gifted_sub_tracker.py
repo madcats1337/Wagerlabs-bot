@@ -170,10 +170,13 @@ class GiftedSubTracker:
                         text(
                             """
                         INSERT INTO raffle_gifted_subs
-                            (period_id, gifter_kick_name, gifter_discord_id, sub_count,
-                             tickets_awarded, kick_event_id)
+                            (period_id, discord_server_id, gifter_kick_name,
+                             gifter_discord_id, sub_count, tickets_awarded, kick_event_id)
                         VALUES
-                            (:period_id, :kick_name, NULL, :sub_count, 0, :event_id)
+                            (:period_id,
+                             -- discord_server_id is NOT NULL; derive the owner from the period.
+                             (SELECT discord_server_id FROM raffle_periods WHERE id = :period_id),
+                             :kick_name, NULL, :sub_count, 0, :event_id)
                     """
                         ),
                         {
@@ -208,10 +211,13 @@ class GiftedSubTracker:
                     text(
                         """
                     INSERT INTO raffle_gifted_subs
-                        (period_id, gifter_kick_name, gifter_discord_id, sub_count,
-                         tickets_awarded, kick_event_id)
+                        (period_id, discord_server_id, gifter_kick_name,
+                         gifter_discord_id, sub_count, tickets_awarded, kick_event_id)
                     VALUES
-                        (:period_id, :kick_name, :discord_id, :sub_count,
+                        (:period_id,
+                         -- discord_server_id is NOT NULL; derive the owner from the period.
+                         (SELECT discord_server_id FROM raffle_periods WHERE id = :period_id),
+                         :kick_name, :discord_id, :sub_count,
                          :tickets, :event_id)
                 """
                     ),

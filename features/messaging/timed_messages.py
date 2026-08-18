@@ -761,8 +761,10 @@ class TimedMessagesCommands(commands.Cog):
                     conn.execute(
                         text(
                             """
-                        INSERT INTO timer_panels (guild_id, channel_id, message_id)
-                        VALUES (:guild, :channel, :message)
+                        INSERT INTO timer_panels
+                            (guild_id, discord_server_id, channel_id, message_id)
+                        -- discord_server_id is NOT NULL; supply the tenant explicitly.
+                        VALUES (:guild, :guild, :channel, :message)
                         ON CONFLICT (guild_id, channel_id, message_id) DO NOTHING
                     """
                         ),

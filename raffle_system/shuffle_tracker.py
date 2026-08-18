@@ -1040,14 +1040,17 @@ class ShuffleWagerTracker:
                     text(
                         """
                     INSERT INTO raffle_shuffle_links
-                        (shuffle_username, kick_name, discord_id, platform, verified, verified_by_discord_id, verified_at)
+                        (shuffle_username, discord_server_id, kick_name, discord_id,
+                         platform, verified, verified_by_discord_id, verified_at)
+                    -- discord_server_id is NOT NULL; supply the tenant explicitly.
                     VALUES
-                        (:shuffle_username, :kick_name, :discord_id, 'shuffle', :verified, :verified_by,
+                        (:shuffle_username, :server_id, :kick_name, :discord_id, 'shuffle', :verified, :verified_by,
                          CASE WHEN :verified THEN CURRENT_TIMESTAMP ELSE NULL END)
                 """
                     ),
                     {
                         "shuffle_username": shuffle_username,
+                        "server_id": self.server_id,
                         "kick_name": kick_name,
                         "discord_id": discord_id,
                         "verified": verified,

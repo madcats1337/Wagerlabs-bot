@@ -98,7 +98,6 @@ from raffle_system.database import (
     migrate_add_created_at_to_shuffle_wagers,
     migrate_add_panel_type_to_link_panels,
     migrate_add_platform_to_wager_tables,
-    migrate_fix_wager_server_id_default,
     migrate_make_shuffle_links_kick_name_nullable,
     migrate_one_active_period_per_server,
     setup_raffle_database,
@@ -7512,8 +7511,10 @@ async def link_logs_toggle(ctx, action: str = None):
             conn.execute(
                 text(
                     """
-                INSERT INTO link_logs_config (guild_id, channel_id, enabled, updated_at)
-                VALUES (:guild_id, :channel_id, TRUE, CURRENT_TIMESTAMP)
+                INSERT INTO link_logs_config
+                    (guild_id, discord_server_id, channel_id, enabled, updated_at)
+                -- discord_server_id is NOT NULL; supply the tenant explicitly.
+                VALUES (:guild_id, :guild_id, :channel_id, TRUE, CURRENT_TIMESTAMP)
                 ON CONFLICT (guild_id) DO UPDATE SET
                     channel_id = :channel_id,
                     enabled = TRUE,
@@ -8203,8 +8204,12 @@ async def fix_watchtime_for_current_period(ctx):
                 conn.execute(
                     text(
                         """
-                    INSERT INTO raffle_watchtime_converted (period_id, kick_name, minutes_converted, tickets_awarded)
-                    VALUES (:period_id, :username, :minutes, 0)
+                    INSERT INTO raffle_watchtime_converted
+                        (period_id, discord_server_id, kick_name, minutes_converted, tickets_awarded)
+                    VALUES (:period_id,
+                            -- discord_server_id is NOT NULL; derive the owner from the period.
+                            (SELECT discord_server_id FROM raffle_periods WHERE id = :period_id),
+                            :username, :minutes, 0)
                 """
                     ),
                     {"period_id": period_id, "username": username, "minutes": minutes},
@@ -8610,8 +8615,10 @@ async def setup_link_panel(ctx, emoji: str = "🔗"):
         conn.execute(
             text(
                 """
-            INSERT INTO link_panels (guild_id, channel_id, message_id, emoji)
-            VALUES (:g, :c, :m, :e)
+            INSERT INTO link_panels
+                (guild_id, discord_server_id, channel_id, message_id, emoji)
+            -- discord_server_id is NOT NULL; for a panel it is the guild itself.
+            VALUES (:g, :g, :c, :m, :e)
         """
             ),
             {"g": ctx.guild.id, "c": ctx.channel.id, "m": message.id, "e": emoji},
@@ -9632,10 +9639,6 @@ async def on_ready():
             # Run migrations
             migrate_add_created_at_to_shuffle_wagers(engine)
             migrate_add_platform_to_wager_tables(engine)
-            # Drops the hardcoded discord_server_id DEFAULT that stamped every
-            # tenant's wagers onto one guild, and re-stamps existing rows from
-            # their period's real owner.
-            migrate_fix_wager_server_id_default(engine)
             # Must run AFTER migrate_add_platform_to_wager_tables (needs the platform column)
             migrate_platform_scope_raffle_constraints(engine)
             # Stream-link platform scoping (Kick + Twitch per Discord user per server)
@@ -11220,8 +11223,12 @@ class PointShopConfirmView(discord.ui.View):
                                 text(
                                     """
                                     INSERT INTO raffle_ticket_log
-                                        (period_id, discord_id, kick_name, ticket_change, source, description)
-                                    VALUES (:period_id, :discord_id, :kick_name, :amount, 'bonus', :desc)
+                                        (period_id, discord_server_id, discord_id,
+                                         kick_name, ticket_change, source, description)
+                                    VALUES (:period_id,
+                                            -- discord_server_id is NOT NULL; derive the owner from the period.
+                                            (SELECT discord_server_id FROM raffle_periods WHERE id = :period_id),
+                                            :discord_id, :kick_name, :amount, 'bonus', :desc)
                                 """
                                 ),
                                 {

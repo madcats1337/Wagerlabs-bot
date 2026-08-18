@@ -496,8 +496,9 @@ def create_new_period(engine, start_date, end_date, clear_tickets=True, discord_
                 conn.execute(
                     text(
                         """
-                    INSERT INTO raffle_watchtime_converted (period_id, kick_name, minutes_converted, tickets_awarded)
-                    SELECT :period_id, username, minutes, 0
+                    INSERT INTO raffle_watchtime_converted
+                        (period_id, discord_server_id, kick_name, minutes_converted, tickets_awarded)
+                    SELECT :period_id, :server_id, username, minutes, 0
                     FROM watchtime
                     WHERE minutes > 0 AND discord_server_id = :server_id
                 """
@@ -509,10 +510,13 @@ def create_new_period(engine, start_date, end_date, clear_tickets=True, discord_
                 conn.execute(
                     text(
                         """
-                    INSERT INTO raffle_watchtime_converted (period_id, kick_name, minutes_converted, tickets_awarded)
-                    SELECT :period_id, username, minutes, 0
-                    FROM watchtime
-                    WHERE minutes > 0
+                    INSERT INTO raffle_watchtime_converted
+                        (period_id, discord_server_id, kick_name, minutes_converted, tickets_awarded)
+                    -- Carry each watchtime row's OWN server across rather than
+                    -- letting the column default file them all under one guild.
+                    SELECT :period_id, w.discord_server_id, w.username, w.minutes, 0
+                    FROM watchtime w
+                    WHERE w.minutes > 0
                 """
                     ),
                     {"period_id": period_id},
@@ -656,65 +660,23 @@ def migrate_add_created_at_to_shuffle_wagers(engine):
         return False
 
 
-# Tables whose `discord_server_id` carries a hardcoded DEFAULT of one specific
-# guild's id (see repo-root schema.sql). The default is a multi-tenancy hazard:
-# any INSERT that omits the column files its row under THAT tenant instead of
-# failing, so the real owner sees nothing. This is how howl wagers vanished from
-# the dashboard's /wagers page.
+# NOTE: `discord_server_id` carries a per-guild DEFAULT on ~22 tables (see
+# repo-root schema.sql). That default is a genuine multi-tenancy hazard — a
+# writer that omits the column files its row under THAT guild instead of its
+# own, which is how howl wagers vanished from the dashboard's /wagers page.
 #
-# activity_logs is excluded on purpose — it is pinned to DEFAULT 0, the global
-# sentinel, which is never a real server.
+# It is nevertheless LOAD-BEARING: the column is NOT NULL, and ~28 INSERT sites
+# across both repos still rely on the default to populate it. Dropping the
+# defaults before fixing those writers turned a silent data-quality bug into a
+# hard outage (NotNullViolation on ticket awards, watchtime conversion, link
+# panels, slot requests, timers). The migration that did so has been removed.
 #
-# Fixed internal list (never user input), so it is safe to interpolate into the
-# ALTER statements below. Mirrors Admin-Dashboard/app.py's
-# DISCORD_SERVER_ID_DEFAULT_TABLES; keep the two in sync.
-DISCORD_SERVER_ID_DEFAULT_TABLES = (
-    "bonus_hunt_bonuses",
-    "bonus_hunt_sessions",
-    "bot_settings",
-    "custom_commands",
-    "feature_settings",
-    "link_logs_config",
-    "link_panels",
-    "pending_links",
-    "raffle_draws",
-    "raffle_gifted_subs",
-    "raffle_tickets",
-    "raffle_periods",
-    "raffle_shuffle_links",
-    "raffle_shuffle_wagers",
-    "raffle_ticket_log",
-    "raffle_watchtime_converted",
-    "shuffle_slots",
-    "slot_call_blacklist",
-    "slot_requests",
-    "timed_messages",
-    "timer_panels",
-    "watchtime_roles",
-)
-
-
-def migrate_fix_wager_server_id_default(engine):
-    """Migration: drop the hardcoded per-guild `discord_server_id` DEFAULTs.
-
-    SCHEMA ONLY — no rows are read or rewritten. Removing the default makes a
-    writer that forgets the column fail loudly instead of silently filing its
-    data under one hardcoded tenant (which is what hid every non-default
-    server's wagers). Existing mis-stamped rows are left exactly as they are;
-    repairing them is a separate, deliberate decision.
-
-    Idempotent: DROP DEFAULT on a column that has none is a no-op, and each
-    table is attempted independently so one missing table cannot abort the rest.
-    """
-    for table in DISCORD_SERVER_ID_DEFAULT_TABLES:
-        try:
-            with engine.begin() as conn:
-                conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN discord_server_id DROP DEFAULT"))
-        except Exception as e:
-            # A table this deployment does not have is normal, not an error.
-            logger.debug(f"discord_server_id default on {table}: {type(e).__name__}: {e}")
-    logger.debug("✓ discord_server_id per-guild defaults dropped where present")
-    return True
+# The correct order, if the defaults are ever to be dropped:
+#   1. every writer supplies discord_server_id explicitly (in progress),
+#   2. verify NO INSERT omits it in either repo,
+#   3. only then drop the defaults.
+# Fixing the writers is what actually removes the hazard; the default then
+# never fires and dropping it becomes cosmetic.
 
 
 def migrate_add_platform_to_wager_tables(engine):
