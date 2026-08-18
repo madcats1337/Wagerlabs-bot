@@ -34,6 +34,25 @@ logger = logging.getLogger(__name__)
 
 WAGERLABS_YELLOW = 0xFACC15
 
+# `max_winners` sentinel for "no cap": keep drawing until the entry pool is
+# exhausted. Written by the dashboard (routes/giveaway.py UNLIMITED_WINNERS)
+# and mirrored here so both services agree on what a negative value means.
+UNLIMITED_WINNERS = -1
+
+
+def _normalize_max_winners(value):
+    """Coerce a max_winners value to a positive cap or UNLIMITED_WINNERS.
+
+    Negative stays negative (unlimited); 0/None/garbage become 1, since a 0
+    cap would make every draw fail its own check.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return 1
+    return UNLIMITED_WINNERS if n < 0 else max(1, n)
+
+
 # A Discord select menu holds at most 25 options.
 _MAX_CHOICES = 25
 
@@ -141,7 +160,10 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
                 "created_by": str(interaction.user),
                 "channel_id": tpl.get("discord_channel_id"),
                 "duration": duration_minutes,
-                "max_winners": max(1, int(tpl.get("max_winners") or 1)),
+                # A NEGATIVE value is the dashboard's "unlimited winners"
+                # sentinel and must survive — max(1, ...) would silently turn an
+                # unlimited template into a single-winner giveaway.
+                "max_winners": _normalize_max_winners(tpl.get("max_winners")),
                 "required_role_id": tpl.get("required_role_id"),
                 "bonus": _json.dumps(bonus_roles) if bonus_roles else None,
                 # Both shapes are written: the array is authoritative, the
@@ -214,8 +236,8 @@ def _describe_template(tpl) -> str:
     bits.append(
         {"discord": "Discord button", "keyword": "Keyword", "active_chatter": "Active chatter"}.get(method, method)
     )
-    winners = int(tpl.get("max_winners") or 1)
-    bits.append(f"{winners} winner{'s' if winners != 1 else ''}")
+    winners = _normalize_max_winners(tpl.get("max_winners"))
+    bits.append("unlimited winners" if winners < 0 else f"{winners} winner{'s' if winners != 1 else ''}")
     if tpl.get("discord_channel_id"):
         bits.append(f"<#{int(tpl['discord_channel_id'])}>")
     if tpl.get("required_role_id"):
@@ -484,13 +506,16 @@ class GiveawayCreateView(discord.ui.LayoutView):
         container.add_item(discord.ui.ActionRow(channel))
 
         # ── Winners ──
+        winners_state = "unlimited" if self.max_winners < 0 else self.max_winners
         container.add_item(
-            discord.ui.TextDisplay(f"**Winners** · {self.max_winners}\n-# How many people win the giveaway.")
+            discord.ui.TextDisplay(f"**Winners** · {winners_state}\n-# How many people win the giveaway.")
         )
         winners = discord.ui.Select(
             placeholder="How many winners…",
             options=_opts(
-                [(f"{n} winner{'s' if n != 1 else ''}", str(n)) for n in (1, 2, 3, 5, 10, 25)],
+                [(f"{n} winner{'s' if n != 1 else ''}", str(n)) for n in (1, 2, 3, 5, 10, 25)]
+                # No cap: keep drawing until every entry has won.
+                + [("Unlimited winners", str(UNLIMITED_WINNERS))],
                 self.max_winners,
             ),
         )

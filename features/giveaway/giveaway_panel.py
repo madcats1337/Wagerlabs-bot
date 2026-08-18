@@ -542,7 +542,11 @@ class GiveawayPanelView(discord.ui.LayoutView):
                 lines.append("\nThis giveaway has ended.")
         else:
             meta = [f"**{entry_count}** {'entry' if entry_count == 1 else 'entries'}"]
-            if max_winners > 1:
+            # Negative = the dashboard's "unlimited winners" sentinel; showing the
+            # raw -1 here would read as nonsense to entrants.
+            if max_winners < 0:
+                meta.append("**unlimited** winners")
+            elif max_winners > 1:
                 meta.append(f"**{max_winners}** winners")
             deadline = _fmt_deadline(g.get("ends_at"))
             if deadline:

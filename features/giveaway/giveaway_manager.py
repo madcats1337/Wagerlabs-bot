@@ -447,10 +447,16 @@ class GiveawayManager:
                 text("SELECT COALESCE(max_winners, 1) FROM giveaways WHERE id = :gid"),
                 {"gid": giveaway_id},
             ).fetchone()
-        max_winners = max(1, int(row[0])) if row else 1
+        raw_max = int(row[0]) if row else 1
+        # Negative = the "unlimited" sentinel the dashboard writes: draw until the
+        # entry pool runs dry rather than stopping at a fixed count. draw_winner
+        # returns falsy once nothing eligible is left, which is what ends the loop
+        # in that mode (and is already the guard for a pool smaller than the cap).
+        unlimited = raw_max < 0
+        max_winners = max(1, raw_max)
 
         drawn, winners = [], []
-        for _ in range(max_winners):
+        while unlimited or len(drawn) < max_winners:
             result = await self.draw_winner(giveaway_id=giveaway_id, exclude=drawn, finalize=False)
             if not result:
                 break
