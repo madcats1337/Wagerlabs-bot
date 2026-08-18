@@ -40,6 +40,7 @@ class RaffleCommands(commands.Cog):
         the bot's global before_invoke also does this). Runs in the command's Task."""
         if ctx.guild:
             set_server(ctx.guild.id, ctx.guild.name)
+        await defer_slash_response(ctx)
 
     def _get_guild_settings(self, ctx):
         """Get a per-guild settings manager (cached) for reading dashboard config.
