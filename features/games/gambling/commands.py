@@ -298,7 +298,9 @@ class GamblingCog(commands.Cog, name="Gambling"):
     async def cmd_blackjack(self, ctx: commands.Context, amount: str = None):
         """Play blackjack. Usage: /bj <bet_amount> or /bj info"""
         # Several DB round-trips run before the first reply - acknowledge the slash interaction first.
-        await defer_slash_response(ctx)
+        # Deferred ephemerally: every reply this command makes is ephemeral, and a
+        # non-ephemeral defer would make the followup public regardless.
+        await defer_slash_response(ctx, ephemeral=True)
 
         if self._is_info(amount) or not amount:
             await ctx.reply(view=blackjack_info_view(self._fair_url(ctx.guild.id)), ephemeral=True)
@@ -434,7 +436,9 @@ class GamblingCog(commands.Cog, name="Gambling"):
     async def cmd_roll(self, ctx: commands.Context, amount: str = None):
         """Roll 1-100 for a multiplier. Usage: /roll <bet_amount> or /roll info"""
         # Several DB round-trips run before the first reply - acknowledge the slash interaction first.
-        await defer_slash_response(ctx)
+        # Deferred ephemerally: every reply this command makes is ephemeral, and a
+        # non-ephemeral defer would make the followup public regardless.
+        await defer_slash_response(ctx, ephemeral=True)
 
         if self._is_info(amount) or not amount:
             await ctx.reply(view=roll_info_view(self._fair_url(ctx.guild.id)), ephemeral=True)
@@ -490,7 +494,9 @@ class GamblingCog(commands.Cog, name="Gambling"):
     async def cmd_double(self, ctx: commands.Context, amount: str = None):
         """20% chance to double your bet. Usage: /double <bet_amount> or /double info"""
         # Several DB round-trips run before the first reply - acknowledge the slash interaction first.
-        await defer_slash_response(ctx)
+        # Deferred ephemerally: every reply this command makes is ephemeral, and a
+        # non-ephemeral defer would make the followup public regardless.
+        await defer_slash_response(ctx, ephemeral=True)
 
         if self._is_info(amount) or not amount:
             await ctx.reply(view=double_info_view(self._fair_url(ctx.guild.id)), ephemeral=True)
