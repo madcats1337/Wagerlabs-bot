@@ -883,11 +883,12 @@ class SlotCallTracker:
             return
 
         matched = False
+        event_type = "match_refresh"
         with self.engine.begin() as conn:
             row = conn.execute(
                 text(
                     """
-                    SELECT id FROM tournaments
+                    SELECT id, mode, current_round FROM tournaments
                     WHERE discord_server_id = :sid AND status IN ('drafting','active')
                     ORDER BY created_at DESC LIMIT 1
                     """
@@ -896,7 +897,7 @@ class SlotCallTracker:
             ).fetchone()
             if not row:
                 return
-            tid = row[0]
+            tid, mode, current_round = row[0], (row[1] or "bracket"), row[2]
 
             comp = conn.execute(
                 text(
@@ -913,32 +914,64 @@ class SlotCallTracker:
                 return
             competitor_id = comp[0]
 
-            cm = conn.execute(
-                text(
-                    """
-                    SELECT id, competitor1_id FROM tournament_matches
-                    WHERE tournament_id = :tid AND status != 'decided'
-                      AND (competitor1_id = :cid OR competitor2_id = :cid)
-                    ORDER BY round ASC, match_number ASC
-                    LIMIT 1
-                    """
-                ),
-                {"tid": tid, "cid": competitor_id},
-            ).fetchone()
-            if not cm:
-                return
-            match_id, c1_id = cm[0], cm[1]
-            prefix = "c1" if c1_id == competitor_id else "c2"
+            if mode == "eliminations":
+                # Eliminations has no matches -- fill the competitor's current
+                # unplayed round entry instead. A round they have already been
+                # scored on is left alone: the multiplier was derived from that
+                # slot's payout, so changing it afterwards would misreport a
+                # result the cut was already decided on.
+                entry = conn.execute(
+                    text(
+                        """
+                        SELECT id FROM tournament_round_entries
+                        WHERE tournament_id = :tid AND round = :rnd
+                          AND competitor_id = :cid
+                          AND eliminated = FALSE AND payout IS NULL
+                        LIMIT 1
+                        """
+                    ),
+                    {"tid": tid, "rnd": current_round, "cid": competitor_id},
+                ).fetchone()
+                if not entry:
+                    return
+                conn.execute(
+                    text("UPDATE tournament_round_entries SET slot_name = :slot WHERE id = :eid"),
+                    {"slot": slot_call.strip(), "eid": entry[0]},
+                )
+                conn.execute(
+                    text("UPDATE tournament_competitors SET requested_slot = :slot WHERE id = :cid"),
+                    {"slot": slot_call.strip(), "cid": competitor_id},
+                )
+                matched = True
+                event_type = "round_refresh"
+            else:
+                cm = conn.execute(
+                    text(
+                        """
+                        SELECT id, competitor1_id FROM tournament_matches
+                        WHERE tournament_id = :tid AND status != 'decided'
+                          AND (competitor1_id = :cid OR competitor2_id = :cid)
+                        ORDER BY round ASC, match_number ASC
+                        LIMIT 1
+                        """
+                    ),
+                    {"tid": tid, "cid": competitor_id},
+                ).fetchone()
+                if not cm:
+                    return
+                match_id, c1_id = cm[0], cm[1]
+                prefix = "c1" if c1_id == competitor_id else "c2"
 
-            conn.execute(
-                text(f"UPDATE tournament_matches SET {prefix}_slot_name = :slot WHERE id = :mid"),
-                {"slot": slot_call.strip(), "mid": match_id},
-            )
-            conn.execute(
-                text("UPDATE tournament_competitors SET requested_slot = :slot WHERE id = :cid"),
-                {"slot": slot_call.strip(), "cid": competitor_id},
-            )
-            matched = True
+                conn.execute(
+                    text(f"UPDATE tournament_matches SET {prefix}_slot_name = :slot WHERE id = :mid"),
+                    {"slot": slot_call.strip(), "mid": match_id},
+                )
+                conn.execute(
+                    text("UPDATE tournament_competitors SET requested_slot = :slot WHERE id = :cid"),
+                    {"slot": slot_call.strip(), "cid": competitor_id},
+                )
+                matched = True
+                event_type = "match_refresh"
 
         if matched:
             logger.info(f"[Tournament] Auto-filled '{slot_call}' for competitor {kick_username}")
@@ -956,7 +989,7 @@ class SlotCallTracker:
                         "tournament:match:events",
                         _json.dumps(
                             {
-                                "type": "match_refresh",
+                                "type": event_type,
                                 "server_id": str(self.server_id),
                                 "payload": {},
                             }

@@ -1051,6 +1051,10 @@ class RedisSubscriber:
         """
         logger.info(f"🏆 Tournament Event: {action}")
 
+        if action == "announce_elimination":
+            await self._announce_elimination(data)
+            return
+
         if action != "announce_winner":
             return
 
@@ -1132,6 +1136,80 @@ class RedisSubscriber:
                 logger.info("[Tournament] no Discord channel configured; skipping Discord announce")
         except Exception as e:
             logger.warning(f"[Tournament] Discord announce failed: {e}")
+
+    async def _announce_elimination(self, data):
+        """Announce a Bonus Eliminations round cut to stream chat + Discord.
+
+        A normal round cuts TWO competitors, so the message is built from the
+        list rather than assuming one; the final round may cut only one, and the
+        wording collapses to the singular for it. There is no OBS widget in this
+        gamemode, so this fires as soon as the dashboard commits the cut -- there
+        is no reveal animation to wait on.
+        """
+        server_id = data.get("discord_server_id") or data.get("server_id")
+        eliminated = data.get("eliminated") or []
+        survivors = data.get("survivors") or []
+        remaining = data.get("remaining")
+        is_final = bool(data.get("is_final"))
+        round_no = data.get("round")
+
+        def _who(p):
+            name = p.get("name") or p.get("kick_username") or "Someone"
+            bits = []
+            if p.get("slot_name"):
+                bits.append(str(p["slot_name"]))
+            mult = p.get("multiplier")
+            if mult is not None:
+                try:
+                    bits.append(f"{float(mult):.2f}x")
+                except (TypeError, ValueError):
+                    pass
+            return f"{name} ({' · '.join(bits)})" if bits else name
+
+        if not eliminated:
+            return
+
+        names = " and ".join(_who(p) for p in eliminated)
+        verb = "is" if len(eliminated) == 1 else "are"
+        parts = [f"❌ Round {round_no}: {names} {verb} ELIMINATED."]
+
+        if is_final:
+            podium = ", ".join(
+                f"{i}. {p.get('name') or p.get('kick_username')}" for i, p in enumerate(survivors, start=1)
+            )
+            if podium:
+                parts.append(f"🏆 Final standings — {podium}")
+        elif remaining is not None:
+            parts.append(f"{remaining} remain.")
+
+        chat_msg = " ".join(parts)
+
+        try:
+            await self.announce_in_chat(chat_msg, guild_id=server_id)
+        except Exception as e:
+            logger.warning(f"[Eliminations] chat announce failed: {e}")
+
+        try:
+            channel_id = None
+            if server_id:
+                from bot import get_guild_settings
+
+                gs = get_guild_settings(int(server_id))
+                if gs:
+                    channel_id = gs.get_int("tournament_announcement_channel_id") or gs.get_int("slot_calls_channel_id")
+            if channel_id:
+                channel = self.bot.get_channel(int(channel_id))
+                if channel is None:
+                    try:
+                        channel = await self.bot.fetch_channel(int(channel_id))
+                    except Exception:
+                        channel = None
+                if channel is not None:
+                    await channel.send(chat_msg)
+            else:
+                logger.info("[Eliminations] no Discord channel configured; skipping Discord announce")
+        except Exception as e:
+            logger.warning(f"[Eliminations] Discord announce failed: {e}")
 
     async def handle_commands_event(self, action, data):
         """Handle custom commands events from dashboard"""
