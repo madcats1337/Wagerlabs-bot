@@ -1140,9 +1140,9 @@ class RedisSubscriber:
     async def _announce_elimination(self, data):
         """Announce a Free-for-all round cut to stream chat + Discord.
 
-        A normal round cuts TWO competitors, so the message is built from the
-        list rather than assuming one; the final round may cut only one, and the
-        wording collapses to the singular for it. There is no OBS widget in this
+        A round cuts as many competitors as the tournament's pace, so the message
+        is built from the list rather than assuming a count; a final round may
+        trim a remainder, and the wording collapses to the singular for one. There is no OBS widget in this
         gamemode, so this fires as soon as the dashboard commits the cut -- there
         is no reveal animation to wait on.
         """
