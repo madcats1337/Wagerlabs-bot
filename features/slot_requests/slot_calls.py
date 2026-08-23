@@ -914,8 +914,8 @@ class SlotCallTracker:
                 return
             competitor_id = comp[0]
 
-            if mode == "eliminations":
-                # Eliminations has no matches -- fill the competitor's current
+            if mode == "ffa":
+                # Free-for-all has no matches -- fill the competitor's current
                 # unplayed round entry instead. A round they have already been
                 # scored on is left alone: the multiplier was derived from that
                 # slot's payout, so changing it afterwards would misreport a

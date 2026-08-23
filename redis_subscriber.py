@@ -1138,7 +1138,7 @@ class RedisSubscriber:
             logger.warning(f"[Tournament] Discord announce failed: {e}")
 
     async def _announce_elimination(self, data):
-        """Announce a Bonus Eliminations round cut to stream chat + Discord.
+        """Announce a Free-for-all round cut to stream chat + Discord.
 
         A normal round cuts TWO competitors, so the message is built from the
         list rather than assuming one; the final round may cut only one, and the
@@ -1187,7 +1187,7 @@ class RedisSubscriber:
         try:
             await self.announce_in_chat(chat_msg, guild_id=server_id)
         except Exception as e:
-            logger.warning(f"[Eliminations] chat announce failed: {e}")
+            logger.warning(f"[FFA] chat announce failed: {e}")
 
         try:
             channel_id = None
@@ -1207,9 +1207,9 @@ class RedisSubscriber:
                 if channel is not None:
                     await channel.send(chat_msg)
             else:
-                logger.info("[Eliminations] no Discord channel configured; skipping Discord announce")
+                logger.info("[FFA] no Discord channel configured; skipping Discord announce")
         except Exception as e:
-            logger.warning(f"[Eliminations] Discord announce failed: {e}")
+            logger.warning(f"[FFA] Discord announce failed: {e}")
 
     async def handle_commands_event(self, action, data):
         """Handle custom commands events from dashboard"""
