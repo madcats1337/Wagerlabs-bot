@@ -8465,6 +8465,13 @@ async def admin_command_list(ctx):
         inline=False,
     )
 
+    # Points
+    embed.add_field(
+        name="💰 Loyalty Points",
+        value="`/pointsgive <@user> <amount> [reason]` - Give loyalty points to a member",
+        inline=False,
+    )
+
     # Gambling Admin
     embed.add_field(
         name="🎲 Gambling",
@@ -12587,6 +12594,78 @@ async def cmd_points_leaderboard(ctx, limit: int = 10):
     embed.set_footer(text=f"Top {len(leaders)} point holders")
 
     await ctx.send(embed=embed)
+
+
+@bot.hybrid_command(name="pointsgive", aliases=["givepoints"])
+@app_commands.default_permissions(administrator=True)
+@commands.has_permissions(administrator=True)
+async def cmd_points_give(ctx, user: discord.Member, amount: int, *, reason: str = "Admin bonus"):
+    """
+    [ADMIN] Give loyalty points to a member
+    Usage: /pointsgive @user <amount> [reason]
+    Example: /pointsgive @John 500 Subathon bonus
+    """
+    # Reads the database before its first reply — acknowledge the slash interaction first.
+    await defer_slash_response(ctx)
+
+    if amount <= 0:
+        await ctx.send("❌ Point amount must be positive.")
+        return
+
+    guild_id = ctx.guild.id
+
+    try:
+        with engine.begin() as conn:
+            # Points are shared across a person's platforms and live on ONE row,
+            # keyed by their canonical username — the same row award_points writes
+            # to. Resolving through resolve_shop_identity is what keeps a grant
+            # visible to a dual-platform viewer no matter which handle they spend
+            # from; writing to the mentioned member's Kick handle directly would
+            # strand the points on a row nothing reads.
+            canonical, accounts = resolve_shop_identity(conn, user.id, guild_id)
+
+            if not accounts:
+                await ctx.send(
+                    f"❌ {user.mention} has not linked a Kick or Twitch account yet, "
+                    "so there is no points balance to credit."
+                )
+                return
+
+            # Upsert, not UPDATE: a linked member who has never earned has no
+            # user_points row yet, and the grant must still land.
+            row = conn.execute(
+                text(
+                    """
+                INSERT INTO user_points (kick_username, discord_id, points, total_earned, discord_server_id, last_updated)
+                VALUES (:u, :d, :p, :p, :sid, CURRENT_TIMESTAMP)
+                ON CONFLICT(kick_username, discord_server_id) DO UPDATE SET
+                    points = user_points.points + :p,
+                    total_earned = user_points.total_earned + :p,
+                    discord_id = COALESCE(:d, user_points.discord_id),
+                    last_updated = CURRENT_TIMESTAMP
+                RETURNING points
+            """
+                ),
+                {"u": canonical, "d": user.id, "p": amount, "sid": guild_id},
+            ).fetchone()
+
+        new_balance = int(row[0]) if row else amount
+
+        embed = discord.Embed(title="💰 Points Granted", color=0xFFD700)
+        embed.add_field(name="Member", value=user.mention, inline=True)
+        embed.add_field(name="Granted", value=f"**+{amount:,}** points", inline=True)
+        embed.add_field(name="New Balance", value=f"{new_balance:,} points", inline=True)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.set_footer(text=f"By {ctx.author.name} • Account: {format_linked_accounts(accounts)}")
+
+        await ctx.send(embed=embed)
+        logger.info(f"💰 Admin {ctx.author} gave {amount} points to {user} ({canonical}): {reason}")
+
+    except commands.BadArgument:
+        await ctx.send("❌ Invalid user or amount. Usage: `/pointsgive @user <amount> [reason]`")
+    except Exception as e:
+        logger.error(f"Error giving points to {user}: {e}")
+        await ctx.send("❌ Error granting points. Please try again.")
 
 
 @bot.hybrid_command(name="postshop")
