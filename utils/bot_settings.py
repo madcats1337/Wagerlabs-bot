@@ -334,6 +334,12 @@ class BotSettingsManager:
         return self.get_bool("raffle_auto_draw", env_fallback="RAFFLE_AUTO_DRAW")
 
     @property
+    def raffle_auto_draw_winners(self) -> int:
+        """How many winners the automatic end-of-period draw picks (1-10)."""
+        value = self.get_int("raffle_auto_draw_winners", default=1)
+        return max(1, min(10, value or 1))
+
+    @property
     def gtb_channel_id(self) -> Optional[int]:
         """Discord channel ID for Guess The Balance"""
         # Falls back to slot_calls_channel_id if not set
@@ -437,6 +443,7 @@ class BotSettingsManager:
             "raffle_announcement_channel_id": self.raffle_announcement_channel_id,
             "raffle_leaderboard_channel_id": self.raffle_leaderboard_channel_id,
             "raffle_auto_draw": self.raffle_auto_draw,
+            "raffle_auto_draw_winners": self.raffle_auto_draw_winners,
             "gtb_channel_id": self.gtb_channel_id,
             "clip_duration": self.clip_duration,
             "dashboard_url": self.dashboard_url,

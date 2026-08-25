@@ -97,6 +97,34 @@ class RaffleScheduler:
         return self._auto_draw_default
 
     @property
+    def auto_draw_winner_count(self):
+        """
+        How many winners an automatic draw picks (refreshes on each check).
+
+        Mirrors the manual dashboard draw's 1-10 bound; anything missing or
+        unparseable falls back to a single winner, which is what auto-draw did
+        before the setting existed.
+        """
+        try:
+            with self.engine.begin() as conn:
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT value FROM bot_settings
+                        WHERE key = 'raffle_auto_draw_winners' AND discord_server_id = :server_id
+                    """
+                    ),
+                    {"server_id": self.discord_server_id},
+                ).fetchone()
+                if row and str(row[0]).strip():
+                    return max(1, min(10, int(str(row[0]).strip())))
+        except (TypeError, ValueError):
+            logger.warning("Invalid raffle_auto_draw_winners value - drawing 1 winner")
+        except Exception as e:
+            logger.warning(f"Failed to get raffle_auto_draw_winners setting from DB: {e}")
+        return 1
+
+    @property
     def auto_renew(self):
         """
         Get the server-wide raffle_auto_renew setting (refreshes on each check).
@@ -173,8 +201,8 @@ class RaffleScheduler:
             if (
                 self.auto_draw and 0 < time_until_end <= 600 and not current_period.get("winner_discord_id")
             ):  # 600 seconds = 10 minutes
-                logger.info(f"⏰ 10 minutes until period end - auto_draw enabled, drawing winner now!")
-                self._draw_winner_for_period(current_period)
+                logger.info(f"⏰ 10 minutes until period end - auto_draw enabled, drawing winner(s) now!")
+                self._draw_winners_for_period(current_period)
             elif 0 < time_until_end <= 600 and not current_period.get("winner_discord_id"):
                 logger.info(f"⏰ 10 minutes until period end - auto_draw DISABLED, skipping automatic draw")
 
@@ -431,24 +459,51 @@ class RaffleScheduler:
             logger.error(f"Failed to create monthly period: {e}")
             return None
 
-    def _draw_winner_for_period(self, period):
-        """Draw winner for the given period"""
-        try:
-            winner = self.raffle_draw.draw_winner(
-                period_id=period["id"],
-                prize_description="Monthly Raffle Prize",
-                drawn_by_discord_id=None,  # Automatic draw
-            )
+    def _draw_winners_for_period(self, period, winner_count=None):
+        """
+        Draw the configured number of winners for the given period.
 
-            if winner:
-                logger.info(f"🎉 Winner drawn for period #{period['id']}: {winner['winner_kick_name']}")
-                return winner
-            else:
-                logger.warning(f"No participants to draw from for period #{period['id']}")
-                return None
+        Each winner is excluded from the next draw, and only the FIRST draw
+        marks the period ended (update_period) - the same shape as the
+        dashboard's multi-winner draw in redis_subscriber.
+
+        Returns:
+            list: Winner dicts (empty when there was nobody to draw)
+        """
+        winners = []
+        try:
+            count = winner_count if winner_count is not None else self.auto_draw_winner_count
+            excluded_discord_ids = []
+
+            for i in range(count):
+                winner = self.raffle_draw.draw_winner(
+                    period_id=period["id"],
+                    prize_description=(
+                        "Monthly Raffle Prize" if count == 1 else f"Monthly Raffle Prize (Winner {i+1}/{count})"
+                    ),
+                    drawn_by_discord_id=None,  # Automatic draw
+                    excluded_discord_ids=excluded_discord_ids or None,
+                    update_period=(i == 0),
+                )
+
+                if not winner:
+                    if i == 0:
+                        logger.warning(f"No participants to draw from for period #{period['id']}")
+                    else:
+                        logger.warning(
+                            f"Only {len(winners)}/{count} winners drawn for period #{period['id']} "
+                            "- ran out of eligible participants"
+                        )
+                    break
+
+                winners.append(winner)
+                excluded_discord_ids.append(winner["winner_discord_id"])
+                logger.info(f"🎉 Winner {i+1}/{count} drawn for period #{period['id']}: {winner['winner_kick_name']}")
+
+            return winners
         except Exception as e:
             logger.error(f"Failed to draw winner: {e}")
-            return None
+            return winners
 
     def _transition_to_new_period(self, old_period):
         """
@@ -467,24 +522,24 @@ class RaffleScheduler:
                 "old_period_end": old_period["end_date"],
                 "winner_drawn": False,
                 "winner_info": None,
+                "winners": [],
                 "new_period_id": None,
                 "transition_time": datetime.now(),
             }
 
-            # Step 1: Draw winner if auto-draw enabled and not already drawn
+            # Step 1: Draw winner(s) if auto-draw enabled and none drawn yet
             if self.auto_draw and not old_period.get("winner_discord_id"):
-                logger.info(f"🎲 Auto-drawing winner for period #{old_period['id']}...")
+                count = self.auto_draw_winner_count
+                logger.info(f"🎲 Auto-drawing {count} winner(s) for period #{old_period['id']}...")
 
-                winner = self.raffle_draw.draw_winner(
-                    period_id=old_period["id"],
-                    prize_description="Monthly Raffle Prize",
-                    drawn_by_discord_id=None,  # Automatic draw
-                )
+                winners = self._draw_winners_for_period(old_period, winner_count=count)
 
-                if winner:
+                if winners:
                     transition_info["winner_drawn"] = True
-                    transition_info["winner_info"] = winner
-                    logger.info(f"🎉 Winner drawn: {winner['winner_kick_name']}")
+                    # winner_info stays the FIRST winner for callers that predate
+                    # multi-winner auto-draw; `winners` carries the full set.
+                    transition_info["winner_info"] = winners[0]
+                    transition_info["winners"] = winners
                 else:
                     logger.warning("No participants to draw from")
 
@@ -718,8 +773,12 @@ async def setup_raffle_scheduler(bot, engine, auto_draw=False, announcement_chan
             # auto-renew OFF the transition ends the period WITHOUT creating a
             # successor (new_period_id=None), and the drawn winner must still
             # be announced.
-            if transition and transition.get("winner_drawn") and transition.get("winner_info"):
-                await scheduler.announce_winner(transition["winner_info"])
+            if transition and transition.get("winner_drawn"):
+                drawn = transition.get("winners") or (
+                    [transition["winner_info"]] if transition.get("winner_info") else []
+                )
+                for winner_info in drawn:
+                    await scheduler.announce_winner(winner_info)
 
             # Process period transition whenever it happens (not just at midnight on 1st)
             if transition and transition.get("new_period_id"):
