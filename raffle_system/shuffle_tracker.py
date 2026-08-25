@@ -11,6 +11,7 @@ Settings loaded from database (bot_settings table) with env var fallbacks:
 import asyncio
 import logging
 import os
+from collections import namedtuple
 from datetime import datetime
 
 import aiohttp
@@ -21,6 +22,60 @@ from utils.wager_leaderboard import is_http_url, resolve_shuffle_stats_url
 from .tickets import TicketManager
 
 logger = logging.getLogger(__name__)
+
+
+#: What one poll owes a viewer. `action` is one of:
+#:   "rollover" — the platform's reporting figure went DOWN, so its window moved;
+#:                re-anchor both marks and award nothing.
+#:   "skip"     — nothing moved and nothing is payable yet.
+#:   "update"   — write the marks; award `tickets` if the viewer is identified.
+WagerAward = namedtuple("WagerAward", "action tickets converted paid_through observed_delta")
+
+
+def compute_wager_award(paid_through, prev_total, current_wager, tickets_per_1000):
+    """Decide what a single poll owes, from the two watermarks and the new figure.
+
+    Pure arithmetic, extracted so the rules below are directly testable — this is
+    money-adjacent and both rules were previously wrong in ways no test caught.
+
+    Two watermarks, deliberately distinct:
+      `paid_through` — the wager level tickets have been PAID through.
+      `prev_total`   — the figure the platform last reported.
+
+    Rule 1 (remainder carries): tickets are whole units, so one poll of wagering
+    usually converts to zero of them. `paid_through` advances ONLY by the dollars
+    actually converted, so the sub-ticket remainder stays pending for later polls.
+    The previous code paid `int(delta/1000*rate)` per poll and then advanced the
+    baseline to the full current total, discarding the remainder every time. At 5
+    tickets per $1,000 on a 2-minute loop that threw away ~99% of all wagering.
+
+    Rule 2 (a decrease is a window rollover, not a refund): Howl reports a
+    date-windowed total, so its figure drops when the window moves. Skipping such
+    a poll would strand `paid_through` at the pre-rollover high-water mark and
+    kill every award for the rest of the raffle period. Raffle-period durations
+    are operator-chosen, so a period spanning a rollover is routine, not an edge
+    case.
+    """
+    rate = tickets_per_1000 if tickets_per_1000 and tickets_per_1000 > 0 else 20
+    dollars_per_ticket = 1000.0 / rate
+
+    if current_wager < prev_total:
+        return WagerAward("rollover", 0, 0.0, round(current_wager, 2), 0.0)
+
+    # The API returns a high-precision float while the columns are DECIMAL(15,2),
+    # so round to cents; otherwise a sub-cent residue reads as movement on every
+    # poll and writes a phantom $0.00 history row per user.
+    observed_delta = round(current_wager - prev_total, 2)
+    unpaid = round(current_wager - paid_through, 2)
+
+    tickets = int(unpaid / dollars_per_ticket) if unpaid > 0 else 0
+    converted = round(tickets * dollars_per_ticket, 2)
+    new_paid_through = round(paid_through + converted, 2)
+
+    if observed_delta <= 0 and tickets == 0:
+        return WagerAward("skip", 0, 0.0, round(paid_through, 2), observed_delta)
+
+    return WagerAward("update", tickets, converted, new_paid_through, observed_delta)
 
 
 class ShuffleWagerTracker:
@@ -499,6 +554,23 @@ class ShuffleWagerTracker:
             tickets_to_award = []  # Store ticket awards to process after wager updates
 
             with self.engine.begin() as conn:
+                # Verified links for this platform, fetched ONCE per poll rather
+                # than per user. Also lets an EXISTING wager row pick up a link
+                # made after the row was created: the row caches discord_id /
+                # kick_name, and without this refresh a viewer who wagers first
+                # and links second earns nothing for the rest of the period.
+                link_rows = conn.execute(
+                    text(
+                        """
+                        SELECT shuffle_username, discord_id, kick_name
+                        FROM raffle_shuffle_links
+                        WHERE verified = TRUE AND platform = :platform
+                        """
+                    ),
+                    {"platform": self.platform_name},
+                ).fetchall()
+                links = {str(r[0]).lower(): (r[1], r[2]) for r in link_rows}
+
                 for user_data in filtered_data:
                     shuffle_username = user_data.get("username")
                     current_wager = float(user_data.get("wagerAmount", 0))
@@ -514,7 +586,8 @@ class ShuffleWagerTracker:
                             last_known_wager,
                             tickets_awarded,
                             discord_id,
-                            kick_name
+                            kick_name,
+                            total_wager_usd
                         FROM raffle_shuffle_wagers
                         WHERE period_id = :period_id AND shuffle_username = :username
                           AND platform = :platform
@@ -526,37 +599,28 @@ class ShuffleWagerTracker:
                     prev_row = prev_result.fetchone()
 
                     if prev_row:
-                        # Existing user - check for wager increase
-                        last_known_wager = float(prev_row[0])
-                        total_tickets_awarded = prev_row[1]
+                        # `last_known_wager` is the wager level tickets have been
+                        # PAID THROUGH; `total_wager_usd` is the last figure the
+                        # platform reported. They are no longer the same number —
+                        # see the remainder handling below.
+                        paid_through = float(prev_row[0])
                         discord_id = prev_row[2]
                         kick_name = prev_row[3]
+                        prev_total = float(prev_row[4] or 0)
 
-                        # Calculate new wager since last check.
-                        #
-                        # The Shuffle API returns wagerAmount as a high-precision
-                        # float (e.g. 116301.04286432), but raffle_shuffle_wagers
-                        # stores last_known_wager as DECIMAL(15,2), so it reads back
-                        # rounded to cents (116301.04). Subtracting the rounded stored
-                        # value from the full-precision API value yields a tiny
-                        # positive residue (~0.0028) on EVERY poll even when the user
-                        # has not wagered. That residue is > 0 (so it slips past a
-                        # naive guard) but rounds to 0.00 in the NUMERIC(15,2)
-                        # wager_delta column — producing one phantom $0.00 history row
-                        # per user per poll. Round the delta to cents and require a
-                        # real change so only genuine wagering is recorded.
-                        wager_delta = round(current_wager - last_known_wager, 2)
+                        # Adopt a link made after this row was created.
+                        linked = links.get(str(shuffle_username).lower())
+                        if linked and (discord_id is None or kick_name is None):
+                            discord_id = discord_id or linked[0]
+                            kick_name = kick_name or linked[1]
 
-                        if wager_delta <= 0:
-                            # No increase (or a sub-cent/decrease change, which we ignore)
-                            continue
+                        award = compute_wager_award(paid_through, prev_total, current_wager, self.tickets_per_1000)
 
-                        # Calculate tickets for the new wager amount
-                        # $1000 = configured tickets per 1000 USD
-                        new_tickets = int((wager_delta / 1000.0) * self.tickets_per_1000)
-
-                        if new_tickets == 0:
-                            # Less than threshold, update wager but no tickets
+                        if award.action == "rollover":
+                            logger.info(
+                                f"[{self.platform_name.capitalize()} Tracker] Reporting window rolled over for "
+                                f"{shuffle_username} (${prev_total:.2f} → ${current_wager:.2f}) — re-anchoring baseline"
+                            )
                             conn.execute(
                                 text(
                                     """
@@ -564,6 +628,8 @@ class ShuffleWagerTracker:
                                 SET
                                     last_known_wager = :current_wager,
                                     total_wager_usd = :current_wager,
+                                    discord_id = COALESCE(discord_id, :discord_id),
+                                    kick_name = COALESCE(kick_name, :kick_name),
                                     last_checked = CURRENT_TIMESTAMP,
                                     last_updated = CURRENT_TIMESTAMP
                                 WHERE period_id = :period_id AND shuffle_username = :username
@@ -574,92 +640,85 @@ class ShuffleWagerTracker:
                                     "period_id": period_id,
                                     "username": shuffle_username,
                                     "current_wager": current_wager,
+                                    "discord_id": discord_id,
+                                    "kick_name": kick_name,
                                     "platform": self.platform_name,
                                 },
                             )
-                            self._record_wager_history(conn, shuffle_username, current_wager, wager_delta)
                             continue
 
-                        # Award tickets if user is linked
-                        if discord_id and kick_name:
-                            # Queue ticket award to happen after wager update transaction
+                        if award.action == "skip":
+                            # Nothing moved and nothing is payable yet.
+                            continue
+
+                        new_tickets = award.tickets
+                        converted = award.converted
+                        new_paid_through = award.paid_through
+                        observed_delta = award.observed_delta
+
+                        # Award to anyone we can identify. `kick_name` is only a
+                        # display label downstream (award_tickets keys on
+                        # discord_id), so requiring it dropped every Howl viewer
+                        # who verified by UID without a Kick account — a state the
+                        # Howl panel creates by design. `raffle_tickets.kick_name`
+                        # is NOT NULL, so fall back to the wager username.
+                        if discord_id and new_tickets > 0:
                             tickets_to_award.append(
                                 {
                                     "discord_id": discord_id,
-                                    "kick_name": kick_name,
+                                    "kick_name": kick_name or shuffle_username,
                                     "tickets": new_tickets,
-                                    "description": f"{self.platform_name.capitalize()} wager: ${wager_delta:.2f} (${last_known_wager:.2f} → ${current_wager:.2f})",
+                                    "description": (
+                                        f"{self.platform_name.capitalize()} wager: ${converted:.2f} "
+                                        f"(${paid_through:.2f} → ${new_paid_through:.2f})"
+                                    ),
                                     "period_id": period_id,
                                     "shuffle_username": shuffle_username,
-                                    "wager_delta": wager_delta,
+                                    "wager_delta": converted,
                                     "current_wager": current_wager,
                                 }
                             )
 
-                            # Update wager tracking (will commit with transaction)
-                            conn.execute(
-                                text(
-                                    """
-                                UPDATE raffle_shuffle_wagers
-                                SET
-                                    last_known_wager = :current_wager,
-                                    total_wager_usd = :current_wager,
-                                    tickets_awarded = tickets_awarded + :new_tickets,
-                                    last_checked = CURRENT_TIMESTAMP,
-                                    last_updated = CURRENT_TIMESTAMP
-                                WHERE period_id = :period_id AND shuffle_username = :username
-                                  AND platform = :platform
-                            """
-                                ),
-                                {
-                                    "period_id": period_id,
-                                    "username": shuffle_username,
-                                    "current_wager": current_wager,
-                                    "new_tickets": new_tickets,
-                                    "platform": self.platform_name,
-                                },
-                            )
-                            self._record_wager_history(conn, shuffle_username, current_wager, wager_delta)
-                        else:
-                            # User exists but not linked - just update wager
-                            conn.execute(
-                                text(
-                                    """
-                                UPDATE raffle_shuffle_wagers
-                                SET
-                                    last_known_wager = :current_wager,
-                                    total_wager_usd = :current_wager,
-                                    last_checked = CURRENT_TIMESTAMP,
-                                    last_updated = CURRENT_TIMESTAMP
-                                WHERE period_id = :period_id AND shuffle_username = :username
-                                  AND platform = :platform
-                            """
-                                ),
-                                {
-                                    "period_id": period_id,
-                                    "username": shuffle_username,
-                                    "current_wager": current_wager,
-                                    "platform": self.platform_name,
-                                },
-                            )
-                            self._record_wager_history(conn, shuffle_username, current_wager, wager_delta)
-                    else:
-                        # New user - check if they're linked (scoped to THIS platform
-                        # so a shuffle link can't match a howl wager username or vice-versa)
-                        link_result = conn.execute(
+                        conn.execute(
                             text(
                                 """
-                            SELECT discord_id, kick_name FROM raffle_shuffle_links
-                            WHERE shuffle_username = :username AND verified = TRUE
+                            UPDATE raffle_shuffle_wagers
+                            SET
+                                last_known_wager = :paid_through,
+                                total_wager_usd = :current_wager,
+                                tickets_awarded = tickets_awarded + :new_tickets,
+                                discord_id = COALESCE(discord_id, :discord_id),
+                                kick_name = COALESCE(kick_name, :kick_name),
+                                last_checked = CURRENT_TIMESTAMP,
+                                last_updated = CURRENT_TIMESTAMP
+                            WHERE period_id = :period_id AND shuffle_username = :username
                               AND platform = :platform
                         """
                             ),
-                            {"username": shuffle_username, "platform": self.platform_name},
+                            {
+                                "period_id": period_id,
+                                "username": shuffle_username,
+                                "current_wager": current_wager,
+                                "paid_through": new_paid_through,
+                                # Only count tickets actually queued for award.
+                                "new_tickets": new_tickets if discord_id else 0,
+                                "discord_id": discord_id,
+                                "kick_name": kick_name,
+                                "platform": self.platform_name,
+                            },
                         )
 
-                        link_row = link_result.fetchone()
-                        discord_id = link_row[0] if link_row else None
-                        kick_name = link_row[1] if link_row else None
+                        # History records OBSERVED movement, so the leaderboard
+                        # still counts every dollar once even though the ticket
+                        # baseline now lags behind the reported total.
+                        if observed_delta > 0:
+                            self._record_wager_history(conn, shuffle_username, current_wager, observed_delta)
+                    else:
+                        # New user - check if they're linked (scoped to THIS platform
+                        # so a shuffle link can't match a howl wager username or vice-versa)
+                        linked = links.get(str(shuffle_username).lower())
+                        discord_id = linked[0] if linked else None
+                        kick_name = linked[1] if linked else None
 
                         # Create wager tracking entry
                         # Set last_known_wager = total_wager so only FUTURE wagers earn tickets
