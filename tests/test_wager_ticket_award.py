@@ -75,6 +75,30 @@ def test_no_movement_is_skipped():
     assert award.tickets == 0
 
 
+def test_sub_cent_storage_residue_is_not_mistaken_for_a_rollover():
+    """Regression: the columns are DECIMAL(15,2) but the API is high-precision.
+
+    Postgres ROUNDS on write, so a stored total reads back slightly ABOVE the
+    figure the API keeps returning for an idle viewer. Comparing raw floats made
+    every poll look like a decrease — which fired the rollover branch forever,
+    awarding nothing, writing no history, and spamming the log once per user per
+    poll. Values taken from the production log line that caught it.
+    """
+    stored = 87696.87  # what DECIMAL(15,2) read back
+    from_api = 87696.8654  # what the API actually reports, unchanged
+
+    assert from_api < stored  # the raw comparison that caused it
+
+    award = compute_wager_award(stored, stored, from_api, RATE)
+    assert award.action == "skip"
+    assert award.tickets == 0
+
+
+def test_a_real_one_cent_drop_still_counts_as_a_rollover():
+    award = compute_wager_award(100.00, 100.00, 99.99, RATE)
+    assert award.action == "rollover"
+
+
 def test_window_rollover_reanchors_instead_of_stranding_the_watermark():
     """Howl's date-windowed total drops when the window moves.
 

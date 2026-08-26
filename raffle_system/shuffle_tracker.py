@@ -59,14 +59,21 @@ def compute_wager_award(paid_through, prev_total, current_wager, tickets_per_100
     rate = tickets_per_1000 if tickets_per_1000 and tickets_per_1000 > 0 else 20
     dollars_per_ticket = 1000.0 / rate
 
-    if current_wager < prev_total:
-        return WagerAward("rollover", 0, 0.0, round(current_wager, 2), 0.0)
-
-    # The API returns a high-precision float while the columns are DECIMAL(15,2),
-    # so round to cents; otherwise a sub-cent residue reads as movement on every
-    # poll and writes a phantom $0.00 history row per user.
+    # EVERY comparison here is at cent precision, and that is load-bearing.
+    #
+    # The API reports a high-precision float (87696.8654) but the columns are
+    # DECIMAL(15,2), so Postgres ROUNDS on write and reads back 87696.87 — a
+    # value strictly GREATER than what the API keeps returning. Comparing the
+    # raw float against the stored one therefore makes an idle viewer look like
+    # they lost money on every single poll. Rounding the difference to cents
+    # first collapses that residue to -0.0, which is not negative.
     observed_delta = round(current_wager - prev_total, 2)
     unpaid = round(current_wager - paid_through, 2)
+
+    # A drop of at least a full cent is a real decrease: the platform's
+    # reporting window moved (Howl serves a date-windowed total). Re-anchor.
+    if observed_delta < 0:
+        return WagerAward("rollover", 0, 0.0, round(current_wager, 2), observed_delta)
 
     tickets = int(unpaid / dollars_per_ticket) if unpaid > 0 else 0
     converted = round(tickets * dollars_per_ticket, 2)
