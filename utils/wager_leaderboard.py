@@ -52,6 +52,27 @@ def add_months(dt: datetime, months: int, *, keep_month_end: bool = False) -> da
     return dt.replace(year=year, month=month, day=day)
 
 
+def snap_to_midnight(dt: datetime) -> datetime:
+    """Pin a period bound to the NEAREST 00:00 UTC.
+
+    Leaderboard windows are configured with date pickers only, so a bound with a
+    time of day is always a legacy artifact — historically local midnight stored
+    through `new Date(y, m, d).toISOString()`, which lands on 22:00 the previous
+    day for a UTC+2 admin. `next_period_window` preserves time-of-day by design,
+    so without this an inherited offset is re-created on every renewal forever.
+
+    NEAREST rather than floor: a rollover boundary is the previous period's end,
+    and flooring 22:00 back to 00:00 would make the new window OVERLAP the one
+    that just closed, double-counting 22 hours of wagering. Rounding up moves the
+    boundary forward at most 12 hours instead, which can only ever leave a gap.
+    """
+    floor = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    if dt == floor:
+        return dt
+    midpoint = floor + timedelta(hours=12)
+    return floor if dt < midpoint else floor + timedelta(days=1)
+
+
 def next_period_window(start: datetime, end: datetime):
     """The next back-to-back window for an auto-renewing leaderboard period.
 
@@ -78,13 +99,18 @@ def next_period_window(start: datetime, end: datetime):
         for keep_month_end in anchors:
             boundary = add_months(start, months, keep_month_end=keep_month_end)
             if boundary == end:
-                return end, add_months(end, months, keep_month_end=keep_month_end)
+                new_start = snap_to_midnight(end)
+                return new_start, snap_to_midnight(add_months(end, months, keep_month_end=keep_month_end))
             if boundary - _ONE_SECOND == end:
                 # Inclusive end: the window stops one second before the boundary,
                 # so the next starts on it (and stops a second before the next).
-                new_start = end + _ONE_SECOND
-                return new_start, add_months(new_start, months, keep_month_end=keep_month_end) - _ONE_SECOND
-    return end, end + (end - start)
+                new_start = snap_to_midnight(end + _ONE_SECOND)
+                new_end = add_months(new_start, months, keep_month_end=keep_month_end)
+                return new_start, snap_to_midnight(new_end) - _ONE_SECOND
+    # Non-calendar window (a 7-day sprint and the like): keep its exact duration,
+    # which is already what such a board wants, but still start it on a midnight.
+    new_start = snap_to_midnight(end)
+    return new_start, new_start + (end - start)
 
 
 def is_http_url(value) -> bool:

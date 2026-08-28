@@ -1758,6 +1758,15 @@ try:
         # the periodic backfill loop (update_discord_usernames_task).
         conn.execute(text("ALTER TABLE links ADD COLUMN IF NOT EXISTS discord_username TEXT"))
 
+        # Mirror of the dashboard's shuffle_wager_history migration (app.py):
+        # the two Railway services deploy independently and either may boot
+        # first, so the column is added in BOTH repos. Holds the RTP-WEIGHTED
+        # running total beside the raw one, which is what makes a period baseline
+        # reconstructable for any past instant — see _record_wager_history.
+        conn.execute(
+            text("ALTER TABLE shuffle_wager_history ADD COLUMN IF NOT EXISTS weighted_total_usd NUMERIC(15, 2)")
+        )
+
         # Create pending_links table
         conn.execute(
             text(

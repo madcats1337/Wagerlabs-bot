@@ -256,7 +256,7 @@ class ShuffleWagerTracker:
         codes_str = f"{len(codes)} codes" if len(codes) > 1 else self.campaign_code
         logger.debug(f"[Shuffle Tracker] 🔄 Settings refreshed - URL: {bool(self.affiliate_url)}, Codes: {codes_str}")
 
-    def _record_wager_history(self, conn, shuffle_username, total_wager_usd, wager_delta):
+    def _record_wager_history(self, conn, shuffle_username, total_wager_usd, wager_delta, weighted_total_usd=None):
         """Append a row to shuffle_wager_history for the dashboard leaderboard.
 
         Only called when the tracker has detected a positive wager increase
@@ -270,6 +270,15 @@ class ShuffleWagerTracker:
           - wager_delta     : how much they wagered since the previous
                               observation. The leaderboard sums this column
                               across rows in [start, end) for each user.
+          - weighted_total_usd : the RTP-WEIGHTED running total at this same
+                              observation. The board ranks on the weighted
+                              figure, but it used to exist only as a live
+                              snapshot in `shuffle_wager_totals` — so once a
+                              period baseline was captured at the wrong moment
+                              there was no way to recompute what it should have
+                              been. Recording it makes a baseline reconstructable
+                              for any instant. None when the platform reports no
+                              weighted figure.
 
         Wrapped in a nested transaction (SAVEPOINT) so an error here doesn't
         poison the surrounding wager-update transaction.
@@ -287,9 +296,10 @@ class ShuffleWagerTracker:
                     text(
                         """
                         INSERT INTO shuffle_wager_history
-                            (discord_server_id, shuffle_username, total_wager_usd, wager_delta)
+                            (discord_server_id, shuffle_username, total_wager_usd,
+                             wager_delta, weighted_total_usd)
                         VALUES
-                            (:server_id, :username, :total, :delta)
+                            (:server_id, :username, :total, :delta, :weighted)
                         """
                     ),
                     {
@@ -297,6 +307,7 @@ class ShuffleWagerTracker:
                         "username": shuffle_username,
                         "total": total_wager_usd,
                         "delta": wager_delta,
+                        "weighted": weighted_total_usd,
                     },
                 )
         except Exception as e:
@@ -719,7 +730,13 @@ class ShuffleWagerTracker:
                         # still counts every dollar once even though the ticket
                         # baseline now lags behind the reported total.
                         if observed_delta > 0:
-                            self._record_wager_history(conn, shuffle_username, current_wager, observed_delta)
+                            try:
+                                weighted_now = round(float(user_data.get("weightedWagerAmount") or 0), 2)
+                            except (TypeError, ValueError):
+                                weighted_now = None
+                            self._record_wager_history(
+                                conn, shuffle_username, current_wager, observed_delta, weighted_now
+                            )
                     else:
                         # New user - check if they're linked (scoped to THIS platform
                         # so a shuffle link can't match a howl wager username or vice-versa)
