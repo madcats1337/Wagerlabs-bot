@@ -1767,6 +1767,25 @@ try:
             text("ALTER TABLE shuffle_wager_history ADD COLUMN IF NOT EXISTS weighted_total_usd NUMERIC(15, 2)")
         )
 
+        # Mirror of the dashboard's wager_leaderboard_totals migration (app.py).
+        # Holds the per-period WINDOWED totals the shuffle tracker polls with
+        # startTime/endTime, which replace the baseline model for Shuffle.
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS wager_leaderboard_totals (
+                    period_id INTEGER NOT NULL
+                        REFERENCES wager_leaderboard_periods(id) ON DELETE CASCADE,
+                    shuffle_username TEXT NOT NULL,
+                    weighted_wager_usd NUMERIC(15, 2) NOT NULL DEFAULT 0,
+                    raw_wager_usd NUMERIC(15, 2) NOT NULL DEFAULT 0,
+                    last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (period_id, shuffle_username)
+                );
+                """
+            )
+        )
+
         # Create pending_links table
         conn.execute(
             text(
@@ -6284,11 +6303,42 @@ def _shuffle_baseline_rows(conn, period_id, server_id, winner_count):
     return period_leaderboard_rows(totals, identity, baselines, winner_count)
 
 
+def _shuffle_windowed_rows(conn, period_id, server_id, winner_count):
+    """Top-N shuffle rows from the WINDOWED totals the tracker polled, or None.
+
+    Same tuple shape as _shuffle_baseline_rows: (username, kick_name,
+    discord_id, is_linked, wagered_usd). Returns None when the period has no
+    windowed rows, so the caller falls back to the baseline model.
+    """
+    rows = conn.execute(
+        text(
+            """
+            SELECT t.shuffle_username,
+                   i.kick_name,
+                   i.discord_id,
+                   (i.discord_id IS NOT NULL) AS is_linked,
+                   t.weighted_wager_usd
+            FROM wager_leaderboard_totals t
+            LEFT JOIN shuffle_wager_totals i
+                   ON i.discord_server_id = :sid
+                  AND i.platform = 'shuffle'
+                  AND LOWER(i.shuffle_username) = LOWER(t.shuffle_username)
+            WHERE t.period_id = :pid
+            ORDER BY t.weighted_wager_usd DESC
+            LIMIT :lim
+            """
+        ),
+        {"sid": server_id, "pid": period_id, "lim": winner_count or 10},
+    ).fetchall()
+    return rows or None
+
+
 def _freeze_leaderboard_snapshot(conn, period_id, server_id, start_dt, end_dt, winner_count, site="shuffle"):
     """Write the frozen top-N winners for a period (SQLAlchemy connection).
 
     - Howl: query the Howl affiliate API directly for [start, end).
-    - Shuffle: the baseline model (current lifetime total - period baseline).
+    - Shuffle: the windowed totals polled for [start, end); the baseline model
+      only as a fallback for periods that predate windowed polling.
     """
     conn.execute(
         text("DELETE FROM wager_leaderboard_winners WHERE period_id = :pid"),
@@ -6298,7 +6348,12 @@ def _freeze_leaderboard_snapshot(conn, period_id, server_id, start_dt, end_dt, w
     if (site or "shuffle").lower() == "howl":
         rows = _fetch_howl_freeze_rows(conn, server_id, start_dt, end_dt, winner_count)
     else:
-        rows = _shuffle_baseline_rows(conn, period_id, server_id, winner_count)
+        # Prefer the windowed totals polled with startTime/endTime — the exact
+        # figure for this period. Fall back to the baseline model for periods
+        # that predate windowed polling, so old periods still freeze correctly.
+        rows = _shuffle_windowed_rows(conn, period_id, server_id, winner_count)
+        if rows is None:
+            rows = _shuffle_baseline_rows(conn, period_id, server_id, winner_count)
 
     prizes = {
         r[0]: r[1]

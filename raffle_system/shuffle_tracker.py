@@ -12,7 +12,7 @@ import asyncio
 import logging
 import os
 from collections import namedtuple
-from datetime import datetime
+from datetime import datetime, timezone
 
 import aiohttp
 from sqlalchemy import text
@@ -498,6 +498,119 @@ class ShuffleWagerTracker:
                 f"server={self.server_id}: {type(e).__name__}: {e}"
             )
 
+    def _active_leaderboard_window(self):
+        """(period_id, start_epoch, end_epoch) for this server's active SHUFFLE
+        leaderboard period, or None.
+
+        Howl periods are excluded: the Howl path already queries its own date
+        window, and the dashboard reads Howl standings straight from its API.
+        """
+        if self.platform_name == "howl" or not self.server_id:
+            return None
+        try:
+            with self.engine.begin() as conn:
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT id, start_date, end_date
+                        FROM wager_leaderboard_periods
+                        WHERE discord_server_id = :sid
+                          AND status = 'active'
+                          AND LOWER(COALESCE(site, 'shuffle')) <> 'howl'
+                        ORDER BY start_date DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"sid": self.server_id},
+                ).fetchone()
+        except Exception as e:
+            logger.info(f"[Shuffle Tracker] leaderboard window lookup failed: {e}")
+            return None
+        if not row:
+            return None
+        pid, start, end = row[0], row[1], row[2]
+        if not start or not end or end <= start:
+            return None
+        # The columns are naive UTC; stamp the zone before converting so the
+        # epochs don't silently pick up the host's offset.
+        return (
+            pid,
+            int(start.replace(tzinfo=timezone.utc).timestamp()),
+            int(end.replace(tzinfo=timezone.utc).timestamp()),
+        )
+
+    async def sync_leaderboard_window(self):
+        """Refresh the active period's WINDOWED totals from the affiliate API.
+
+        This replaces the baseline model for Shuffle. Rather than storing a
+        lifetime total and subtracting an anchor snapshotted at period start —
+        which silently mis-states every standing if that anchor is captured at
+        the wrong moment, and cannot be recomputed afterwards — we ask Shuffle
+        for the period window directly and store what it returns.
+
+        Deliberately a SECOND request rather than reusing the main poll's data:
+        raffle ticket awards depend on the RAW LIFETIME total being monotonic
+        (`last_known_wager` deltas plus rollover handling), and a windowed figure
+        resets at every period boundary. Pointing the main poll at a window would
+        break ticket accrual, so the two stay separate and this one only runs
+        while a leaderboard period is actually active.
+
+        Failures are non-fatal: the previous rows stay, and the dashboard falls
+        back to the baseline model when a period has no rows at all.
+        """
+        window = self._active_leaderboard_window()
+        if not window:
+            return {"status": "no_active_period"}
+        period_id, start_epoch, end_epoch = window
+
+        rows = await self._fetch_shuffle_data(window=(start_epoch, end_epoch))
+        if not rows:
+            # _fetch_shuffle_data already logged the reason at the right level.
+            return {"status": "fetch_failed"}
+
+        codes = [c.strip().lower() for c in (self.campaign_code or "").split(",") if c.strip()]
+        if codes:
+            rows = [r for r in rows if str(r.get("campaignCode", "")).lower() in codes]
+        if not rows:
+            logger.debug("[Shuffle Tracker] windowed poll returned no qualifying users")
+            return {"status": "no_users"}
+
+        stored = 0
+        try:
+            with self.engine.begin() as conn:
+                for r in rows:
+                    username = r.get("username")
+                    if not username:
+                        continue
+                    try:
+                        weighted = round(float(r.get("weightedWagerAmount", 0) or 0), 2)
+                        raw = round(float(r.get("wagerAmount", 0) or 0), 2)
+                    except (TypeError, ValueError):
+                        continue
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO wager_leaderboard_totals
+                                (period_id, shuffle_username, weighted_wager_usd,
+                                 raw_wager_usd, last_updated)
+                            VALUES (:pid, :username, :weighted, :raw, CURRENT_TIMESTAMP)
+                            ON CONFLICT (period_id, shuffle_username)
+                            DO UPDATE SET
+                                weighted_wager_usd = EXCLUDED.weighted_wager_usd,
+                                raw_wager_usd = EXCLUDED.raw_wager_usd,
+                                last_updated = CURRENT_TIMESTAMP
+                            """
+                        ),
+                        {"pid": period_id, "username": username, "weighted": weighted, "raw": raw},
+                    )
+                    stored += 1
+        except Exception as e:
+            logger.warning(f"[Shuffle Tracker] windowed totals upsert failed for period {period_id}: {e}")
+            return {"status": "store_failed"}
+
+        logger.debug(f"[Shuffle Tracker] stored {stored} windowed totals for leaderboard period {period_id}")
+        return {"status": "ok", "stored": stored, "period_id": period_id}
+
     async def update_shuffle_wagers(self):
         """
         Poll gambling platform affiliate API and update wager tracking
@@ -559,6 +672,15 @@ class ShuffleWagerTracker:
 
             # Always refresh the period-independent leaderboard totals.
             self._store_lifetime_totals(filtered_data)
+
+            # Then refresh the active leaderboard period's WINDOWED totals — a
+            # separate request, because this one is scoped to the period and the
+            # lifetime figures above are what raffle tickets accrue against.
+            # Non-fatal: a failure here must never abort ticket awarding.
+            try:
+                await self.sync_leaderboard_window()
+            except Exception as e:
+                logger.info(f"[Shuffle Tracker] leaderboard window sync failed: {e}")
 
             # Raffle ticket awarding requires an active raffle period. With no
             # period we've still stored the leaderboard totals above, so just stop
@@ -926,9 +1048,17 @@ class ShuffleWagerTracker:
             normalized.append(row)
         return normalized
 
-    async def _fetch_shuffle_data(self):
+    async def _fetch_shuffle_data(self, window=None):
         """
         Fetch wager data from the active platform's affiliate API and normalize it.
+
+        `window` is an optional (start_epoch, end_epoch) pair in UNIX SECONDS.
+        Shuffle's affiliate endpoint accepts startTime/endTime and then reports
+        each referee's totals for exactly that range, which is what the
+        leaderboard wants — no baseline subtraction, nothing to anchor wrongly.
+        Milliseconds are rejected with INVALID_DATE, so callers must pass seconds.
+
+        Ignored for Howl, which already builds its own date window below.
 
         Returns:
             list: Array of normalized user wager objects, or None on failure.
@@ -964,6 +1094,8 @@ class ShuffleWagerTracker:
             # /stats/<id> URL). It returns both raw `wagerAmount` (drives tickets)
             # and `weightedWagerAmount` (RTP-weighted, drives the leaderboard).
             fetch_url = self._shuffle_wager_url(self.affiliate_url)
+            if window:
+                params = {"startTime": str(int(window[0])), "endTime": str(int(window[1]))}
 
         try:
             async with aiohttp.ClientSession() as session:
