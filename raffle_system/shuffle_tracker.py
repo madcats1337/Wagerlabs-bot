@@ -95,6 +95,9 @@ class ShuffleWagerTracker:
 
     def __init__(self, engine, bot_settings=None, server_id=None):
         self.engine = engine
+        # Poll alternation + failure counter (see sync_leaderboard_window).
+        self._poll_cycle = 0
+        self._window_sync_failures = 0
         self.server_id = server_id
         self.ticket_manager = TicketManager(engine, server_id=server_id)
         self.bot_settings = bot_settings
@@ -122,6 +125,15 @@ class ShuffleWagerTracker:
 
     # Default howl affiliate leaderboard endpoint (overridable per-server).
     HOWL_DEFAULT_LB_URL = "https://howl.gg/api/user/affiliate/lb"
+
+    # Shuffle rate-limits per-affiliate HARD: two requests issued back to back
+    # get the second rejected with TOO_MANY_REQUEST every time (verified against
+    # the live endpoint — it is why the windowed poll silently failed on every
+    # cycle). So a poll makes exactly ONE request and alternates what it asks
+    # for: the lifetime totals that tickets and the baseline model need, then
+    # the windowed totals the leaderboard needs. Each therefore refreshes every
+    # other cycle rather than racing on every cycle.
+    LEADERBOARD_SYNC_EVERY_N_POLLS = 2
 
     @staticmethod
     def _shuffle_wager_url(affiliate_url):
@@ -565,8 +577,19 @@ class ShuffleWagerTracker:
 
         rows = await self._fetch_shuffle_data(window=(start_epoch, end_epoch))
         if not rows:
-            # _fetch_shuffle_data already logged the reason at the right level.
+            # Repeated failure is worth surfacing: the dashboard falls back to
+            # the baseline model once these rows go stale, so the board stays
+            # live, but the windowed figures stop tracking until this recovers.
+            self._window_sync_failures += 1
+            if self._window_sync_failures in (3, 10) or self._window_sync_failures % 30 == 0:
+                logger.warning(
+                    f"[Shuffle Tracker] windowed leaderboard poll has failed "
+                    f"{self._window_sync_failures} times in a row for period {period_id}; "
+                    f"standings fall back to the baseline model until it recovers"
+                )
             return {"status": "fetch_failed"}
+
+        self._window_sync_failures = 0
 
         codes = [c.strip().lower() for c in (self.campaign_code or "").split(",") if c.strip()]
         if codes:
@@ -622,6 +645,23 @@ class ShuffleWagerTracker:
             dict: Summary of updates performed
         """
         try:
+            # ONE request per poll (see LEADERBOARD_SYNC_EVERY_N_POLLS): spend
+            # this cycle on the windowed leaderboard totals instead of the
+            # lifetime ones, then return. Skipping a lifetime poll costs nothing
+            # — the totals are cumulative, so the next one's delta includes
+            # everything wagered meanwhile, exactly as during any missed poll.
+            self._poll_cycle += 1
+            if self._poll_cycle % self.LEADERBOARD_SYNC_EVERY_N_POLLS == 0:
+                try:
+                    result = await self.sync_leaderboard_window()
+                except Exception as e:
+                    logger.info(f"[Shuffle Tracker] leaderboard window sync failed: {e}")
+                    result = {"status": "error"}
+                # Nothing to sync (no active period / not shuffle) — don't waste
+                # the cycle; fall through and do the lifetime poll instead.
+                if result.get("status") != "no_active_period":
+                    return {"status": "leaderboard_window", "updates": 0, "window": result}
+
             # Fetch current wager data from the platform FIRST. The lifetime
             # totals feed the dashboard's Tier-4 wager leaderboard, which is
             # independent of raffles — so we store totals on every poll even when
@@ -672,15 +712,6 @@ class ShuffleWagerTracker:
 
             # Always refresh the period-independent leaderboard totals.
             self._store_lifetime_totals(filtered_data)
-
-            # Then refresh the active leaderboard period's WINDOWED totals — a
-            # separate request, because this one is scoped to the period and the
-            # lifetime figures above are what raffle tickets accrue against.
-            # Non-fatal: a failure here must never abort ticket awarding.
-            try:
-                await self.sync_leaderboard_window()
-            except Exception as e:
-                logger.info(f"[Shuffle Tracker] leaderboard window sync failed: {e}")
 
             # Raffle ticket awarding requires an active raffle period. With no
             # period we've still stored the leaderboard totals above, so just stop
