@@ -40,6 +40,9 @@ TIER3 = TIER2 + [
     # Running more than one stream platform (Kick + Twitch) at once. Mirror of
     # Admin-Dashboard/utils/tiers.py.
     "multi_platform",
+    # Key-authenticated public REST API (/api/v1/*) over points, shop, bonus hunt
+    # and tournament. Mirror of Admin-Dashboard/utils/tiers.py.
+    "public_api",
 ]
 TIER4 = TIER3 + [
     # Public affiliate leaderboard page generator. Mirror of

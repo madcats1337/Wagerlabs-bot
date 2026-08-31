@@ -1510,6 +1510,11 @@ def handle_user_linking_callback(code, code_verifier, state, discord_id, created
             return redirect_oauth_error("Wagerlabs could not read your Kick username. Please try again.")
 
         kick_username = kick_user["username"]
+        # Kick's IMMUTABLE user id. get_kick_user_info already returns it; it is the
+        # safe join key for anything resolving to a points balance, because the
+        # handle above can be renamed or recycled onto a different person.
+        kick_user_id = kick_user.get("id")
+        kick_user_id = str(kick_user_id) if kick_user_id is not None else None
         logger.info(f"👤 Kick username: {kick_username}")
 
         # Must be bound before the check below: the "already linked" branch is the
@@ -1522,9 +1527,24 @@ def handle_user_linking_callback(code, code_verifier, state, discord_id, created
         # engine.begin(): the FAILED notification is a write, and a connect()
         # block rolls back on exit, so the row never reached the bot.
         with engine.begin() as conn:
+            # Match on the handle OR the immutable id: a viewer who renamed their
+            # Kick account would otherwise pass the handle check and then collide
+            # on links_platform_user_id_server_unique as a raw IntegrityError.
             existing = conn.execute(
-                text("SELECT discord_id FROM links WHERE kick_name = :k AND discord_server_id = :gid"),
-                {"k": kick_username.lower(), "gid": guild_id},
+                text(
+                    """
+                    SELECT discord_id FROM links
+                    WHERE discord_server_id = :gid
+                      AND (
+                            kick_name = :k
+                            OR (:puid IS NOT NULL
+                                AND platform_user_id = :puid
+                                AND COALESCE(platform, 'kick') = 'kick')
+                          )
+                    LIMIT 1
+                    """
+                ),
+                {"k": kick_username.lower(), "gid": guild_id, "puid": kick_user_id},
             ).fetchone()
 
             if existing and existing[0] != discord_id:
@@ -1555,13 +1575,15 @@ def handle_user_linking_callback(code, code_verifier, state, discord_id, created
                 conn.execute(
                     text(
                         """
-                    INSERT INTO links (discord_id, kick_name, discord_server_id, platform)
-                    VALUES (:d, :k, :gid, 'kick')
+                    INSERT INTO links (discord_id, kick_name, discord_server_id, platform, platform_user_id)
+                    VALUES (:d, :k, :gid, 'kick', :puid)
                     ON CONFLICT(discord_id, discord_server_id, platform) DO UPDATE
-                    SET kick_name = excluded.kick_name, linked_at = CURRENT_TIMESTAMP
+                    SET kick_name = excluded.kick_name,
+                        platform_user_id = COALESCE(excluded.platform_user_id, links.platform_user_id),
+                        linked_at = CURRENT_TIMESTAMP
                 """
                     ),
-                    {"d": discord_id, "k": kick_username.lower(), "gid": guild_id},
+                    {"d": discord_id, "k": kick_username.lower(), "gid": guild_id, "puid": kick_user_id},
                 )
             except Exception as insert_error:
                 # If composite key doesn't exist yet (old schema), try alternative approach
@@ -1591,11 +1613,11 @@ def handle_user_linking_callback(code, code_verifier, state, discord_id, created
                     conn.execute(
                         text(
                             """
-                        INSERT INTO links (discord_id, kick_name, discord_server_id, platform, linked_at)
-                        VALUES (:d, :k, :gid, 'kick', CURRENT_TIMESTAMP)
+                        INSERT INTO links (discord_id, kick_name, discord_server_id, platform, platform_user_id, linked_at)
+                        VALUES (:d, :k, :gid, 'kick', :puid, CURRENT_TIMESTAMP)
                     """
                         ),
-                        {"d": discord_id, "k": kick_username.lower(), "gid": guild_id},
+                        {"d": discord_id, "k": kick_username.lower(), "gid": guild_id, "puid": kick_user_id},
                     )
                 else:
                     raise
@@ -1774,9 +1796,14 @@ def auth_twitch_link_callback():
             timeout=10,
         )
         twitch_login = None
+        twitch_user_id = None
         if user_resp.status_code == 200:
             udata = (user_resp.json().get("data") or [{}])[0]
             twitch_login = udata.get("login")
+            # Twitch's IMMUTABLE user id, already present in this helix/users
+            # response. `login` can be renamed or recycled; the id cannot.
+            twitch_user_id = udata.get("id")
+            twitch_user_id = str(twitch_user_id) if twitch_user_id is not None else None
         if not twitch_login:
             return redirect_oauth_error(
                 "Wagerlabs could not read your Twitch username. Please try again.",
@@ -1786,7 +1813,14 @@ def auth_twitch_link_callback():
         # Create/update the link (platform='twitch') + notify the bot to grant the role.
         from core.stream_links import upsert_link
 
-        upsert_link(engine, discord_id, twitch_login, guild_id, platform="twitch")
+        upsert_link(
+            engine,
+            discord_id,
+            twitch_login,
+            guild_id,
+            platform="twitch",
+            platform_user_id=twitch_user_id,
+        )
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM oauth_states WHERE state = :s"), {"s": state})
             conn.execute(

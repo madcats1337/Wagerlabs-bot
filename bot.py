@@ -106,6 +106,7 @@ from raffle_system.database import (
 from raffle_system.gifted_sub_tracker import setup_gifted_sub_handler
 from raffle_system.migrations.add_commit_reveal_to_periods import migrate_add_commit_reveal_to_periods
 from raffle_system.migrations.add_platform_to_links import migrate_add_platform_to_links
+from raffle_system.migrations.add_platform_user_id_to_links import migrate_add_platform_user_id_to_links
 from raffle_system.migrations.add_provably_fair_to_draws import migrate_add_provably_fair_to_draws
 from raffle_system.migrations.platform_scope_raffle_constraints import migrate_platform_scope_raffle_constraints
 from raffle_system.scheduler import setup_raffle_scheduler
@@ -861,6 +862,17 @@ class KickWebSocketManager:
 
             # Debug: Log every incoming message
             logger.info(f"💬 Received {platform} message: {username}: {content[:100]}")
+
+            # Opportunistically stamp this chatter's IMMUTABLE platform id onto their
+            # links row if it predates the platform_user_id column. Costs at most one
+            # UPDATE per viewer per process (see backfill_platform_user_id), never a
+            # write per message, and can never raise into chat handling.
+            try:
+                from core.stream_links import backfill_platform_user_id, extract_chat_platform_user_id
+
+                backfill_platform_user_id(engine, guild_id, platform, username, extract_chat_platform_user_id(msg))
+            except Exception:
+                pass
 
             # Update watchtime tracking (per-guild)
             now = datetime.now(timezone.utc)
@@ -9717,6 +9729,9 @@ async def on_ready():
             migrate_platform_scope_raffle_constraints(engine)
             # Stream-link platform scoping (Kick + Twitch per Discord user per server)
             migrate_add_platform_to_links(engine)
+            # Immutable per-platform viewer id (Kick user_id / Twitch id). Must run
+            # AFTER add_platform_to_links — its unique index includes `platform`.
+            migrate_add_platform_user_id_to_links(engine)
             migrate_add_provably_fair_to_draws(engine)
             # Commit-reveal columns (raffle_periods seed/commitment + draw commitment).
             # After add_provably_fair_to_draws so raffle_draws already has its base PF columns.
