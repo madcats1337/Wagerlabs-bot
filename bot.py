@@ -9300,6 +9300,97 @@ async def refresh_standalone_chat(sid: int) -> None:
     await ensure_standalone_chat_runtime(sid, server_name, kick_channel)
 
 
+# -------------------------
+# Gateway watchdog
+# -------------------------
+# Discord hands out a region-specific `resume_gateway_url` on READY, and discord.py
+# 2.7.0 re-pins it on EVERY reconnect attempt:
+#     ws_params.update(sequence=..., gateway=self.ws.gateway, resume=True, ...)
+# (discord/client.py:784; the resume URL is written to ws.gateway at gateway.py:578).
+# `self.ws` is never reassigned when the handshake itself raises, so once that one
+# regional node starts refusing connections the bot retries the SAME dead host
+# forever, on a backoff that caps around 17 minutes. It cannot self-heal.
+#
+# Seen in production 2026-09-01: gateway-us-east-1a.discord.gg returned 503 while
+# gateway.discord.gg was healthy (verified from an unrelated network, so not an
+# egress-IP block and not a Discord-wide outage). Slash commands were dead ~13
+# minutes while Kick chat, watchtime and wager tracking all kept running — which is
+# exactly why nothing else noticed and why a human had to spot it.
+#
+# Exiting is the whole fix: combined_server.py polls this subprocess every 5s and
+# respawns it, and a fresh boot re-does GET /gateway/bot -> wss://gateway.discord.gg
+# with a new IDENTIFY. Gunicorn and the OAuth/webhook server are left alone, so this
+# is much cheaper than bouncing the Railway service.
+GATEWAY_WATCHDOG_ENABLED = os.getenv("GATEWAY_WATCHDOG_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+# Stall budget while pinned to a REGIONAL resume host. Ordinary reconnects and
+# RESUMEs finish in seconds, so minutes here is already pathological.
+GATEWAY_STALL_MINUTES = float(os.getenv("GATEWAY_STALL_MINUTES", "5"))
+# Stall budget while on the DEFAULT gateway. Deliberately much longer: if the main
+# entrypoint is unreachable then a restart cannot help either, so we ride it out
+# instead of burning IDENTIFYs against the session_start_limit in a restart loop.
+GATEWAY_STALL_DEFAULT_MINUTES = float(os.getenv("GATEWAY_STALL_DEFAULT_MINUTES", "30"))
+
+_gateway_last_ok: Optional[float] = None  # time.monotonic() when the socket was last open
+
+
+def _gateway_socket_open() -> bool:
+    """True while the gateway websocket is actually connected."""
+    ws = bot.ws
+    if ws is None:
+        return False
+    try:
+        return bool(ws.open)
+    except AttributeError:
+        # ws.open dereferences ws.socket, which is None while a handshake is in flight.
+        return False
+
+
+def _gateway_host() -> str:
+    """The host discord.py will retry — the regional resume URL once READY has landed."""
+    return str(getattr(bot.ws, "gateway", "") or "")
+
+
+@tasks.loop(seconds=60)
+async def gateway_watchdog_task():
+    """Exit the process if the Discord gateway stays down (see the note above)."""
+    global _gateway_last_ok
+
+    if _gateway_socket_open():
+        _gateway_last_ok = time.monotonic()
+        return
+
+    if _gateway_last_ok is None:
+        # No healthy socket observed yet in this process — start the clock now.
+        _gateway_last_ok = time.monotonic()
+        return
+
+    stalled_min = (time.monotonic() - _gateway_last_ok) / 60
+    host = _gateway_host() or "unknown"
+    on_default = "gateway.discord.gg" in host
+    limit_min = GATEWAY_STALL_DEFAULT_MINUTES if on_default else GATEWAY_STALL_MINUTES
+
+    if stalled_min < limit_min:
+        logger.warning(
+            f"⚠️ Discord gateway disconnected for {stalled_min:.1f}m (host={host}) — "
+            f"will restart the bot process at {limit_min:.0f}m"
+        )
+        return
+
+    logger.error(
+        f"❌ Discord gateway down {stalled_min:.1f}m on {host} — exiting so the supervisor respawns the bot "
+        "with a fresh IDENTIFY against the default gateway"
+    )
+    # os._exit rather than a clean shutdown: a graceful exit has to unwind
+    # discord.py's reconnect loop, which is precisely the thing that is wedged.
+    logging.shutdown()  # flush the line above before the process dies
+    os._exit(1)
+
+
+@gateway_watchdog_task.before_loop
+async def before_gateway_watchdog():
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready():
     # Track bot uptime for health checks
@@ -9698,6 +9789,12 @@ async def on_ready():
         if not leaderboard_sync_task.is_running() and engine:
             leaderboard_sync_task.start()
             logger.debug("✅ Leaderboard sync task started (runs every 2 minutes)")
+
+        # Gateway watchdog: bounce this subprocess if the Discord socket stays down
+        # (discord.py cannot recover from a dead regional resume host on its own).
+        if GATEWAY_WATCHDOG_ENABLED and not gateway_watchdog_task.is_running():
+            gateway_watchdog_task.start()
+            logger.debug(f"✅ Gateway watchdog started (restart after {GATEWAY_STALL_MINUTES:.0f}m stalled)")
 
         # Initialize raffle system — skip cog/command registration on gateway reconnects.
         # (on_ready fires on every reconnect; cog/command re-registration would raise errors.)
