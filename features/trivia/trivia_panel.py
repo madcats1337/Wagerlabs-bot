@@ -86,23 +86,23 @@ def _relative(value) -> str:
     return f"<t:{int(value.timestamp())}:R>"
 
 
-def _duration(seconds) -> str:
-    """A frozen duration as "2m 30s" - used where a live countdown cannot be.
+def _clock(seconds) -> str:
+    """A frozen duration as a clock readout: `2:00`, `0:45`, `1:04:00`.
 
-    A paused event has no deadline to count down to, and an event that has not
-    started yet has only its configured lengths, so those states show a plain
-    duration instead of a `<t:...:R>`.
+    Used wherever a live countdown cannot be - a paused event has no deadline to
+    count down to, and an event that has not started has only its configured
+    lengths. Clock notation rather than "2m 30s" because that is what makes a
+    static value read as a stopped timer instead of as a setting.
     """
     try:
         seconds = max(0, int(seconds))
     except (TypeError, ValueError):
-        return "-"
-    minutes, secs = divmod(seconds, 60)
-    if minutes and secs:
-        return f"{minutes}m {secs}s"
-    if minutes:
-        return f"{minutes}m"
-    return f"{secs}s"
+        return "--:--"
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
 
 def _readout(label: str, value: str) -> str:
@@ -112,8 +112,17 @@ def _readout(label: str, value: str) -> str:
     across a single line, which read as a sentence rather than as a pair of
     instruments; giving each its own caption and sizing the value as a heading
     is what makes a countdown look like a countdown.
+
+    Blocks are joined with a SINGLE newline (see `_stack`) - a `###` heading
+    already carries its own vertical margin in Discord, so a blank line between
+    readouts double-spaces them into a scattered list.
     """
     return f"**{label}**\n### {value}"
+
+
+def _stack(*blocks: str) -> str:
+    """Join readouts tightly, dropping any that are empty."""
+    return "\n".join(block for block in blocks if block)
 
 
 def phase_of(event) -> str:
@@ -193,11 +202,14 @@ class TriviaPanelView(discord.ui.LayoutView):
         #
         # No decorative emojis anywhere - everything a viewer sees below the
         # title comes from what the operator typed.
+        # Every separator is `small`: `large` doubles the gap, and stacked on top
+        # of the margins Discord already gives headings it left the panel airy
+        # to the point of looking unfinished.
         container.add_item(discord.ui.TextDisplay("# Trivia"))
-        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
         container.add_item(discord.ui.TextDisplay(f"**Question**\n{event.get('question') or ''}"))
-        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
         container.add_item(discord.ui.TextDisplay(self._state_block(event, phase)))
 
@@ -230,53 +242,46 @@ class TriviaPanelView(discord.ui.LayoutView):
 
         if winner_id:
             answer = event.get("answer") or ""
-            return "\n\n".join(
-                [
-                    _readout("Winner", f"<@{int(winner_id)}>"),
-                    f"Correct answer: **{answer}**",
-                ]
+            return _stack(
+                _readout("Winner", f"<@{int(winner_id)}>"),
+                f"Correct answer: **{answer}**",
             )
 
         if phase == "idle":
             # Deliberately NO "starts in" readout: nothing has been scheduled
             # until the operator presses START, so a figure here would be a
             # countdown to a moment that does not exist yet.
-            return "\n\n".join(
-                [
-                    "*Starting soon...*",
-                    _readout("Answering window", _duration(event.get("duration_seconds"))),
-                ]
+            return _stack(
+                "*Starting soon...*",
+                _readout("Answering window", _clock(event.get("duration_seconds"))),
             )
 
         if phase == "prep":
             # `<t:...:R>` renders as "in 30 seconds", so the caption omits the
             # preposition - the two lines read "Starts / in 30 seconds".
-            return "\n\n".join(
-                [
-                    _readout("Starts", _relative(event.get("answers_open_at"))),
-                    _readout("Ends", _relative(event.get("ends_at"))),
-                ]
+            return _stack(
+                _readout("Starts", _relative(event.get("answers_open_at"))),
+                _readout("Ends", _relative(event.get("ends_at"))),
             )
 
         if phase == "live":
-            return "\n\n".join(
-                [
-                    "**Answers are open**",
-                    _readout("Ends", _relative(event.get("ends_at"))),
-                ]
+            return _stack(
+                "**Answers are open**",
+                _readout("Ends", _relative(event.get("ends_at"))),
             )
 
         if phase == "paused":
             # Frozen: there is no deadline to count down to, so the readouts
-            # show what was banked at the pause instead of a live timestamp.
-            blocks = ["*Paused*"]
+            # show the banked clock instead of a live timestamp - which is
+            # exactly what a stopped timer should look like.
             prep_left = event.get("prep_remaining_seconds")
-            if prep_left:
-                blocks.append(_readout("Starts", f"in {_duration(prep_left)}"))
-            blocks.append(_readout("Answering window", _duration(event.get("duration_remaining_seconds"))))
-            return "\n\n".join(blocks)
+            return _stack(
+                "*Paused*",
+                _readout("Starts", _clock(prep_left)) if prep_left else "",
+                _readout("Answering window", _clock(event.get("duration_remaining_seconds"))),
+            )
 
-        return "**Ended**\n\nNobody answered correctly in time."
+        return _stack("**Ended**", "Nobody answered correctly in time.")
 
     @staticmethod
     def _footer(event, phase) -> str:
