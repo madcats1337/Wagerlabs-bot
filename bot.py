@@ -90,6 +90,7 @@ from features.superadmin.features_panel import setup_features_panel_system
 from features.superadmin.patchnotes_panel import setup_extension_patchnotes_panel_system, setup_patchnotes_panel_system
 from features.superadmin.rules_panel import setup_rules_panel_system
 from features.superadmin.sub_role_panel import setup_sub_role_panel_system
+from migrations.create_trivia_tables import migrate_create_trivia_tables
 from raffle_system.auto_leaderboard import setup_auto_leaderboard
 from raffle_system.commands import setup as setup_raffle_commands
 
@@ -9840,6 +9841,9 @@ async def on_ready():
             # Enforce one active raffle period per server (safety net behind the
             # transient-DB-error fix). Must run before the per-guild loop below.
             migrate_one_active_period_per_server(engine)
+            # Trivia events. Mirrors the dashboard's run_migrations block —
+            # whichever service boots first creates the table.
+            migrate_create_trivia_tables(engine)
 
             # Initialize per-guild trackers and managers (without adding cogs yet)
             for guild in bot.guilds:
@@ -10012,6 +10016,22 @@ async def on_ready():
                 logger.debug(f"✅ Giveaway panel persistent view registered (handles all guilds)")
             except Exception as e:
                 logger.warning(f"⚠️ Giveaway panel view registration failed (non-fatal): {e}")
+
+            # Trivia: the panel carries no buttons, so there is no persistent
+            # view to register — what has to survive a restart is the CLOCK.
+            # The ticker re-reads every live event and re-arms its phase
+            # transitions from the stored absolute deadlines, which also
+            # rebuilds the registry of channels the answer listener watches.
+            try:
+                from features.trivia.trivia_listener import setup_trivia_listener
+                from features.trivia.trivia_panel import TriviaTicker
+
+                bot.trivia_ticker = TriviaTicker(bot, engine)
+                await setup_trivia_listener(bot, engine)
+                await bot.trivia_ticker.resume_all()
+                logger.debug(f"✅ Trivia listener + ticker registered (handles all guilds)")
+            except Exception as e:
+                logger.warning(f"⚠️ Trivia initialization failed (non-fatal): {e}")
 
             # Create slot panels per-guild (but only add cogs once)
             first_guild = True

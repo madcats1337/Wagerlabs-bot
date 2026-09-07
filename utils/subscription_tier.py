@@ -31,6 +31,8 @@ TIER2 = FREE + [
     "personal_subdomain",
     "giveaway",
     "tournament",
+    # Discord community trivia events. Mirror of Admin-Dashboard/utils/tiers.py.
+    "trivia",
 ]
 TIER3 = TIER2 + [
     "full_dashboard",
@@ -66,6 +68,7 @@ REQUIRES_DISCORD = {
     "clips",
     "wagers",
     "tournament",
+    "trivia",
     "full_dashboard",
     "leaderboard_generator",
 }

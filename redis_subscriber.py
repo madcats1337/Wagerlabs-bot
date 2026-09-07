@@ -98,6 +98,7 @@ SUBSCRIBED_CHANNELS = (
     "dashboard:tournament",
     "dashboard:clips",
     "dashboard:giveaway_verified",
+    "dashboard:trivia",
     # bot_events: Twitch chat (via EventSub webhook in the Gunicorn process) is
     # forwarded here for the bot to process. Kick chat still uses the direct
     # WebSocket (not this channel).
@@ -3231,6 +3232,64 @@ Congratulations! Please contact an admin to claim your prize! 🎊
         except Exception as e:
             logger.warning(f"⚠️ Failed to invalidate tier cache for {guild_id}: {e}")
 
+    async def handle_trivia_event(self, action, data):
+        """Handle trivia CREATE / START / PAUSE / END from the dashboard.
+
+        The dashboard has already written the row before publishing, so nothing
+        in the payload is trusted beyond WHICH event changed — every handler
+        below re-reads the row and renders from that. A dropped or duplicated
+        Redis message therefore costs at most a stale panel, never a wrong one.
+
+        Re-arming the ticker on every action is what makes PAUSE actually stop
+        the clock: the scheduled expiry task is cancelled, and a later resume
+        creates a new one from the fresh deadlines.
+        """
+        guild_id = data.get("discord_server_id")
+        event_id = data.get("trivia_id")
+        if not guild_id or not event_id:
+            logger.warning("⚠️ [trivia] event missing discord_server_id or trivia_id")
+            return
+
+        try:
+            guild_id = int(guild_id)
+        except (TypeError, ValueError):
+            logger.warning(f"⚠️ [trivia] bad discord_server_id: {data.get('discord_server_id')}")
+            return
+
+        try:
+            from features.trivia.trivia_panel import fetch_event, post_panel, refresh_panel
+
+            engine = get_engine()
+            event = fetch_event(engine, event_id, guild_id)
+            if not event:
+                logger.warning(f"⚠️ [trivia] event {event_id} not found for guild {guild_id}")
+                return
+
+            ticker = getattr(self.bot, "trivia_ticker", None)
+
+            if action == "created":
+                logger.info(f"[trivia] creating panel for event {event_id}")
+                await post_panel(self.bot, engine, event_id, guild_id)
+                if ticker is not None:
+                    # A created event is not running, so this only makes sure no
+                    # stale schedule/registration survives from a previous event.
+                    ticker.arm(event)
+                return
+
+            if action in ("started", "paused", "ended"):
+                logger.info(f"[trivia] event {event_id} -> {action}")
+                if ticker is not None:
+                    if action == "started":
+                        ticker.arm(event)
+                    else:
+                        ticker.release(event)
+                await refresh_panel(self.bot, engine, event_id, guild_id, event=event)
+                return
+
+            logger.debug(f"[trivia] ignoring unknown action '{action}'")
+        except Exception as e:
+            logger.error(f"❌ [trivia] handling '{action}' for event {event_id} failed: {e}", exc_info=True)
+
     async def handle_bot_event(self, payload):
         """Handle events forwarded from the Gunicorn webhook process via Redis
         `bot_events`. Currently: Twitch chat messages routed into the shared chat
@@ -3401,6 +3460,8 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                                 await self.handle_tournament_event(action, data)
                             elif channel == "dashboard:clips":
                                 await self.handle_clips_event(action, data)
+                            elif channel == "dashboard:trivia":
+                                await self.handle_trivia_event(action, data)
                             elif channel == "dashboard:giveaway_verified":
                                 try:
                                     from features.giveaway.giveaway_panel import process_giveaway_verification
