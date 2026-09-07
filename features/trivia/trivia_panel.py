@@ -38,11 +38,13 @@ logger = logging.getLogger(__name__)
 ACCENT = 0xFACC15  # Wagerlabs yellow
 
 # Phase-coloured accents so the panel's state reads at a glance in a busy
-# channel: neutral while waiting, yellow while answers are open, red once over.
-ACCENT_WAITING = 0x6B7280
-ACCENT_LIVE = ACCENT
-ACCENT_ENDED = 0xEF4444
-ACCENT_WON = 0x22C55E
+# channel, without anyone having to read a word of it.
+ACCENT_WAITING = 0x6B7280  # idle - nothing scheduled yet
+ACCENT_PREP = 0x6366F1  # counting down to the answering window
+ACCENT_LIVE = ACCENT  # answers open
+ACCENT_PAUSED = 0xF59E0B  # clock frozen
+ACCENT_ENDED = 0xEF4444  # over, nobody correct
+ACCENT_WON = 0x22C55E  # someone got it
 
 SELECT_COLUMNS = """
     id, discord_server_id, discord_channel_id, discord_message_id,
@@ -101,6 +103,17 @@ def _duration(seconds) -> str:
     if minutes:
         return f"{minutes}m"
     return f"{secs}s"
+
+
+def _readout(label: str, value: str) -> str:
+    """One labelled readout: a small caption above a large value.
+
+    Two lines, never one. The old layout ran "label value  ·  label value"
+    across a single line, which read as a sentence rather than as a pair of
+    instruments; giving each its own caption and sizing the value as a heading
+    is what makes a countdown look like a countdown.
+    """
+    return f"**{label}**\n### {value}"
 
 
 def phase_of(event) -> str:
@@ -172,88 +185,132 @@ class TriviaPanelView(discord.ui.LayoutView):
         super().__init__(timeout=None)
 
         phase = phase_of(event)
-        winner_id = event.get("winner_discord_id")
+        container = discord.ui.Container(accent_colour=self._accent(event, phase))
 
-        if winner_id:
-            accent = ACCENT_WON
-        elif phase == "ended":
-            accent = ACCENT_ENDED
-        elif phase == "live":
-            accent = ACCENT_LIVE
-        else:
-            accent = ACCENT_WAITING
+        # Four banded sections, each its own TextDisplay with a divider between:
+        # title, question, readouts, footer. Packing them into one block is what
+        # made the old panel read as an undifferentiated paragraph.
+        #
+        # No decorative emojis anywhere - everything a viewer sees below the
+        # title comes from what the operator typed.
+        container.add_item(discord.ui.TextDisplay("# Trivia"))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
 
-        container = discord.ui.Container(accent_colour=accent)
-
-        # No decorative emojis - anything a viewer sees comes from the question
-        # the operator typed.
-        lines = ["# Trivia", event.get("question") or ""]
-        container.add_item(discord.ui.TextDisplay("\n".join(line for line in lines if line)))
-        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+        container.add_item(discord.ui.TextDisplay(f"**Question**\n{event.get('question') or ''}"))
+        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
 
         container.add_item(discord.ui.TextDisplay(self._state_block(event, phase)))
 
-        footer = self._footer(event)
+        footer = self._footer(event, phase)
         if footer:
             container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
-            container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+            container.add_item(discord.ui.TextDisplay(footer))
 
         self.add_item(container)
 
     @staticmethod
+    def _accent(event, phase) -> int:
+        if event.get("winner_discord_id"):
+            return ACCENT_WON
+        return {
+            "idle": ACCENT_WAITING,
+            "prep": ACCENT_PREP,
+            "live": ACCENT_LIVE,
+            "paused": ACCENT_PAUSED,
+        }.get(phase, ACCENT_ENDED)
+
+    @staticmethod
     def _state_block(event, phase) -> str:
-        """Both timers plus the one-line instruction for the current phase."""
+        """The readouts for the current phase, one per stacked block.
+
+        Guidance text is NOT here - it lives in the footer, so this section is
+        only ever state.
+        """
         winner_id = event.get("winner_discord_id")
 
         if winner_id:
             answer = event.get("answer") or ""
-            return f"**Winner** <@{int(winner_id)}>\n" f"Correct answer: **{answer}**\n\n" "Answers are closed."
+            return "\n\n".join(
+                [
+                    _readout("Winner", f"<@{int(winner_id)}>"),
+                    f"Correct answer: **{answer}**",
+                ]
+            )
 
         if phase == "idle":
-            return (
-                f"**Starts in** {_duration(event.get('prep_seconds'))}  ·  "
-                f"**Answering window** {_duration(event.get('duration_seconds'))}\n\n"
-                "Waiting to start. Answers posted before the timer opens do not count."
+            # Deliberately NO "starts in" readout: nothing has been scheduled
+            # until the operator presses START, so a figure here would be a
+            # countdown to a moment that does not exist yet.
+            return "\n\n".join(
+                [
+                    "*Starting soon...*",
+                    _readout("Answering window", _duration(event.get("duration_seconds"))),
+                ]
             )
 
         if phase == "prep":
-            return (
-                f"**Answers open** {_relative(event.get('answers_open_at'))}  ·  "
-                f"**Ends** {_relative(event.get('ends_at'))}\n\n"
-                "Get ready. Answers posted before the window opens do not count."
+            # `<t:...:R>` renders as "in 30 seconds", so the caption omits the
+            # preposition - the two lines read "Starts / in 30 seconds".
+            return "\n\n".join(
+                [
+                    _readout("Starts", _relative(event.get("answers_open_at"))),
+                    _readout("Ends", _relative(event.get("ends_at"))),
+                ]
             )
 
         if phase == "live":
-            return (
-                f"**Answers are open**  ·  **Ends** {_relative(event.get('ends_at'))}\n\n"
-                "Post your answer in this channel. First correct answer wins."
+            return "\n\n".join(
+                [
+                    "**Answers are open**",
+                    _readout("Ends", _relative(event.get("ends_at"))),
+                ]
             )
 
         if phase == "paused":
-            # Frozen: no deadline exists to count down to, so both timers show
-            # what was banked at the pause.
+            # Frozen: there is no deadline to count down to, so the readouts
+            # show what was banked at the pause instead of a live timestamp.
+            blocks = ["*Paused*"]
             prep_left = event.get("prep_remaining_seconds")
-            duration_left = event.get("duration_remaining_seconds")
-            opening_label = f"**Opens after** {_duration(prep_left)}" if prep_left else "**Answering window** was open"
-            return (
-                f"**Paused**\n"
-                f"{opening_label}  ·  **Time banked** {_duration(duration_left)}\n\n"
-                "Answers are not counted while the event is paused."
-            )
+            if prep_left:
+                blocks.append(_readout("Starts", f"in {_duration(prep_left)}"))
+            blocks.append(_readout("Answering window", _duration(event.get("duration_remaining_seconds"))))
+            return "\n\n".join(blocks)
 
-        return "**Ended**\nNobody answered correctly in time."
+        return "**Ended**\n\nNobody answered correctly in time."
 
     @staticmethod
-    def _footer(event) -> str:
-        """Absolute stamps, rendered in each viewer's own timezone."""
-        parts = []
+    def _footer(event, phase) -> str:
+        """Subtext: what to do right now, then the event's own timestamps.
+
+        The instruction sits down here rather than under the readouts because it
+        is guidance, not state - keeping it out of the body is what lets the
+        countdowns read as instruments.
+        """
+        if event.get("winner_discord_id") or phase == "ended":
+            note = "Answers are closed."
+        elif phase == "idle":
+            note = "Waiting to start. Answers posted before the timer opens do not count."
+        elif phase == "prep":
+            note = "Get ready. Answers posted before the window opens do not count."
+        elif phase == "live":
+            note = "Post your answer in this channel. First correct answer wins."
+        else:
+            note = "Answers are not counted while the event is paused."
+
+        lines = [f"-# {note}"]
+
+        # Absolute stamps, rendered in each viewer's own timezone.
+        stamps = []
         started = _aware(event.get("started_at"))
         if started:
-            parts.append(f"Started <t:{int(started.timestamp())}:f>")
+            stamps.append(f"Started <t:{int(started.timestamp())}:f>")
         ended = _aware(event.get("ended_at"))
         if ended:
-            parts.append(f"Ended <t:{int(ended.timestamp())}:f>")
-        return "  ·  ".join(parts)
+            stamps.append(f"Ended <t:{int(ended.timestamp())}:f>")
+        if stamps:
+            lines.append("-# " + "  ·  ".join(stamps))
+
+        return "\n".join(lines)
 
 
 async def _resolve_channel(bot, channel_id):
