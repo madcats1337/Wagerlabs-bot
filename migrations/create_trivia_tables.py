@@ -33,6 +33,11 @@ def migrate_create_trivia_tables(engine):
                         discord_message_id BIGINT,
                         question TEXT NOT NULL,
                         answer TEXT NOT NULL,
+                        -- `prize` is the RENDERED display string; the bot
+                        -- prints it verbatim and never interprets a type.
+                        prize VARCHAR(255),
+                        prize_type VARCHAR(20),
+                        prize_amount NUMERIC(14, 2),
                         prep_seconds INTEGER NOT NULL DEFAULT 30,
                         duration_seconds INTEGER NOT NULL DEFAULT 120,
                         status VARCHAR(20) NOT NULL DEFAULT 'created',
@@ -50,6 +55,19 @@ def migrate_create_trivia_tables(engine):
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         ended_at TIMESTAMPTZ
                     )
+                    """
+                )
+            )
+
+            # Optional prize, shown on the panel and named in the winner
+            # announcement. Additive for tables created before it existed.
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE trivia_events
+                        ADD COLUMN IF NOT EXISTS prize VARCHAR(255),
+                        ADD COLUMN IF NOT EXISTS prize_type VARCHAR(20),
+                        ADD COLUMN IF NOT EXISTS prize_amount NUMERIC(14, 2)
                     """
                 )
             )

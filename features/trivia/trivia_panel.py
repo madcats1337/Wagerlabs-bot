@@ -48,7 +48,8 @@ ACCENT_WON = 0x22C55E  # someone got it
 
 SELECT_COLUMNS = """
     id, discord_server_id, discord_channel_id, discord_message_id,
-    question, answer, prep_seconds, duration_seconds, status,
+    question, answer, prize, prize_type, prize_amount,
+    prep_seconds, duration_seconds, status,
     started_at, answers_open_at, ends_at, paused_at,
     prep_remaining_seconds, duration_remaining_seconds,
     winner_discord_id, winner_name, winner_answer, won_at,
@@ -105,6 +106,33 @@ def _clock(seconds) -> str:
     return f"{minutes}:{secs:02d}"
 
 
+def _fence_width(text: str) -> int:
+    """One more backtick than the longest run inside `text`, floor 1.
+
+    Shared by both code helpers: an operator's question can legitimately contain
+    a backtick - or three - and a fixed delimiter would let it close the span or
+    block early and spill raw markdown through the rest of the panel.
+    """
+    longest = run = 0
+    for char in str(text):
+        run = run + 1 if char == "`" else 0
+        longest = max(longest, run)
+    return longest + 1
+
+
+def _code_block(text: str) -> str:
+    """Render `text` as a FENCED code block - the full-width boxed form.
+
+    Used for the question, where the extra width and padding suit a sentence,
+    and where newlines have to survive: the dashboard's question field is a
+    textarea, and a fenced block is the only code form that can hold more than
+    one line.
+    """
+    text = str(text).strip() or "-"
+    fence = "`" * max(3, _fence_width(text))
+    return f"{fence}\n{text}\n{fence}"
+
+
 def _chip(text: str) -> str:
     """Render `text` as an INLINE code chip - a rounded monospace pill.
 
@@ -119,16 +147,11 @@ def _chip(text: str) -> str:
         and spill raw markdown through the rest of the panel;
       * a value that starts or ends with a backtick needs padding spaces.
 
-    Whitespace is collapsed because a newline terminates an inline span - the
-    dashboard's question field is a textarea, so a pasted multi-line question
-    would otherwise break the chip open.
+    Whitespace is collapsed because a newline terminates an inline span. Clock
+    values never contain one, but the helper stays safe for any caller.
     """
     text = " ".join(str(text).split()) or "-"
-    longest = run = 0
-    for char in text:
-        run = run + 1 if char == "`" else 0
-        longest = max(longest, run)
-    fence = "`" * (longest + 1)
+    fence = "`" * _fence_width(text)
     pad = " " if text.startswith("`") or text.endswith("`") else ""
     return f"{fence}{pad}{text}{pad}{fence}"
 
@@ -243,10 +266,18 @@ class TriviaPanelView(discord.ui.LayoutView):
         container.add_item(discord.ui.TextDisplay("# Trivia"))
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
-        # The question is chipped too: it sets off the one piece of
-        # operator-authored text on the panel, and stops stray markdown in a
-        # question from reformatting everything under it.
-        container.add_item(discord.ui.TextDisplay(f"**Question**\n{_chip(event.get('question') or '')}"))
+        # Fenced rather than chipped: the question is a sentence, so it earns the
+        # wider box, and fencing keeps stray markdown in an operator's question
+        # from reformatting everything under it.
+        #
+        # The prize rides in the same band as the question rather than getting a
+        # divider of its own - what you are playing for and what you must answer
+        # belong together, and another band would re-open the spacing problem.
+        question_block = f"**Question**\n{_code_block(event.get('question') or '')}"
+        prize = (event.get("prize") or "").strip()
+        if prize:
+            question_block = _stack(question_block, f"**Prize**\n{_chip(prize)}")
+        container.add_item(discord.ui.TextDisplay(question_block))
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
         container.add_item(discord.ui.TextDisplay(self._state_block(event, phase)))
@@ -456,9 +487,14 @@ async def announce_winner(bot, engine, event):
     answer = event.get("answer") or ""
     mention = f"<@{int(winner_id)}>" if winner_id else f"**{event.get('winner_name') or 'Unknown'}**"
 
+    message = f"{mention} got it first. The answer was **{answer}**."
+    prize = (event.get("prize") or "").strip()
+    if prize:
+        message += f" Prize: **{prize}**."
+
     # The bot's global allowed_mentions already blocks @everyone/@here and role
     # pings while permitting user mentions, so the winner is tagged for real.
-    await channel.send(f"{mention} got it first. The answer was **{answer}**.")
+    await channel.send(message)
     logger.info(f"[trivia] announced winner {winner_id} for event {event['id']}")
     return True
 
