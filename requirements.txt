@@ -11,7 +11,7 @@ authlib==1.6.12
 cryptography==48.0.1
 gunicorn==23.0.0
 redis==5.3.1
-Pillow==12.2.0
+Pillow==12.3.0
 cloudscraper==1.2.71
 kickpython==0.1.5
 asyncio==3.4.3
