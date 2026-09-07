@@ -105,19 +105,41 @@ def _clock(seconds) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-def _readout(label: str, value: str) -> str:
-    """One labelled readout: a small caption above a large value.
+def _code_block(text: str) -> str:
+    """Fence `text` as a code block, widening the fence past any backticks in it.
 
-    Two lines, never one. The old layout ran "label value  ·  label value"
-    across a single line, which read as a sentence rather than as a pair of
-    instruments; giving each its own caption and sizing the value as a heading
-    is what makes a countdown look like a countdown.
-
-    Blocks are joined with a SINGLE newline (see `_stack`) - a `###` heading
-    already carries its own vertical margin in Discord, so a blank line between
-    readouts double-spaces them into a scattered list.
+    An operator's question can legitimately contain a backtick - or three - and
+    a naive three-backtick fence would let it close the block early and spill
+    raw markdown through the rest of the panel.
     """
-    return f"**{label}**\n### {value}"
+    longest = run = 0
+    for char in str(text):
+        run = run + 1 if char == "`" else 0
+        longest = max(longest, run)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{text}\n{fence}"
+
+
+def _readout(label: str, value: str) -> str:
+    """A LIVE countdown: caption, then Discord's own ticking timestamp.
+
+    The value is deliberately NOT fenced. `<t:...:R>` inside a code block
+    renders as the literal tag rather than a countdown, so a live timer cannot
+    be boxed the way a frozen one is. Discord already draws timestamps with a
+    highlighted chip, which keeps them reading as a readout alongside the
+    fenced clocks.
+    """
+    return f"**{label}**\n{value}"
+
+
+def _clock_readout(label: str, seconds) -> str:
+    """A FROZEN clock, fenced so it reads as a digital readout.
+
+    Also what removes the gap under the caption: a `###` heading (the previous
+    treatment) carries a large margin of its own, while a code block sits
+    directly beneath its label.
+    """
+    return f"**{label}**\n{_code_block(_clock(seconds))}"
 
 
 def _stack(*blocks: str) -> str:
@@ -208,7 +230,10 @@ class TriviaPanelView(discord.ui.LayoutView):
         container.add_item(discord.ui.TextDisplay("# Trivia"))
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
-        container.add_item(discord.ui.TextDisplay(f"**Question**\n{event.get('question') or ''}"))
+        # The question is fenced too: it boxes the one piece of operator-authored
+        # text on the panel, and stops stray markdown in a question from
+        # reformatting everything under it.
+        container.add_item(discord.ui.TextDisplay(f"**Question**\n{_code_block(event.get('question') or '')}"))
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
         container.add_item(discord.ui.TextDisplay(self._state_block(event, phase)))
@@ -253,7 +278,7 @@ class TriviaPanelView(discord.ui.LayoutView):
             # countdown to a moment that does not exist yet.
             return _stack(
                 "*Starting soon...*",
-                _readout("Answering window", _clock(event.get("duration_seconds"))),
+                _clock_readout("Answering window", event.get("duration_seconds")),
             )
 
         if phase == "prep":
@@ -277,8 +302,8 @@ class TriviaPanelView(discord.ui.LayoutView):
             prep_left = event.get("prep_remaining_seconds")
             return _stack(
                 "*Paused*",
-                _readout("Starts", _clock(prep_left)) if prep_left else "",
-                _readout("Answering window", _clock(event.get("duration_remaining_seconds"))),
+                _clock_readout("Starts", prep_left) if prep_left else "",
+                _clock_readout("Answering window", event.get("duration_remaining_seconds")),
             )
 
         return _stack("**Ended**", "Nobody answered correctly in time.")
