@@ -23,6 +23,7 @@ from discord.ext import commands
 from sqlalchemy import text
 
 from .trivia_panel import SELECT_COLUMNS, announce_winner, answers_are_open, fetch_event, refresh_panel
+from .trivia_payout import PayoutResult, pay_points_prize
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +105,22 @@ class TriviaAnswerListener(commands.Cog):
             f"[trivia] event {event_id} won by {message.author} ({message.author.id}) " f"in #{message.channel}"
         )
 
+        # Settle a loyalty-point prize BEFORE announcing, so the announcement can
+        # state what actually happened rather than promising a credit that may
+        # not have landed. Returns NOT_APPLICABLE for USD/custom prizes and for
+        # events with no prize at all.
+        payout = pay_points_prize(self.engine, winner)
+        if payout[0] != PayoutResult.NOT_APPLICABLE:
+            # Re-read so the panel and the dashboard show `prize_paid_at`.
+            winner = fetch_event(self.engine, event_id, guild_id) or winner
+
         await refresh_panel(self.bot, self.engine, event_id, guild_id, event=winner)
-        await announce_winner(self.bot, self.engine, winner)
+        await announce_winner(
+            self.bot,
+            self.engine,
+            winner,
+            payout=None if payout[0] == PayoutResult.NOT_APPLICABLE else payout,
+        )
 
     def _claim(self, event_id, author, content):
         """Atomically record the winner, or return None if someone else won.

@@ -38,6 +38,10 @@ def migrate_create_trivia_tables(engine):
                         prize VARCHAR(255),
                         prize_type VARCHAR(20),
                         prize_amount NUMERIC(14, 2),
+                        -- Idempotency guard for the points payout: claimed in
+                        -- the same transaction that credits user_points.
+                        prize_paid_at TIMESTAMPTZ,
+                        prize_paid_to VARCHAR(255),
                         prep_seconds INTEGER NOT NULL DEFAULT 30,
                         duration_seconds INTEGER NOT NULL DEFAULT 120,
                         status VARCHAR(20) NOT NULL DEFAULT 'created',
@@ -67,7 +71,9 @@ def migrate_create_trivia_tables(engine):
                     ALTER TABLE trivia_events
                         ADD COLUMN IF NOT EXISTS prize VARCHAR(255),
                         ADD COLUMN IF NOT EXISTS prize_type VARCHAR(20),
-                        ADD COLUMN IF NOT EXISTS prize_amount NUMERIC(14, 2)
+                        ADD COLUMN IF NOT EXISTS prize_amount NUMERIC(14, 2),
+                        ADD COLUMN IF NOT EXISTS prize_paid_at TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS prize_paid_to VARCHAR(255)
                     """
                 )
             )

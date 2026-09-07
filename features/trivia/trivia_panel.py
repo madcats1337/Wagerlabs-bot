@@ -48,7 +48,7 @@ ACCENT_WON = 0x22C55E  # someone got it
 
 SELECT_COLUMNS = """
     id, discord_server_id, discord_channel_id, discord_message_id,
-    question, answer, prize, prize_type, prize_amount,
+    question, answer, prize, prize_type, prize_amount, prize_paid_at, prize_paid_to,
     prep_seconds, duration_seconds, status,
     started_at, answers_open_at, ends_at, paused_at,
     prep_remaining_seconds, duration_remaining_seconds,
@@ -311,9 +311,17 @@ class TriviaPanelView(discord.ui.LayoutView):
 
         if winner_id:
             answer = event.get("answer") or ""
+            # Only a points prize can be settled automatically, so this line
+            # appears only for one. An unpaid points prize says so rather than
+            # staying silent - that is the operator's cue to grant it by hand
+            # once the winner links.
+            paid_line = ""
+            if (event.get("prize_type") or "") == "points":
+                paid_line = "Points paid out" if event.get("prize_paid_at") else "Points pending - winner not linked"
             return _stack(
                 _readout("Winner", f"<@{int(winner_id)}>"),
                 f"Correct answer: **{answer}**",
+                f"-# {paid_line}" if paid_line else "",
             )
 
         if phase == "idle":
@@ -472,12 +480,18 @@ async def refresh_panel(bot, engine, event_id, guild_id=None, event=None):
     return True
 
 
-async def announce_winner(bot, engine, event):
+async def announce_winner(bot, engine, event, payout=None):
     """Announce and tag the winner in the event's own channel.
 
     Posted as a normal message, not an edit, so it pings the winner and shows
     up in the channel's flow - the panel above it carries the same result but a
     silent edit is easy to miss.
+
+    `payout` is the (result, canonical, amount) tuple from `pay_points_prize`
+    when a loyalty-point prize was settled. It decides the prize clause: a
+    credited winner is told the points landed, an unlinked one is told how to
+    claim them. Passing None falls back to simply naming the prize, which is
+    right for USD and custom prizes the operator settles by hand.
     """
     channel = await _resolve_channel(bot, event["discord_channel_id"])
     if channel is None:
@@ -489,7 +503,12 @@ async def announce_winner(bot, engine, event):
 
     message = f"{mention} got it first. The answer was **{answer}**."
     prize = (event.get("prize") or "").strip()
-    if prize:
+    if payout is not None:
+        from .trivia_payout import payout_sentence
+
+        result, _canonical, amount = payout
+        message += payout_sentence(result, amount, prize)
+    elif prize:
         message += f" Prize: **{prize}**."
 
     # The bot's global allowed_mentions already blocks @everyone/@here and role
