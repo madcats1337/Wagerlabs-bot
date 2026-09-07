@@ -105,19 +105,32 @@ def _clock(seconds) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-def _code_block(text: str) -> str:
-    """Fence `text` as a code block, widening the fence past any backticks in it.
+def _chip(text: str) -> str:
+    """Render `text` as an INLINE code chip - a rounded monospace pill.
 
-    An operator's question can legitimately contain a backtick - or three - and
-    a naive three-backtick fence would let it close the block early and spill
-    raw markdown through the rest of the panel.
+    Single backticks, not a fenced block. A fence is the wrong shape here: it
+    draws a full-width box with its own padding, which is what made the panel
+    look blocky. An inline span sits tight under its caption and reads as a
+    value display.
+
+    Two robustness details, both required by the inline-code grammar:
+      * the delimiter grows past the longest backtick run inside the text, so an
+        operator's question containing a backtick cannot close the span early
+        and spill raw markdown through the rest of the panel;
+      * a value that starts or ends with a backtick needs padding spaces.
+
+    Whitespace is collapsed because a newline terminates an inline span - the
+    dashboard's question field is a textarea, so a pasted multi-line question
+    would otherwise break the chip open.
     """
+    text = " ".join(str(text).split()) or "-"
     longest = run = 0
-    for char in str(text):
+    for char in text:
         run = run + 1 if char == "`" else 0
         longest = max(longest, run)
-    fence = "`" * max(3, longest + 1)
-    return f"{fence}\n{text}\n{fence}"
+    fence = "`" * (longest + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
 
 
 def _readout(label: str, value: str) -> str:
@@ -133,13 +146,13 @@ def _readout(label: str, value: str) -> str:
 
 
 def _clock_readout(label: str, seconds) -> str:
-    """A FROZEN clock, fenced so it reads as a digital readout.
+    """A FROZEN clock, chipped so it reads as a digital readout.
 
     Also what removes the gap under the caption: a `###` heading (the previous
-    treatment) carries a large margin of its own, while a code block sits
-    directly beneath its label.
+    treatment) carries a large margin of its own, while a chip sits directly
+    beneath its label.
     """
-    return f"**{label}**\n{_code_block(_clock(seconds))}"
+    return f"**{label}**\n{_chip(_clock(seconds))}"
 
 
 def _stack(*blocks: str) -> str:
@@ -230,10 +243,10 @@ class TriviaPanelView(discord.ui.LayoutView):
         container.add_item(discord.ui.TextDisplay("# Trivia"))
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
-        # The question is fenced too: it boxes the one piece of operator-authored
-        # text on the panel, and stops stray markdown in a question from
-        # reformatting everything under it.
-        container.add_item(discord.ui.TextDisplay(f"**Question**\n{_code_block(event.get('question') or '')}"))
+        # The question is chipped too: it sets off the one piece of
+        # operator-authored text on the panel, and stops stray markdown in a
+        # question from reformatting everything under it.
+        container.add_item(discord.ui.TextDisplay(f"**Question**\n{_chip(event.get('question') or '')}"))
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
 
         container.add_item(discord.ui.TextDisplay(self._state_block(event, phase)))
