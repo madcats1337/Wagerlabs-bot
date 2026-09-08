@@ -2,6 +2,11 @@
 (message activity, giveaway/trivia/raffle wins). Every award goes through
 `award_xp` so level/rank transitions are detected and announced from one
 place, regardless of source.
+
+It is also where an active competition's score is incremented, in the same
+transaction as the lifetime total. Funnelling both through this one function is
+what keeps "XP earned this period" honest without a second code path per XP
+source, and what makes it impossible for the two totals to drift.
 """
 
 import logging
@@ -9,6 +14,7 @@ import logging
 from sqlalchemy import text
 
 from .cards import render_levelup_card, render_rankup_card
+from .competition import record_competition_xp
 from .curve import level_from_total_xp, rank_for_level
 
 logger = logging.getLogger(__name__)
@@ -100,6 +106,20 @@ async def award_xp(engine, bot, guild_id, discord_id, amount: int, source: str, 
                 },
             ).fetchone()
             new_total_xp, old_level, old_rank = row
+
+            # Same transaction as the lifetime upsert above: a crash between the
+            # two would otherwise leave the community board and the competition
+            # board disagreeing about the same award, with nothing to reconcile
+            # them from. No-ops when no competition is running.
+            record_competition_xp(
+                conn,
+                guild_id,
+                discord_id,
+                amount,
+                is_message=(source == "message"),
+                username=resolved_username,
+                avatar_url=avatar_url,
+            )
 
             new_level = level_from_total_xp(new_total_xp)
             new_rank = rank_for_level(new_level)

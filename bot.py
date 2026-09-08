@@ -10040,12 +10040,20 @@ async def on_ready():
                 from features.levels.commands import RankCommands
                 from features.levels.database import setup_levels_database
                 from features.levels.listener import MessageXPCog
-                from features.levels.panel import setup_levels_panel_system, start_levels_panel_refresh_loop
+                from features.levels.panel import (
+                    COMPETITION_PANEL_TYPE,
+                    setup_levels_panel_system,
+                    start_levels_panel_refresh_loop,
+                )
 
                 setup_levels_database(engine)
                 await bot.add_cog(MessageXPCog(bot, engine))
                 await bot.add_cog(RankCommands(bot, engine))
                 bot.levels_panels = await setup_levels_panel_system(bot, engine)
+                bot.levels_competition_panels = await setup_levels_panel_system(bot, engine, COMPETITION_PANEL_TYPE)
+                # The refresh loop closes lapsed competitions too, and needs an
+                # engine; it only receives `bot`.
+                bot.levels_engine = engine
                 start_levels_panel_refresh_loop(bot)
                 logger.debug(f"✅ Levels/XP system registered ({len(bot.levels_panels)} guilds)")
             except Exception as e:

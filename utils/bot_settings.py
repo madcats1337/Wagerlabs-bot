@@ -334,6 +334,15 @@ class BotSettingsManager:
         return self.get_int("levels_channel_id")
 
     @property
+    def levels_competition_channel_id(self) -> Optional[int]:
+        """Channel for the competition panel + end-of-period results.
+
+        Falls back to levels_channel_id at the call site, so a server that only
+        configured one channel still gets competition announcements.
+        """
+        return self.get_int("levels_competition_channel_id")
+
+    @property
     def levels_enabled(self) -> bool:
         """Whether the XP/leveling system is active for this server (default on)"""
         return self.get_bool("levels_enabled", default=True)

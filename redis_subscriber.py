@@ -1856,6 +1856,7 @@ class RedisSubscriber:
             "shuffle_verify": "shuffle_panels",
             "howl_verify": "howl_panels",
             "levels_leaderboard": "levels_panels",
+            "levels_competition": "levels_competition_panels",
             # Global super-admin panels for the official guild.
             "patchnotes": "patchnotes_panels",
             "patchnotes_extension": "extension_patchnotes_panels",

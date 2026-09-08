@@ -1,4 +1,12 @@
-"""Standing community-leaderboard panel: posted/moved via the same
+"""Standing panels for the levels system: the community leaderboard, and the
+active competition board.
+
+Both are the same mechanism with a different query and renderer, so LevelsPanel
+is parameterised by panel type rather than duplicated — placement, move
+semantics, restart recovery and the "message was deleted" repost are identical
+and only want one implementation.
+
+Community-leaderboard panel: posted/moved via the same
 dashboard -> redis `post_panel` flow used by the Shuffle/Howl verify panels
 (features/linking/shuffle_panel.py is the direct model). Content is the
 top-N `user_levels` rows rendered as one image, refreshed periodically and
@@ -16,11 +24,22 @@ import discord
 from discord.ext import tasks
 from sqlalchemy import text
 
-from .cards import render_leaderboard_card
+from .cards import render_competition_card, render_competition_winners_card, render_leaderboard_card
+from .competition import (
+    PERIOD_LABELS,
+    close_competition,
+    get_active_competition,
+    get_competition_board,
+    get_competition_winners,
+    mark_announced,
+    renew_competition,
+)
+from .prizes import describe_prize, pay_all_prizes
 
 logger = logging.getLogger(__name__)
 
 PANEL_TYPE = "levels_leaderboard"
+COMPETITION_PANEL_TYPE = "levels_competition"
 TOP_N = 10
 
 # Holds the refresh tasks.loop — module-level so the closure-defined loop
@@ -61,15 +80,35 @@ def _fetch_leaderboard_rows(engine, guild_id, limit=TOP_N):
 
 
 class LevelsPanel:
-    """Manages the community-leaderboard panel message for one guild."""
+    """Manages one standing panel message for one guild.
 
-    def __init__(self, bot, engine, guild_id):
+    `panel_type` selects both the link_panels row and which board is rendered,
+    so the community leaderboard and the competition board share this class.
+    """
+
+    def __init__(self, bot, engine, guild_id, panel_type=PANEL_TYPE):
         self.bot = bot
         self.engine = engine
         self.guild_id = guild_id
+        self.panel_type = panel_type
         self.panel_channel_id = None
         self.panel_message_id = None
         self._load_panel_info()
+
+    async def _render(self):
+        """The image this panel currently shows, or None when it has nothing
+        to show (competition panel with no competition running)."""
+        if self.panel_type == COMPETITION_PANEL_TYPE:
+            competition = get_active_competition(self.engine, self.guild_id)
+            if not competition:
+                return None
+            board = get_competition_board(self.engine, competition["id"], limit=TOP_N)
+            return await render_competition_card(
+                board,
+                PERIOD_LABELS.get(competition["period_type"], "Activity"),
+                competition["end_date"],
+            )
+        return await render_leaderboard_card(_fetch_leaderboard_rows(self.engine, self.guild_id))
 
     def _load_panel_info(self):
         try:
@@ -82,7 +121,7 @@ class LevelsPanel:
                         ORDER BY created_at DESC LIMIT 1
                         """
                     ),
-                    {"guild_id": self.guild_id, "ptype": PANEL_TYPE},
+                    {"guild_id": self.guild_id, "ptype": self.panel_type},
                 ).fetchone()
             if row:
                 self.panel_channel_id, self.panel_message_id = row[0], row[1]
@@ -94,7 +133,7 @@ class LevelsPanel:
             with self.engine.begin() as conn:
                 conn.execute(
                     text("DELETE FROM link_panels WHERE guild_id = :guild_id AND panel_type = :ptype"),
-                    {"guild_id": self.guild_id, "ptype": PANEL_TYPE},
+                    {"guild_id": self.guild_id, "ptype": self.panel_type},
                 )
                 conn.execute(
                     text(
@@ -108,7 +147,7 @@ class LevelsPanel:
                         "guild_id": self.guild_id,
                         "channel_id": channel_id,
                         "message_id": message_id,
-                        "ptype": PANEL_TYPE,
+                        "ptype": self.panel_type,
                     },
                 )
         except Exception as e:
@@ -117,15 +156,17 @@ class LevelsPanel:
     async def create_panel(self, channel: discord.TextChannel):
         """Post the panel fresh in `channel` (used for the initial post and moves)."""
         try:
-            rows = _fetch_leaderboard_rows(self.engine, self.guild_id)
-            file = await render_leaderboard_card(rows)
+            file = await self._render()
+            if file is None:
+                logger.info(f"[levels] no active competition for guild {self.guild_id}; panel not posted")
+                return False
             message = await channel.send(file=file)
             self.panel_channel_id = channel.id
             self.panel_message_id = message.id
             self._save_panel_info(channel.id, message.id)
             return True
         except Exception as e:
-            logger.error(f"[levels] failed to create leaderboard panel for guild {self.guild_id}: {e}")
+            logger.error(f"[levels] failed to create {self.panel_type} panel for guild {self.guild_id}: {e}")
             return False
 
     def _enabled(self) -> bool:
@@ -158,33 +199,119 @@ class LevelsPanel:
                 return
 
         try:
-            rows = _fetch_leaderboard_rows(self.engine, self.guild_id)
-            file = await render_leaderboard_card(rows)
+            file = await self._render()
+            if file is None:
+                return
             message = await channel.fetch_message(self.panel_message_id)
             await message.edit(attachments=[file])
         except discord.NotFound:
-            logger.info(f"[levels] leaderboard panel message gone for guild {self.guild_id}; reposting")
+            logger.info(f"[levels] {self.panel_type} panel message gone for guild {self.guild_id}; reposting")
             await self.create_panel(channel)
         except Exception as e:
-            logger.error(f"[levels] failed to refresh leaderboard panel for guild {self.guild_id}: {e}")
+            logger.error(f"[levels] failed to refresh {self.panel_type} panel for guild {self.guild_id}: {e}")
 
 
-async def setup_levels_panel_system(bot, engine):
+async def setup_levels_panel_system(bot, engine, panel_type=PANEL_TYPE):
     """Build per-guild panel instances (re-attaching to any already-posted message)."""
     panels = {}
     for guild in bot.guilds:
-        panels[guild.id] = LevelsPanel(bot, engine, guild.id)
+        panels[guild.id] = LevelsPanel(bot, engine, guild.id, panel_type)
     return panels
+
+
+async def _announce_competition_end(bot, engine, guild_id, competition, winners):
+    """Post the podium card for a just-closed competition.
+
+    Claimed via mark_announced so a restart between closing and announcing
+    cannot post the results twice.
+    """
+    if not mark_announced(engine, competition["id"]):
+        return
+
+    getter = getattr(bot, "get_guild_settings", None)
+    settings = getter(guild_id) if callable(getter) else None
+    channel_id = getattr(settings, "levels_competition_channel_id", None) or getattr(
+        settings, "levels_channel_id", None
+    )
+    if not channel_id:
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            logger.warning(f"[levels] competition channel {channel_id} not found for guild {guild_id}: {e}")
+            return
+
+    try:
+        card_rows = [
+            {
+                "place": w["place"],
+                "discord_id": w["discord_id"],
+                "username": w["username"],
+                "avatar_url": None,
+                "xp": w["xp"],
+                "prize": describe_prize(w["prize_type"], w["prize_amount"], w["prize_text"]),
+            }
+            for w in winners
+        ]
+        file = await render_competition_winners_card(
+            card_rows, PERIOD_LABELS.get(competition["period_type"], "Activity")
+        )
+        mentions = " ".join(f"<@{w['discord_id']}>" for w in winners)
+        await channel.send(content=mentions or None, file=file)
+    except Exception as e:
+        logger.error(f"[levels] failed to post competition results for guild {guild_id}: {e}")
+
+
+async def check_competitions(bot, engine):
+    """Close and renew any competition whose period has lapsed.
+
+    Runs on the existing panel-refresh tick rather than its own loop. A DB error
+    inside get_active_competition propagates out to the caller, which skips this
+    guild for this tick — deliberately, so a transient failure can never be read
+    as "no competition" and end one that is running fine.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+
+    for guild in bot.guilds:
+        try:
+            competition = get_active_competition(engine, guild.id)
+            if not competition:
+                continue
+
+            end_date = competition["end_date"]
+            if end_date.tzinfo is None:
+                end_date = end_date.replace(tzinfo=timezone.utc)
+            if now < end_date:
+                continue
+
+            if not close_competition(engine, competition):
+                continue  # someone else closed it first
+
+            winners = get_competition_winners(engine, competition["id"])
+            pay_all_prizes(engine, guild.id, competition["id"], winners)
+            # Re-read so the card shows payout state as actually committed.
+            winners = get_competition_winners(engine, competition["id"])
+            await _announce_competition_end(bot, engine, guild.id, competition, winners)
+
+            if competition.get("auto_renew"):
+                renew_competition(engine, competition)
+        except Exception as e:
+            logger.error(f"[levels] competition check failed for guild {guild.id}: {e}", exc_info=True)
 
 
 async def refresh_all_panels(bot):
     """Periodic refresh entry point, called from the task loop below."""
-    panels = getattr(bot, "levels_panels", None) or {}
-    for panel in panels.values():
-        try:
-            await panel.refresh()
-        except Exception as e:
-            logger.error(f"[levels] panel refresh loop error: {e}")
+    for attr in ("levels_panels", "levels_competition_panels"):
+        for panel in (getattr(bot, attr, None) or {}).values():
+            try:
+                await panel.refresh()
+            except Exception as e:
+                logger.error(f"[levels] panel refresh loop error: {e}")
 
 
 def start_levels_panel_refresh_loop(bot):
@@ -193,6 +320,11 @@ def start_levels_panel_refresh_loop(bot):
 
     @tasks.loop(minutes=10)
     async def refresh_levels_panels():
+        # Competitions are closed BEFORE the panels re-render, so the tick that
+        # ends a period also repaints the panel with the fresh one.
+        engine = getattr(bot, "levels_engine", None)
+        if engine is not None:
+            await check_competitions(bot, engine)
         await refresh_all_panels(bot)
 
     @refresh_levels_panels.before_loop

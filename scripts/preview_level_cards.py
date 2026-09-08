@@ -24,7 +24,7 @@ import asyncio
 import html
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
@@ -32,6 +32,8 @@ sys.path.insert(0, REPO_ROOT)
 import aiohttp  # noqa: E402
 
 from features.levels.cards import (  # noqa: E402
+    render_competition_card,
+    render_competition_winners_card,
     render_leaderboard_card,
     render_levelup_card,
     render_rank_card,
@@ -80,6 +82,53 @@ def rows(count: int):
             }
         )
     return out
+
+
+def _in(**delta):
+    """An instant `delta` from now (negative values are in the past)."""
+    return datetime.now(timezone.utc) + timedelta(**delta)
+
+
+def _comp_rows(count: int):
+    """Competition board rows — note `xp` is per-period, not lifetime."""
+    specs = [
+        (TYPICAL_NAME, 18240, 912),
+        ("xX_SlotGrinder_Xx", 15110, 780),
+        (LONG_NAME, 12980, 664),
+        ("bonusbuyer", 8120, 420),
+        (None, 340, 19),
+    ]
+    return [
+        {
+            "position": i + 1,
+            "discord_id": 2000 + i,
+            "username": name,
+            "avatar_url": AVATARS[i % len(AVATARS)],
+            "xp": xp,
+            "messages_sent": msgs,
+        }
+        for i, (name, xp, msgs) in enumerate(specs[:count])
+    ]
+
+
+def _winners(count: int):
+    """Frozen winner rows, one per prize type."""
+    specs = [
+        (TYPICAL_NAME, 18240, "$50.00"),
+        ("xX_SlotGrinder_Xx", 15110, "2,500 points"),
+        (LONG_NAME, 12980, "Steam key"),
+    ]
+    return [
+        {
+            "place": i + 1,
+            "discord_id": 2000 + i,
+            "username": name,
+            "avatar_url": AVATARS[i % len(AVATARS)],
+            "xp": xp,
+            "prize": prize,
+        }
+        for i, (name, xp, prize) in enumerate(specs[:count])
+    ]
 
 
 # (slug, caption, zero-arg factory returning the render coroutine)
@@ -207,6 +256,54 @@ GROUPS = [
                 "rankup-noavatar",
                 "Avatar missing → placeholder circle",
                 lambda: render_rankup_card(SHORT_NAME, None, "bronze", "silver", 11),
+            ),
+        ],
+    ),
+    (
+        "Competition panel",
+        "Standing panel for an active competition. Scores are XP earned IN THE PERIOD, "
+        "not lifetime totals. Only the top 3 are accented, so the prize cut-off is readable.",
+        [
+            (
+                "competition-weekly",
+                "Weekly, 5 entrants, mid-period",
+                lambda: render_competition_card(_comp_rows(5), "Weekly", _in(days=3, hours=4)),
+            ),
+            (
+                "competition-monthly",
+                "Monthly with only 2 entrants, hours left",
+                lambda: render_competition_card(_comp_rows(2), "Monthly", _in(hours=5, minutes=20)),
+            ),
+            (
+                "competition-ending",
+                "Past its end instant — reads 'Ending now' rather than a negative countdown",
+                lambda: render_competition_card(_comp_rows(3), "Weekly", _in(minutes=-1)),
+            ),
+            (
+                "competition-empty",
+                "Competition running but nobody has earned yet",
+                lambda: render_competition_card([], "Bi-Weekly", _in(days=13)),
+            ),
+        ],
+    ),
+    (
+        "Competition results",
+        "Posted once when the period closes. Covers all three prize types.",
+        [
+            (
+                "competition-winners",
+                "Full podium: USD, points and a custom prize",
+                lambda: render_competition_winners_card(_winners(3), "Weekly"),
+            ),
+            (
+                "competition-winners-one",
+                "Only one member qualified",
+                lambda: render_competition_winners_card(_winners(1), "Monthly"),
+            ),
+            (
+                "competition-winners-none",
+                "Period closed with no qualifying activity",
+                lambda: render_competition_winners_card([], "Weekly"),
             ),
         ],
     ),

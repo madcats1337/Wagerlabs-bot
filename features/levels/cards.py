@@ -649,3 +649,219 @@ async def render_leaderboard_card(rows) -> discord.File:
             canvas.alpha_composite(divider, dest=(ox + _s(30), y))
 
     return _to_file(_apply_bloom(canvas, light), "leaderboard.png")
+
+
+# ── Competition cards ───────────────────────────────────────────────────────
+
+# Podium colours for places 1-3. Distinct from RANK_COLORS: a bronze-rank member
+# can place first, so tying podium colour to rank tier would be misleading.
+PLACE_COLORS = {
+    1: (250, 204, 21),
+    2: (198, 202, 214),
+    3: (205, 127, 50),
+}
+
+
+def _format_remaining(ends_at, now=None) -> str:
+    """Coarse 'time left' string. Deliberately not second-precision: the panel
+    only re-renders every 10 minutes, so a ticking clock would be wrong for
+    most of its life."""
+    from datetime import datetime, timezone
+
+    now = now or datetime.now(timezone.utc)
+    if ends_at.tzinfo is None:
+        ends_at = ends_at.replace(tzinfo=timezone.utc)
+
+    seconds = int((ends_at - now).total_seconds())
+    if seconds <= 0:
+        return "Ending now"
+
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes = seconds // 60
+    if days:
+        return f"{days}d {hours}h left"
+    if hours:
+        return f"{hours}h {minutes}m left"
+    return f"{minutes}m left"
+
+
+async def render_competition_card(rows, period_label: str, ends_at) -> discord.File:
+    """Standing competition panel: the period board plus time remaining.
+
+    `rows` carry per-period `xp`, NOT lifetime total_xp — the whole point of the
+    competition board is that it is scoped to the period.
+    """
+    row_h = _s(84)
+    header_h = _s(104)
+    avatar_size = _s(56)
+    W = _s(820)
+    H = header_h + row_h * max(len(rows), 1) + _s(24)
+
+    canvas, draw, ox, oy, light = _new_card(W, H)
+
+    title_font = _load_font(36, bold=True)
+    meta_font = _load_font(20)
+    name_font = _load_font(26, bold=True)
+    small_font = _load_font(20)
+
+    draw.text((ox + _s(30), oy + _s(20)), f"{period_label} Competition", fill=ACCENT, font=title_font)
+
+    remaining = _format_remaining(ends_at)
+    draw.text(
+        (ox + W - _s(30) - draw.textlength(remaining, font=meta_font), oy + _s(32)),
+        remaining,
+        fill=SUBTEXT_COLOR,
+        font=meta_font,
+    )
+    draw.text((ox + _s(30), oy + _s(66)), "Top 3 win prizes", fill=SUBTEXT_COLOR, font=meta_font)
+
+    if not rows:
+        draw.text(
+            (ox + _s(30), oy + header_h + _s(20)),
+            "No activity yet this period.",
+            fill=SUBTEXT_COLOR,
+            font=name_font,
+        )
+        return _to_file(_apply_bloom(canvas, light), "competition.png")
+
+    avatars = await _fetch_avatars([row.get("avatar_url") for row in rows], avatar_size)
+
+    text_x = ox + _s(170)
+    xp_texts = [f"{row.get('xp', 0):,} XP" for row in rows]
+    xp_column = max(draw.textlength(t, font=name_font) for t in xp_texts)
+    name_max = int(W - _s(30) - xp_column - _s(24)) - _s(170)
+    divider = _tint(Image.new("L", (W - _s(60), max(1, SCALE // 2)), 255), DIVIDER, DIVIDER_ALPHA)
+
+    y = oy + header_h
+    for index, (row, avatar) in enumerate(zip(rows, avatars)):
+        position = row.get("position", index + 1)
+        # Only the podium places are coloured; the rest stay neutral so the
+        # prize-winning cut-off is readable at a glance.
+        accent = PLACE_COLORS.get(position, SUBTEXT_COLOR)
+
+        draw.text((ox + _s(30), y + row_h // 2 - _s(16)), f"#{position}", fill=accent, font=name_font)
+        _draw_avatar(
+            canvas,
+            light,
+            avatar,
+            ox + _s(100),
+            y + (row_h - avatar_size) // 2,
+            avatar_size,
+            accent,
+            ring_width=3,
+        )
+
+        display_name = row.get("username") or f"User {row.get('discord_id')}"
+        draw.text(
+            (text_x, y + _s(12)),
+            _truncate(draw, display_name, name_font, name_max),
+            fill=TEXT_COLOR,
+            font=name_font,
+        )
+        draw.text(
+            (text_x, y + _s(46)),
+            _truncate(draw, f"{row.get('messages_sent', 0):,} msgs this period", small_font, name_max),
+            fill=SUBTEXT_COLOR,
+            font=small_font,
+        )
+
+        xp_text = xp_texts[index]
+        draw.text(
+            (ox + W - _s(30) - draw.textlength(xp_text, font=name_font), y + row_h // 2 - _s(13)),
+            xp_text,
+            fill=accent,
+            font=name_font,
+        )
+
+        y += row_h
+        if index < len(rows) - 1:
+            canvas.alpha_composite(divider, dest=(ox + _s(30), y))
+
+    return _to_file(_apply_bloom(canvas, light), "competition.png")
+
+
+async def render_competition_winners_card(winners, period_label: str) -> discord.File:
+    """End-of-competition podium: the top 3 and what each of them won.
+
+    `winners` are the FROZEN rows, each with place, username, avatar_url, xp and
+    a pre-formatted `prize` string.
+    """
+    row_h = _s(96)
+    header_h = _s(104)
+    avatar_size = _s(64)
+    W = _s(820)
+    H = header_h + row_h * max(len(winners), 1) + _s(24)
+
+    canvas, draw, ox, oy, light = _new_card(W, H)
+
+    title_font = _load_font(36, bold=True)
+    meta_font = _load_font(20)
+    name_font = _load_font(26, bold=True)
+    prize_font = _load_font(22, bold=True)
+
+    draw.text((ox + _s(30), oy + _s(20)), f"{period_label} Competition Results", fill=ACCENT, font=title_font)
+    draw.text((ox + _s(30), oy + _s(66)), "Congratulations to the top 3", fill=SUBTEXT_COLOR, font=meta_font)
+
+    if not winners:
+        draw.text(
+            (ox + _s(30), oy + header_h + _s(20)),
+            "No qualifying activity this period.",
+            fill=SUBTEXT_COLOR,
+            font=name_font,
+        )
+        return _to_file(_apply_bloom(canvas, light), "competition-winners.png")
+
+    avatars = await _fetch_avatars([w.get("avatar_url") for w in winners], avatar_size)
+
+    text_x = ox + _s(180)
+    prize_texts = [(w.get("prize") or "") for w in winners]
+    prize_column = max([draw.textlength(t, font=prize_font) for t in prize_texts] + [0])
+    name_max = int(W - _s(30) - prize_column - _s(24)) - _s(180)
+    divider = _tint(Image.new("L", (W - _s(60), max(1, SCALE // 2)), 255), DIVIDER, DIVIDER_ALPHA)
+
+    y = oy + header_h
+    for index, (winner, avatar) in enumerate(zip(winners, avatars)):
+        place = winner.get("place", index + 1)
+        accent = PLACE_COLORS.get(place, ACCENT)
+
+        draw.text((ox + _s(30), y + row_h // 2 - _s(16)), f"#{place}", fill=accent, font=name_font)
+        _draw_avatar(
+            canvas,
+            light,
+            avatar,
+            ox + _s(100),
+            y + (row_h - avatar_size) // 2,
+            avatar_size,
+            accent,
+            ring_width=4,
+        )
+
+        display_name = winner.get("username") or f"User {winner.get('discord_id')}"
+        draw.text(
+            (text_x, y + _s(18)),
+            _truncate(draw, display_name, name_font, name_max),
+            fill=TEXT_COLOR,
+            font=name_font,
+        )
+        draw.text(
+            (text_x, y + _s(52)),
+            f"{winner.get('xp', 0):,} XP this period",
+            fill=SUBTEXT_COLOR,
+            font=meta_font,
+        )
+
+        prize = prize_texts[index]
+        if prize:
+            draw.text(
+                (ox + W - _s(30) - draw.textlength(prize, font=prize_font), y + row_h // 2 - _s(11)),
+                prize,
+                fill=accent,
+                font=prize_font,
+            )
+
+        y += row_h
+        if index < len(winners) - 1:
+            canvas.alpha_composite(divider, dest=(ox + _s(30), y))
+
+    return _to_file(_apply_bloom(canvas, light), "competition-winners.png")
