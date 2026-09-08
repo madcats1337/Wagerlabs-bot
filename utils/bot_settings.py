@@ -329,6 +329,16 @@ class BotSettingsManager:
         return self.get_int("raffle_leaderboard_channel_id", env_fallback="RAFFLE_LEADERBOARD_CHANNEL_ID")
 
     @property
+    def levels_channel_id(self) -> Optional[int]:
+        """Discord channel ID for the XP leaderboard panel + level-up/rank-up announcements"""
+        return self.get_int("levels_channel_id")
+
+    @property
+    def levels_enabled(self) -> bool:
+        """Whether the XP/leveling system is active for this server (default on)"""
+        return self.get_bool("levels_enabled", default=True)
+
+    @property
     def raffle_auto_draw(self) -> bool:
         """Whether to automatically draw raffle at period end"""
         return self.get_bool("raffle_auto_draw", env_fallback="RAFFLE_AUTO_DRAW")

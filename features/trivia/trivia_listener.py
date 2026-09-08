@@ -114,6 +114,21 @@ class TriviaAnswerListener(commands.Cog):
             # Re-read so the panel and the dashboard show `prize_paid_at`.
             winner = fetch_event(self.engine, event_id, guild_id) or winner
 
+        try:
+            from features.levels.engine import award_xp
+
+            await award_xp(
+                self.engine,
+                self.bot,
+                guild_id,
+                winner["winner_discord_id"],
+                20,
+                source="trivia",
+                username=winner.get("winner_name"),
+            )
+        except Exception as e:
+            logger.warning(f"[trivia] leveling XP award failed for event {event_id}: {e}")
+
         await refresh_panel(self.bot, self.engine, event_id, guild_id, event=winner)
         await announce_winner(
             self.bot,

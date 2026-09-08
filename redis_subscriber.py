@@ -940,6 +940,31 @@ class RedisSubscriber:
                                 [winner_to_announce], prize_description, guild_id=queue_server_id
                             )
 
+                            # Award leveling XP to the revealed winner (raffle win = 20 XP flat).
+                            # Deliberately placed here, matching the reveal timing (draw -> queue
+                            # -> OBS animation -> this point), not at the earlier draw_winner() call.
+                            try:
+                                from features.levels.engine import award_xp
+
+                                w_discord_id = winner_to_announce.get("winner_discord_id")
+                                if w_discord_id and queue_server_id:
+                                    await award_xp(
+                                        # NOT the module-level `engine`: this
+                                        # function assigns that name further
+                                        # down, which makes it local for the
+                                        # whole scope and would raise
+                                        # UnboundLocalError here.
+                                        get_engine(),
+                                        self.bot,
+                                        int(queue_server_id),
+                                        int(w_discord_id),
+                                        20,
+                                        source="raffle",
+                                        username=winner_to_announce.get("winner_kick_name"),
+                                    )
+                            except Exception as e:
+                                logger.warning(f"[levels] raffle XP award failed: {e}")
+
                             # Also announce in Kick chat. announce_in_chat swallows
                             # its own errors, so a Kick failure never blocks the
                             # Discord announce above.
@@ -1830,6 +1855,7 @@ class RedisSubscriber:
             "link": "link_panels",
             "shuffle_verify": "shuffle_panels",
             "howl_verify": "howl_panels",
+            "levels_leaderboard": "levels_panels",
             # Global super-admin panels for the official guild.
             "patchnotes": "patchnotes_panels",
             "patchnotes_extension": "extension_patchnotes_panels",
@@ -2190,6 +2216,25 @@ class RedisSubscriber:
                         except Exception as e:
                             logger.debug(f"[giveaway] winner discord_id lookup failed: {e}")
                     all_winners = [{"name": winner, "discord_id": winner_discord_id}]
+
+                # Award leveling XP to every winner (giveaway win = 20 XP flat).
+                try:
+                    from features.levels.engine import award_xp
+
+                    for w in all_winners:
+                        w_discord_id = w.get("discord_id")
+                        if w_discord_id:
+                            await award_xp(
+                                engine,
+                                self.bot,
+                                guild_id,
+                                int(w_discord_id),
+                                20,
+                                source="giveaway",
+                                username=w.get("name"),
+                            )
+                except Exception as e:
+                    logger.warning(f"[levels] giveaway XP award failed: {e}")
 
                 from features.giveaway.giveaway_panel import winner_label
 

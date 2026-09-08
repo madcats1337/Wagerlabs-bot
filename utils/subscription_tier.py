@@ -22,7 +22,17 @@ from sqlalchemy import text
 logger = logging.getLogger(__name__)
 
 # Cumulative feature -> tier map. MUST match Admin-Dashboard/utils/tiers.py.
-FREE = ["bonus_hunt", "slot_requests", "gtb", "widgets", "extension"]
+FREE = [
+    "bonus_hunt",
+    "slot_requests",
+    "gtb",
+    "widgets",
+    "extension",
+    # Discord activity XP/leveling system. Free for every tier, but still
+    # requires a live Discord guild (see REQUIRES_DISCORD below). Mirror of
+    # Admin-Dashboard/utils/tiers.py.
+    "levels",
+]
 TIER2 = FREE + [
     "point_shop",
     "point_rewards",
@@ -71,6 +81,7 @@ REQUIRES_DISCORD = {
     "trivia",
     "full_dashboard",
     "leaderboard_generator",
+    "levels",
 }
 
 

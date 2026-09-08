@@ -10033,6 +10033,24 @@ async def on_ready():
             except Exception as e:
                 logger.warning(f"⚠️ Trivia initialization failed (non-fatal): {e}")
 
+            # Levels/XP system: message activity + giveaway/trivia/raffle win XP,
+            # a /rank card, and a standing community-leaderboard panel. Mirrors
+            # the trivia block above (local imports, non-fatal on failure).
+            try:
+                from features.levels.commands import RankCommands
+                from features.levels.database import setup_levels_database
+                from features.levels.listener import MessageXPCog
+                from features.levels.panel import setup_levels_panel_system, start_levels_panel_refresh_loop
+
+                setup_levels_database(engine)
+                await bot.add_cog(MessageXPCog(bot, engine))
+                await bot.add_cog(RankCommands(bot, engine))
+                bot.levels_panels = await setup_levels_panel_system(bot, engine)
+                start_levels_panel_refresh_loop(bot)
+                logger.debug(f"✅ Levels/XP system registered ({len(bot.levels_panels)} guilds)")
+            except Exception as e:
+                logger.warning(f"⚠️ Levels/XP initialization failed (non-fatal): {e}")
+
             # Create slot panels per-guild (but only add cogs once)
             first_guild = True
             for guild in bot.guilds:
