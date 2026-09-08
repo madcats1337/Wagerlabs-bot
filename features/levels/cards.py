@@ -662,35 +662,16 @@ PLACE_COLORS = {
 }
 
 
-def _format_remaining(ends_at, now=None) -> str:
-    """Coarse 'time left' string. Deliberately not second-precision: the panel
-    only re-renders every 10 minutes, so a ticking clock would be wrong for
-    most of its life."""
-    from datetime import datetime, timezone
-
-    now = now or datetime.now(timezone.utc)
-    if ends_at.tzinfo is None:
-        ends_at = ends_at.replace(tzinfo=timezone.utc)
-
-    seconds = int((ends_at - now).total_seconds())
-    if seconds <= 0:
-        return "Ending now"
-
-    days, seconds = divmod(seconds, 86400)
-    hours, seconds = divmod(seconds, 3600)
-    minutes = seconds // 60
-    if days:
-        return f"{days}d {hours}h left"
-    if hours:
-        return f"{hours}h {minutes}m left"
-    return f"{minutes}m left"
-
-
-async def render_competition_card(rows, period_label: str, ends_at) -> discord.File:
-    """Standing competition panel: the period board plus time remaining.
+async def render_competition_card(rows, period_label: str) -> discord.File:
+    """Standing competition panel: the period board.
 
     `rows` carry per-period `xp`, NOT lifetime total_xp — the whole point of the
     competition board is that it is scoped to the period.
+
+    Deliberately renders NO countdown. The panel re-renders every 10 minutes, so
+    a time baked into the pixels is stale for almost its whole life. The
+    remaining time is put in the embed instead as a Discord relative timestamp
+    (<t:...:R>), which every client ticks live.
     """
     row_h = _s(84)
     header_h = _s(104)
@@ -706,14 +687,6 @@ async def render_competition_card(rows, period_label: str, ends_at) -> discord.F
     small_font = _load_font(20)
 
     draw.text((ox + _s(30), oy + _s(20)), f"{period_label} Competition", fill=ACCENT, font=title_font)
-
-    remaining = _format_remaining(ends_at)
-    draw.text(
-        (ox + W - _s(30) - draw.textlength(remaining, font=meta_font), oy + _s(32)),
-        remaining,
-        fill=SUBTEXT_COLOR,
-        font=meta_font,
-    )
     draw.text((ox + _s(30), oy + _s(66)), "Top 3 win prizes", fill=SUBTEXT_COLOR, font=meta_font)
 
     if not rows:
@@ -781,87 +754,200 @@ async def render_competition_card(rows, period_label: str, ends_at) -> discord.F
     return _to_file(_apply_bloom(canvas, light), "competition.png")
 
 
+# Podium, matching the public /leaderboards design language
+# (frontend/src/pages/public/leaderboard/LeaderboardPieces.tsx): a per-place
+# gradient panel whose fill fades IN from the top, a circular rank badge above a
+# ringed avatar, uppercase micro-labels over each value, and 1st raised in the
+# centre with render order 2 - 1 - 3.
+MUTED_LABEL = (118, 118, 130)
+
+_PODIUM_ORDER = (2, 1, 3)
+_PODIUM_RAISE = {1: 24, 2: 0, 3: 0}
+
+# (panel tint, border, badge/label accent) per place. Same yellow / gray /
+# amber-700 families the web podium uses.
+_PODIUM_STYLE = {
+    1: {"tint": (234, 179, 8), "accent": (250, 204, 21), "border_alpha": 77},
+    2: {"tint": (156, 163, 175), "accent": (209, 213, 219), "border_alpha": 51},
+    3: {"tint": (180, 83, 9), "accent": (217, 119, 6), "border_alpha": 51},
+}
+
+
+def _podium_panel(size, tint, border_alpha: int) -> Image.Image:
+    """A rounded panel whose gradient fill fades in from the top.
+
+    The web version does this with a CSS mask-image; here the same effect is a
+    vertical alpha ramp multiplied into the rounded mask, so the panel dissolves
+    into the card instead of sitting on it as a hard rectangle.
+    """
+    w, h = size
+    radius = _s(16)
+
+    ramp = Image.new("L", (1, h))
+    for y in range(h):
+        # 0.04 -> 0.12 alpha over the panel height, matching the web gradient.
+        t = y / max(1, h - 1)
+        ramp.putpixel((0, y), int(255 * (0.04 + 0.08 * t)))
+    ramp = ramp.resize((w, h), Image.Resampling.BILINEAR)
+
+    panel = _tint(ImageChops.multiply(_rounded_mask((w, h), radius), ramp), tint)
+    panel.alpha_composite(_tint(_rounded_outline_mask((w, h), radius, max(1, SCALE // 2)), tint, border_alpha))
+    return panel
+
+
 async def render_competition_winners_card(winners, period_label: str) -> discord.File:
-    """End-of-competition podium: the top 3 and what each of them won.
+    """End-of-competition podium, styled after the public leaderboard podium.
 
     `winners` are the FROZEN rows, each with place, username, avatar_url, xp and
-    a pre-formatted `prize` string.
+    a pre-formatted `prize` string. Fewer than three is normal - a quiet period
+    renders only the places actually won, and the group stays centred.
     """
-    row_h = _s(96)
-    header_h = _s(104)
-    avatar_size = _s(64)
-    W = _s(820)
-    H = header_h + row_h * max(len(winners), 1) + _s(24)
+    W = _s(900)
+    column_w = _s(268)
+    gap = _s(16)
+    panel_top = _s(96)
+
+    # Vertical rhythm inside a panel, in design units from the panel's top. The
+    # panel HEIGHT is DERIVED from these rather than guessed: a fixed height left
+    # ~70 units of dead space under the last line, and moving the content down
+    # only shifted that gap instead of closing it.
+    _BADGE_TOP, _BADGE = 22, 42
+    _AVATAR_GAP, _AVATAR = 18, 74
+    _NAME_GAP, _NAME_H = 16, 30
+    _LABEL_H, _SECTION_GAP = 20, 24
+    _VALUE_H, _PRIZE_H = 28, 34
+    _PANEL_BOTTOM = 18  # room under the last value, mirroring the top inset
+
+    name_y_rel = _BADGE_TOP + _BADGE + _AVATAR_GAP + _AVATAR + _NAME_GAP
+    score_label_rel = name_y_rel + _NAME_H + _SECTION_GAP
+    reward_label_rel = score_label_rel + _LABEL_H + _VALUE_H + _SECTION_GAP
+    panel_h = _s(reward_label_rel + _LABEL_H + _PRIZE_H + _PANEL_BOTTOM)
+    # Card ends just below the panel floor. The panels share a floor at
+    # panel_top + panel_h (1st is raised but grown to match), so anything beyond
+    # a small margin here is dead space under all three at once.
+    # The un-raised panels sit lowest, so they set the card's bottom edge.
+    H = panel_top + panel_h + _s(22)
 
     canvas, draw, ox, oy, light = _new_card(W, H)
 
-    title_font = _load_font(36, bold=True)
-    meta_font = _load_font(20)
-    name_font = _load_font(26, bold=True)
-    prize_font = _load_font(22, bold=True)
+    title_font = _load_font(34, bold=True)
+    badge_font = _load_font(20, bold=True)
+    name_font = _load_font(23, bold=True)
+    label_font = _load_font(14, bold=True)
+    value_font = _load_font(19)
+    prize_font = _load_font(24, bold=True)
 
     draw.text((ox + _s(30), oy + _s(20)), f"{period_label} Competition Results", fill=ACCENT, font=title_font)
-    draw.text((ox + _s(30), oy + _s(66)), "Congratulations to the top 3", fill=SUBTEXT_COLOR, font=meta_font)
 
-    if not winners:
+    by_place = {w.get("place", i + 1): w for i, w in enumerate(winners)}
+    if not by_place:
         draw.text(
-            (ox + _s(30), oy + header_h + _s(20)),
+            (ox + _s(30), oy + _s(200)),
             "No qualifying activity this period.",
             fill=SUBTEXT_COLOR,
             font=name_font,
         )
         return _to_file(_apply_bloom(canvas, light), "competition-winners.png")
 
-    avatars = await _fetch_avatars([w.get("avatar_url") for w in winners], avatar_size)
+    present = [p for p in _PODIUM_ORDER if p in by_place]
+    avatar_size = _s(_AVATAR)
+    avatars = await _fetch_avatars([by_place[p].get("avatar_url") for p in present], avatar_size)
+    avatar_by_place = dict(zip(present, avatars))
 
-    text_x = ox + _s(180)
-    prize_texts = [(w.get("prize") or "") for w in winners]
-    prize_column = max([draw.textlength(t, font=prize_font) for t in prize_texts] + [0])
-    name_max = int(W - _s(30) - prize_column - _s(24)) - _s(180)
-    divider = _tint(Image.new("L", (W - _s(60), max(1, SCALE // 2)), 255), DIVIDER, DIVIDER_ALPHA)
+    total_w = len(present) * column_w + (len(present) - 1) * gap
+    x = ox + (W - total_w) // 2
+    panel_divider = _tint(Image.new("L", (column_w - _s(56), max(1, SCALE // 2)), 255), DIVIDER, DIVIDER_ALPHA)
 
-    y = oy + header_h
-    for index, (winner, avatar) in enumerate(zip(winners, avatars)):
-        place = winner.get("place", index + 1)
-        accent = PLACE_COLORS.get(place, ACCENT)
+    for place in present:
+        winner = by_place[place]
+        style = _PODIUM_STYLE.get(place, _PODIUM_STYLE[1])
+        accent = style["accent"]
+        centre_x = x + column_w // 2
+        # 1st is LIFTED as a whole, the way the web podium does with
+        # -translate-y-6 — every panel keeps the same height. Growing it instead
+        # (to land on a shared floor) turned the entire raise into dead space
+        # under the reward, since the content does not stretch with the panel.
+        raise_by = _s(_PODIUM_RAISE.get(place, 0))
+        top = oy + panel_top - raise_by
 
-        draw.text((ox + _s(30), y + row_h // 2 - _s(16)), f"#{place}", fill=accent, font=name_font)
+        canvas.alpha_composite(
+            _podium_panel((column_w, panel_h), style["tint"], style["border_alpha"]),
+            dest=(x, top),
+        )
+
+        # Circular rank badge.
+        badge_size = _s(_BADGE)
+        badge_x = centre_x - badge_size // 2
+        badge_y = top + _s(_BADGE_TOP)
+        canvas.alpha_composite(_tint(_circle_mask(badge_size), style["tint"], 51), dest=(badge_x, badge_y))
+        canvas.alpha_composite(_tint(_ring_mask(badge_size, max(1, SCALE)), accent, 102), dest=(badge_x, badge_y))
+        badge_text = f"#{place}"
+        draw.text(
+            (centre_x - draw.textlength(badge_text, font=badge_font) / 2, badge_y + _s(9)),
+            badge_text,
+            fill=accent,
+            font=badge_font,
+        )
+
+        avatar_y = badge_y + badge_size + _s(_AVATAR_GAP)
         _draw_avatar(
             canvas,
             light,
-            avatar,
-            ox + _s(100),
-            y + (row_h - avatar_size) // 2,
+            avatar_by_place[place],
+            centre_x - avatar_size // 2,
+            avatar_y,
             avatar_size,
             accent,
-            ring_width=4,
+            ring_width=3,
         )
 
-        display_name = winner.get("username") or f"User {winner.get('discord_id')}"
+        name = _truncate(
+            draw, winner.get("username") or f"User {winner.get('discord_id')}", name_font, column_w - _s(24)
+        )
+        name_y = top + _s(name_y_rel)
         draw.text(
-            (text_x, y + _s(18)),
-            _truncate(draw, display_name, name_font, name_max),
+            (centre_x - draw.textlength(name, font=name_font) / 2, name_y),
+            name,
             fill=TEXT_COLOR,
             font=name_font,
         )
-        draw.text(
-            (text_x, y + _s(52)),
-            f"{winner.get('xp', 0):,} XP this period",
-            fill=SUBTEXT_COLOR,
-            font=meta_font,
-        )
 
-        prize = prize_texts[index]
-        if prize:
+        # Uppercase micro-label over each value, as on the web podium.
+        def _labelled(label, value, value_font, value_fill, top):
             draw.text(
-                (ox + W - _s(30) - draw.textlength(prize, font=prize_font), y + row_h // 2 - _s(11)),
-                prize,
-                fill=accent,
-                font=prize_font,
+                (centre_x - draw.textlength(label, font=label_font) / 2, top),
+                label,
+                fill=MUTED_LABEL,
+                font=label_font,
+            )
+            draw.text(
+                (centre_x - draw.textlength(value, font=value_font) / 2, top + _s(20)),
+                value,
+                fill=value_fill,
+                font=value_font,
             )
 
-        y += row_h
-        if index < len(winners) - 1:
-            canvas.alpha_composite(divider, dest=(ox + _s(30), y))
+        def _divider(top):
+            """Hairline between sections, inset from the panel edge.
+
+            Same DIVIDER/DIVIDER_ALPHA the leaderboard rows use, so every
+            separator in the card set reads at one weight.
+            """
+            canvas.alpha_composite(panel_divider, dest=(x + _s(28), top))
+
+        # The three sections are spread down the panel rather than stacked at
+        # the top: the reward is the payoff line, so it sits low with the dead
+        # space distributed between the groups instead of below them.
+        score_top = top + _s(score_label_rel)
+        _divider(score_top - _s(14))
+        _labelled("SCORE", f"{winner.get('xp', 0):,}", value_font, TEXT_COLOR, score_top)
+
+        prize = _truncate(draw, winner.get("prize") or "", prize_font, column_w - _s(24))
+        if prize:
+            reward_top = top + _s(reward_label_rel)
+            _divider(reward_top - _s(14))
+            _labelled("REWARD", prize, prize_font, accent, reward_top)
+
+        x += column_w + gap
 
     return _to_file(_apply_bloom(canvas, light), "competition-winners.png")

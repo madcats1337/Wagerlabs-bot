@@ -19,10 +19,21 @@ rather than adding a dedicated table for one row of state per guild.
 """
 
 import logging
+from datetime import datetime, timezone
 
 import discord
 from discord.ext import tasks
 from sqlalchemy import text
+
+try:
+    from discord import MediaGalleryItem
+except Exception:  # pragma: no cover - older discord.py
+    MediaGalleryItem = None
+
+try:
+    from discord.ui import Container, LayoutView, MediaGallery, Separator, TextDisplay
+except Exception:  # pragma: no cover - older discord.py
+    Container = LayoutView = MediaGallery = Separator = TextDisplay = None
 
 from .cards import render_competition_card, render_competition_winners_card, render_leaderboard_card
 from .competition import (
@@ -41,6 +52,60 @@ logger = logging.getLogger(__name__)
 PANEL_TYPE = "levels_leaderboard"
 COMPETITION_PANEL_TYPE = "levels_competition"
 TOP_N = 10
+
+ACCENT_COLOR = 0xFACC15  # Wagerlabs yellow
+
+
+def _relative_timestamp(moment) -> str:
+    """Discord relative timestamp, e.g. "<t:1699999999:R>".
+
+    Rendered and ticked CLIENT-side, which is the whole reason the countdown is
+    NOT drawn into the card: the panel image only re-renders every 10 minutes,
+    so a baked-in "3d 3h left" is wrong for almost its entire life. Mirrors
+    features/giveaway/giveaway_panel.py::_fmt_deadline.
+    """
+    if not moment:
+        return ""
+    if isinstance(moment, str):
+        try:
+            moment = datetime.fromisoformat(moment)
+        except ValueError:
+            return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return f"<t:{int(moment.timestamp())}:R>"
+
+
+def _competition_view(competition, filename: str):
+    """Components V2 layout: the rendered board plus a LIVE countdown.
+
+    A V2 message cannot carry an embed, so the image rides in a MediaGallery
+    referencing the attachment and the countdown sits in a TextDisplay beside
+    it. Returns None when this discord.py build lacks V2, so the caller can fall
+    back to sending the bare image rather than posting nothing.
+    """
+    if LayoutView is None or MediaGalleryItem is None:
+        return None
+
+    label = PERIOD_LABELS.get(competition["period_type"], "Activity")
+    ends = _relative_timestamp(competition["end_date"])
+
+    view = LayoutView(timeout=None)
+    container = Container(accent_colour=ACCENT_COLOR)
+    container.add_item(TextDisplay(f"## {label} Competition"))
+    container.add_item(
+        TextDisplay(
+            f"Top 3 most active members win prizes. Ends {ends}." if ends else "Top 3 most active members win prizes."
+        )
+    )
+    container.add_item(MediaGallery(MediaGalleryItem(f"attachment://{filename}")))
+    container.add_item(Separator())
+    container.add_item(
+        TextDisplay("-# Scores count XP earned during this competition only — separate from the community leaderboard.")
+    )
+    view.add_item(container)
+    return view
+
 
 # Holds the refresh tasks.loop — module-level so the closure-defined loop
 # isn't garbage-collected once start_levels_panel_refresh_loop returns (same
@@ -96,19 +161,23 @@ class LevelsPanel:
         self._load_panel_info()
 
     async def _render(self):
-        """The image this panel currently shows, or None when it has nothing
-        to show (competition panel with no competition running)."""
+        """(file, view) for this panel, or (None, None) when it has nothing to
+        show (competition panel with no competition running).
+
+        `view` is a Components V2 layout for the competition panel — that is
+        what carries the live countdown next to the image — and None for the
+        plain leaderboard panel.
+        """
         if self.panel_type == COMPETITION_PANEL_TYPE:
             competition = get_active_competition(self.engine, self.guild_id)
             if not competition:
-                return None
+                return None, None
             board = get_competition_board(self.engine, competition["id"], limit=TOP_N)
-            return await render_competition_card(
-                board,
-                PERIOD_LABELS.get(competition["period_type"], "Activity"),
-                competition["end_date"],
-            )
-        return await render_leaderboard_card(_fetch_leaderboard_rows(self.engine, self.guild_id))
+            file = await render_competition_card(board, PERIOD_LABELS.get(competition["period_type"], "Activity"))
+            return file, _competition_view(competition, file.filename)
+
+        file = await render_leaderboard_card(_fetch_leaderboard_rows(self.engine, self.guild_id))
+        return file, None
 
     def _load_panel_info(self):
         try:
@@ -156,11 +225,14 @@ class LevelsPanel:
     async def create_panel(self, channel: discord.TextChannel):
         """Post the panel fresh in `channel` (used for the initial post and moves)."""
         try:
-            file = await self._render()
+            file, view = await self._render()
             if file is None:
                 logger.info(f"[levels] no active competition for guild {self.guild_id}; panel not posted")
                 return False
-            message = await channel.send(file=file)
+            kwargs = {"file": file}
+            if view is not None:
+                kwargs["view"] = view
+            message = await channel.send(**kwargs)
             self.panel_channel_id = channel.id
             self.panel_message_id = message.id
             self._save_panel_info(channel.id, message.id)
@@ -199,11 +271,17 @@ class LevelsPanel:
                 return
 
         try:
-            file = await self._render()
+            file, view = await self._render()
             if file is None:
                 return
             message = await channel.fetch_message(self.panel_message_id)
-            await message.edit(attachments=[file])
+            # The countdown is a client-ticked timestamp in the view, so the
+            # view is re-sent alongside the image to keep the end instant in
+            # step with a competition that renewed since the last refresh.
+            if view is not None:
+                await message.edit(attachments=[file], view=view)
+            else:
+                await message.edit(attachments=[file])
         except discord.NotFound:
             logger.info(f"[levels] {self.panel_type} panel message gone for guild {self.guild_id}; reposting")
             await self.create_panel(channel)
@@ -256,11 +334,26 @@ async def _announce_competition_end(bot, engine, guild_id, competition, winners)
             }
             for w in winners
         ]
-        file = await render_competition_winners_card(
-            card_rows, PERIOD_LABELS.get(competition["period_type"], "Activity")
-        )
+        label = PERIOD_LABELS.get(competition["period_type"], "Activity")
+        file = await render_competition_winners_card(card_rows, label)
         mentions = " ".join(f"<@{w['discord_id']}>" for w in winners)
-        await channel.send(content=mentions or None, file=file)
+
+        view = None
+        if LayoutView is not None and MediaGalleryItem is not None:
+            view = LayoutView(timeout=None)
+            container = Container(accent_colour=ACCENT_COLOR)
+            container.add_item(TextDisplay(f"## {label} Competition Results"))
+            if mentions:
+                container.add_item(TextDisplay(f"Congratulations {mentions}!"))
+            container.add_item(MediaGallery(MediaGalleryItem(f"attachment://{file.filename}")))
+            view.add_item(container)
+
+        if view is not None:
+            # A V2 message carries its text inside the container, so `content`
+            # would be rejected here.
+            await channel.send(file=file, view=view)
+        else:
+            await channel.send(content=mentions or None, file=file)
     except Exception as e:
         logger.error(f"[levels] failed to post competition results for guild {guild_id}: {e}")
 

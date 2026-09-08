@@ -262,27 +262,23 @@ GROUPS = [
     (
         "Competition panel",
         "Standing panel for an active competition. Scores are XP earned IN THE PERIOD, "
-        "not lifetime totals. Only the top 3 are accented, so the prize cut-off is readable.",
+        "not lifetime totals. Only the top 3 are accented. The countdown is NOT drawn here — "
+        "it lives in the Components V2 message as a client-ticked timestamp.",
         [
             (
                 "competition-weekly",
                 "Weekly, 5 entrants, mid-period",
-                lambda: render_competition_card(_comp_rows(5), "Weekly", _in(days=3, hours=4)),
+                lambda: render_competition_card(_comp_rows(5), "Weekly"),
             ),
             (
                 "competition-monthly",
                 "Monthly with only 2 entrants, hours left",
-                lambda: render_competition_card(_comp_rows(2), "Monthly", _in(hours=5, minutes=20)),
-            ),
-            (
-                "competition-ending",
-                "Past its end instant — reads 'Ending now' rather than a negative countdown",
-                lambda: render_competition_card(_comp_rows(3), "Weekly", _in(minutes=-1)),
+                lambda: render_competition_card(_comp_rows(2), "Monthly"),
             ),
             (
                 "competition-empty",
                 "Competition running but nobody has earned yet",
-                lambda: render_competition_card([], "Bi-Weekly", _in(days=13)),
+                lambda: render_competition_card([], "Bi-Weekly"),
             ),
         ],
     ),
@@ -294,6 +290,11 @@ GROUPS = [
                 "competition-winners",
                 "Full podium: USD, points and a custom prize",
                 lambda: render_competition_winners_card(_winners(3), "Weekly"),
+            ),
+            (
+                "competition-winners-two",
+                "Only two members qualified — the podium centres on what was won",
+                lambda: render_competition_winners_card(_winners(2), "Weekly"),
             ),
             (
                 "competition-winners-one",
