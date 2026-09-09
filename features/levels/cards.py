@@ -1116,11 +1116,11 @@ def _parse_color(value, fallback):
     """
     if not value or not isinstance(value, str):
         return fallback
-    text_value = value.strip().lower()
 
+    text_value = value.strip().lower()
     if text_value.startswith("#"):
         hex_digits = text_value[1:]
-        if len(hex_digits) == 3:
+        if len(hex_digits) in (3, 4):
             hex_digits = "".join(c * 2 for c in hex_digits)
         if len(hex_digits) in (6, 8):
             try:
@@ -1175,11 +1175,21 @@ def _parse_gradient(value):
     return "linear", stops, angle
 
 
-def _multi_gradient(size, colors, horizontal: bool) -> Image.Image:
-    """An N-stop linear gradient, stops spaced evenly along the axis."""
+def _multi_gradient(size, colors, angle_deg: float) -> Image.Image:
+    """An N-stop linear gradient at an arbitrary angle."""
+    import math
+
     width, height = size
-    span = width if horizontal else height
-    strip = Image.new("RGBA", (span, 1) if horizontal else (1, span))
+
+    # CSS angle to mathematical angle (0 is right, 90 is up)
+    theta = math.radians(90 - angle_deg)
+
+    # Distance between the two corner-perpendiculars
+    span = int(math.ceil(abs(width * math.cos(theta)) + abs(height * math.sin(theta))))
+    if span < 1:
+        span = 1
+
+    strip = Image.new("RGBA", (span, 1))
     pixels = strip.load()
 
     segments = len(colors) - 1
@@ -1193,12 +1203,15 @@ def _multi_gradient(size, colors, horizontal: bool) -> Image.Image:
         e = end if len(end) == 4 else end + (255,)
 
         blended = tuple(int(round(s[c] + (e[c] - s[c]) * local)) for c in range(4))
-        if horizontal:
-            pixels[i, 0] = blended
-        else:
-            pixels[0, i] = blended
+        pixels[i, 0] = blended
 
-    return strip.resize(size, Image.Resampling.BILINEAR)
+    square = strip.resize((span, span), Image.Resampling.BILINEAR)
+    rot = square.rotate(90 - angle_deg, resample=Image.Resampling.BILINEAR, expand=True)
+
+    rx, ry = rot.size
+    left = (rx - width) // 2
+    top = (ry - height) // 2
+    return rot.crop((left, top, left + width, top + height))
 
 
 def _banner_background(size, background):
@@ -1206,11 +1219,6 @@ def _banner_background(size, background):
 
     Returns None to mean "use the default card gradient", so an unset theme
     takes the exact path the unthemed card always did.
-
-    The picker emits a CSS angle, but PIL has no cheap rotated-gradient fill.
-    Rather than rasterise a rotated ramp (and handle the corner coverage that
-    needs), the angle snaps to the nearer of vertical/horizontal -- the two that
-    actually read as intentional at an 820x200 banner's aspect.
     """
     if not background:
         return None
@@ -1230,10 +1238,7 @@ def _banner_background(size, background):
             return Image.new("RGBA", size, solid)
         return None
 
-    # CSS 0deg points up and angles run clockwise, so 90/270 are the horizontal
-    # axis and 0/180 the vertical one.
-    horizontal = 45 <= (angle % 180) < 135
-    return _multi_gradient(size, colors, horizontal)
+    return _multi_gradient(size, colors, angle)
 
 
 class BannerTheme:
