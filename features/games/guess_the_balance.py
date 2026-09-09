@@ -406,6 +406,10 @@ class GuessTheBalanceManager:
             return None
 
 
+#: gtb_guesses.guess_amount is NUMERIC(12, 2) — 10 digits before the point.
+MAX_GUESS_AMOUNT = 999999999999.99
+
+
 def parse_amount(amount_str: str) -> Optional[float]:
     """
     Parse amount string to float, handling commas and dollar signs
@@ -414,6 +418,14 @@ def parse_amount(amount_str: str) -> Optional[float]:
         "$1234.56" -> 1234.56
         "1,234.56" -> 1234.56
         "1234" -> 1234.0
+
+    Returns None for anything that is not a usable amount, which INCLUDES the
+    special floats: `float()` happily accepts "nan", "inf" and overflowing
+    literals like "1e400". `nan <= 0` is False, so a bare positivity check lets
+    NaN through and it reaches the NUMERIC column as a value no comparison can
+    order — which would quietly corrupt winner scoring. Bound the magnitude here
+    too, so an out-of-range guess is refused with a message instead of raising
+    a numeric-overflow error out of the INSERT.
     """
     try:
         # Remove dollar signs, commas, and spaces
@@ -422,10 +434,11 @@ def parse_amount(amount_str: str) -> Optional[float]:
         # Convert to float
         amount = float(cleaned)
 
-        # Validate
-        if amount <= 0:
+        # Validate. `amount != amount` is the NaN test (NaN is not equal to
+        # itself); the range check rejects the infinities on the same pass.
+        if amount != amount or amount <= 0 or amount > MAX_GUESS_AMOUNT:
             return None
 
         return amount
-    except (ValueError, InvalidOperation):
+    except (ValueError, InvalidOperation, AttributeError, TypeError):
         return None

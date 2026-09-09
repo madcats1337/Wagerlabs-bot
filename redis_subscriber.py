@@ -591,7 +591,6 @@ class RedisSubscriber:
 
         if action == "open":
             session_id = data.get("session_id")
-            opened_by = data.get("opened_by")
             winner_count = data.get("winner_count", 3) or 3
             # "winner" vs "winners" so a count of 1 reads correctly.
             winner_label = "winner" if winner_count == 1 else "winners"
@@ -602,17 +601,21 @@ class RedisSubscriber:
                 guild_id=guild_id,
             )
 
-            # Post to Discord GTB channel if available
-            if hasattr(self.bot, "gtb_channel_id") and self.bot.gtb_channel_id:
-                try:
-                    channel = self.bot.get_channel(self.bot.gtb_channel_id)
-                    if channel:
-                        await channel.send(
-                            f"💰 **GTB Session #{session_id} OPENED** by {opened_by} "
-                            f"— top {winner_count} {winner_label} will be picked"
-                        )
-                except Exception as e:
-                    logger.info(f"Failed to send Discord notification: {e}")
+            # Announce in the Discord channel bound on the dashboard. This is
+            # the interactive Components V2 panel: it carries a Submit Guess
+            # button, so linked members can guess without leaving Discord.
+            #
+            # (This replaces a `self.bot.gtb_channel_id` block that could never
+            # fire — that attribute was never assigned anywhere, so the Discord
+            # notification silently did nothing. The channel is read per-guild
+            # from bot_settings instead, which is also what makes it
+            # multi-tenant.)
+            try:
+                from features.games.gtb_notification import post_notification
+
+                await post_notification(self.bot, get_engine(), guild_id, session_id)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to post GTB session announcement: {e}")
 
             # Update Discord GTB panel for this guild
             if guild_id and hasattr(self.bot, "gtb_panels_by_guild"):
@@ -634,14 +637,15 @@ class RedisSubscriber:
                 f"🔒 Guess the Balance session #{session_id} is now CLOSED! No more guesses allowed.", guild_id=guild_id
             )
 
-            # Post to Discord
-            if hasattr(self.bot, "gtb_channel_id") and self.bot.gtb_channel_id:
-                try:
-                    channel = self.bot.get_channel(self.bot.gtb_channel_id)
-                    if channel:
-                        await channel.send(f"🔒 **GTB Session #{session_id} CLOSED** - Guessing is over!")
-                except Exception as e:
-                    logger.info(f"Failed to send Discord notification: {e}")
+            # Re-render the announcement in place: status flips to closed and
+            # the Submit Guess button is dropped, so the message cannot take a
+            # guess the session would reject anyway.
+            try:
+                from features.games.gtb_notification import refresh_notification
+
+                await refresh_notification(self.bot, get_engine(), guild_id, session_id)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to refresh GTB session announcement: {e}")
 
             # Update Discord GTB panel for this guild
             if guild_id and hasattr(self.bot, "gtb_panels_by_guild"):
@@ -725,14 +729,13 @@ class RedisSubscriber:
                 else:
                     logger.warning(f"⚠️ GTB manager not available and no winners provided in message")
 
-            # Post to Discord
-            if hasattr(self.bot, "gtb_channel_id") and self.bot.gtb_channel_id:
-                try:
-                    channel = self.bot.get_channel(self.bot.gtb_channel_id)
-                    if channel:
-                        await channel.send(f"🎉 **GTB Result Set**: ${result_amount:,.2f}")
-                except Exception as e:
-                    logger.info(f"Failed to send Discord notification: {e}")
+            # Re-render the announcement with the final balance and winners.
+            try:
+                from features.games.gtb_notification import refresh_notification
+
+                await refresh_notification(self.bot, get_engine(), guild_id, session_id)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to refresh GTB session announcement: {e}")
 
             # Update Discord GTB panel for this guild
             if guild_id and hasattr(self.bot, "gtb_panels_by_guild"):

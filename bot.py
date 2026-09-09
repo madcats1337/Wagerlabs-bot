@@ -9994,6 +9994,16 @@ async def on_ready():
             bot.add_view(gtb_persistent_view)
             logger.debug(f"✅ GTB panel persistent view registered (handles all guilds)")
 
+            # GTB session ANNOUNCEMENT (member-facing, separate from the admin
+            # control panel above): a stateless template so the Submit Guess
+            # button on announcements posted before this restart re-binds. Its
+            # callback reads the guild, the open session and the member's
+            # linked handle from the interaction + DB, never from this instance.
+            from features.games.gtb_notification import GtbNotificationView
+
+            bot.add_view(GtbNotificationView.template(engine))
+            logger.debug(f"✅ GTB notification persistent view registered (handles all guilds)")
+
             # Point shop storefront: register a stateless template so the
             # purchase select and balance button on already-posted shop
             # messages keep working after a restart (their callbacks read all
