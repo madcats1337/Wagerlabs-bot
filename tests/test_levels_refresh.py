@@ -8,6 +8,7 @@ dozen near-identical states.
 """
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -154,3 +155,85 @@ def test_request_outside_an_event_loop_is_survivable():
     bot = FakeBot(1)
     PANEL.request_panel_refresh(bot, 1)  # no running loop — must not raise
     assert not PANEL._pending_refreshes
+
+
+# ── Components V2 -> embed migration ────────────────────────────────────────
+
+
+def _panel_over(message):
+    """A LevelsPanel wired to `message`, with the DB and render stubbed out."""
+    panel = PANEL.LevelsPanel.__new__(PANEL.LevelsPanel)
+    panel.bot = MagicMock()
+    panel.engine = MagicMock()
+    panel.guild_id = 1
+    panel.panel_type = PANEL.PANEL_TYPE
+    panel.panel_channel_id = 10
+    panel.panel_message_id = 20
+    panel._enabled = lambda: True
+    panel._render = AsyncMock(return_value=(MagicMock(), MagicMock(), MagicMock()))
+    panel.create_panel = AsyncMock(return_value=True)
+
+    channel = MagicMock()
+    channel.fetch_message = AsyncMock(return_value=message)
+    panel.bot.get_channel.return_value = channel
+    return panel, channel
+
+
+def _message(components_v2):
+    message = MagicMock()
+    message.flags.components_v2 = components_v2
+    message.edit = AsyncMock()
+    message.delete = AsyncMock()
+    return message
+
+
+def test_a_components_v2_panel_is_reposted_not_edited():
+    """The IS_COMPONENTS_V2 flag is set at creation and cannot be cleared.
+
+    Editing an embed onto such a message silently does nothing, so a panel
+    posted by the older V2 layout would render the old design forever and every
+    fix would look like it had no effect. This shipped exactly that way.
+    """
+
+    async def _test():
+        message = _message(components_v2=True)
+        panel, _ = _panel_over(message)
+
+        await panel.refresh()
+
+        panel.create_panel.assert_awaited_once()
+        message.delete.assert_awaited_once()
+        message.edit.assert_not_awaited()
+
+    asyncio.run(_test())
+
+
+def test_an_embed_panel_is_edited_in_place():
+    """The normal path: no repost, so the message keeps its place in channel."""
+
+    async def _test():
+        message = _message(components_v2=False)
+        panel, _ = _panel_over(message)
+
+        await panel.refresh()
+
+        message.edit.assert_awaited_once()
+        panel.create_panel.assert_not_awaited()
+        message.delete.assert_not_awaited()
+
+    asyncio.run(_test())
+
+
+def test_the_stale_panel_survives_a_failed_repost():
+    """Post before delete: a failure must leave the old board, not nothing."""
+
+    async def _test():
+        message = _message(components_v2=True)
+        panel, _ = _panel_over(message)
+        panel.create_panel = AsyncMock(return_value=False)
+
+        await panel.refresh()
+
+        message.delete.assert_not_awaited()
+
+    asyncio.run(_test())

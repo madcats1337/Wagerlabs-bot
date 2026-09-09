@@ -256,6 +256,22 @@ class LevelsPanel:
         except Exception:
             return True
 
+    async def _replace_panel(self, channel, stale_message):
+        """Post a fresh panel, then remove the one it supersedes.
+
+        Used when the existing message cannot render what we now produce (see
+        refresh). Posts BEFORE deleting so a failure leaves the channel with the
+        old board rather than with nothing — the same move-semantics ordering
+        the link/verify panels use.
+        """
+        if not await self.create_panel(channel):
+            return
+        try:
+            await stale_message.delete()
+        except Exception as e:
+            # The new panel is already up; a leftover copy is untidy, not broken.
+            logger.warning(f"[levels] could not delete superseded panel for guild {self.guild_id}: {e}")
+
     async def refresh(self):
         """Re-render and edit the standing message in place; re-post if it's gone."""
         if not self.panel_channel_id or not self.panel_message_id:
@@ -275,6 +291,21 @@ class LevelsPanel:
             if file is None:
                 return
             message = await channel.fetch_message(self.panel_message_id)
+
+            # A message posted as Components V2 can NEVER carry an embed: the
+            # IS_COMPONENTS_V2 flag is set at creation and cannot be cleared, so
+            # editing embed= onto it silently does nothing. Panels posted by the
+            # older V2 layout therefore have to be re-POSTED once to pick up the
+            # embed board — otherwise they keep rendering the old design forever
+            # and every "fix" appears to have no effect.
+            if message.flags.components_v2:
+                logger.info(
+                    f"[levels] {self.panel_type} panel for guild {self.guild_id} is a "
+                    "Components V2 message and cannot hold an embed; reposting"
+                )
+                await self._replace_panel(channel, message)
+                return
+
             # Embed and view are re-sent alongside the image: the rows change on
             # every refresh, and the competition countdown is a client-ticked
             # timestamp that must track a period which may have renewed.
