@@ -1108,12 +1108,11 @@ def _load_banner_font(font_key: str, size: int, bold: bool = False):
 
 
 def _parse_color(value, fallback):
-    """A CSS-ish colour string -> an RGB tuple, or `fallback`.
+    """A CSS-ish colour string -> an RGBA tuple, or `fallback`.
 
-    Accepts "#rgb", "#rrggbb", "#rrggbbaa" and "rgb()/rgba()" -- the forms the
-    dashboard colour picker emits. Alpha is parsed but dropped: the banner
-    composites onto its own opaque card, so a translucent fill would read as a
-    muddied colour rather than as transparency.
+    Accepts "#rgb", "#rrggbb", "#rrggbbaa" and "rgb()/rgba()".
+    Alpha is parsed so gradients can fade to transparent (revealing the
+    default card background behind them).
     """
     if not value or not isinstance(value, str):
         return fallback
@@ -1125,21 +1124,22 @@ def _parse_color(value, fallback):
             hex_digits = "".join(c * 2 for c in hex_digits)
         if len(hex_digits) in (6, 8):
             try:
-                return tuple(int(hex_digits[i : i + 2], 16) for i in (0, 2, 4))
+                r, g, b = (int(hex_digits[i : i + 2], 16) for i in (0, 2, 4))
+                a = int(hex_digits[6:8], 16) if len(hex_digits) == 8 else 255
+                return (r, g, b, a)
             except ValueError:
                 return fallback
         return fallback
 
     if text_value.startswith("rgb"):
         inner = text_value[text_value.find("(") + 1 : text_value.rfind(")")]
-        parts = [p.strip() for p in inner.split(",")[:3]]
-        # Must be exactly three components: a short "rgb(1,2)" would otherwise
-        # return a 2-tuple, which PIL then rejects deep inside a fill call
-        # rather than here where it can fall back cleanly.
-        if len(parts) != 3:
+        parts = [p.strip() for p in inner.split(",")]
+        if len(parts) not in (3, 4):
             return fallback
         try:
-            return tuple(max(0, min(255, int(round(float(p))))) for p in parts)
+            r, g, b = (max(0, min(255, int(round(float(p))))) for p in parts[:3])
+            a = max(0, min(255, int(round(float(parts[3]) * 255)))) if len(parts) == 4 else 255
+            return (r, g, b, a)
         except (ValueError, IndexError):
             return fallback
 
@@ -1179,7 +1179,7 @@ def _multi_gradient(size, colors, horizontal: bool) -> Image.Image:
     """An N-stop linear gradient, stops spaced evenly along the axis."""
     width, height = size
     span = width if horizontal else height
-    strip = Image.new("RGB", (span, 1) if horizontal else (1, span))
+    strip = Image.new("RGBA", (span, 1) if horizontal else (1, span))
     pixels = strip.load()
 
     segments = len(colors) - 1
@@ -1188,7 +1188,11 @@ def _multi_gradient(size, colors, horizontal: bool) -> Image.Image:
         index = min(int(t), segments - 1)
         local = t - index
         start, end = colors[index], colors[index + 1]
-        blended = tuple(int(round(start[c] + (end[c] - start[c]) * local)) for c in range(3))
+
+        s = start if len(start) == 4 else start + (255,)
+        e = end if len(end) == 4 else end + (255,)
+
+        blended = tuple(int(round(s[c] + (e[c] - s[c]) * local)) for c in range(4))
         if horizontal:
             pixels[i, 0] = blended
         else:
@@ -1214,11 +1218,17 @@ def _banner_background(size, background):
     kind, raw_colors, angle = _parse_gradient(background)
     if kind == "solid":
         solid = _parse_color(raw_colors[0], None)
-        return Image.new("RGB", size, solid) if solid else None
+        if solid:
+            solid = solid if len(solid) == 4 else solid + (255,)
+            return Image.new("RGBA", size, solid)
+        return None
 
     colors = [c for c in (_parse_color(c, None) for c in raw_colors) if c is not None]
     if len(colors) < 2:
-        return Image.new("RGB", size, colors[0]) if colors else None
+        if colors:
+            solid = colors[0] if len(colors[0]) == 4 else colors[0] + (255,)
+            return Image.new("RGBA", size, solid)
+        return None
 
     # CSS 0deg points up and angles run clockwise, so 90/270 are the horizontal
     # axis and 0/180 the vertical one.
