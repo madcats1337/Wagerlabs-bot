@@ -1,13 +1,18 @@
 """Paginated leaderboard rendering for the standing Levels panels.
 
 The board used to be one rendered image of the top 10. It is now a BANNER image
-(identity + headline values, see cards.render_banner_png) above the entries as
-TEXT, ten to a page. Two reasons:
+(identity + headline values, see cards.render_banner_png) attached above a rich
+EMBED holding the entries, ten to a page. Two reasons:
 
   • a rendered row costs an image re-render and a re-upload on every page turn
     and every refresh, where text is a message edit;
   • rendered text is not selectable, copyable, or searchable in Discord, and
     does not scale with the reader's accessibility settings.
+
+The columns are three `inline=True` embed fields — Discord's own column
+mechanism. Nothing is padded into alignment, so a variable-width @mention in
+one column cannot push the others out of line, which is what defeated every
+text-only attempt at a table.
 
 Paging is PRIVATE to the clicker. The panel is one standing message shared by
 the whole channel, so editing it on a Next click would drag every other reader's
@@ -23,6 +28,8 @@ rows would break on the first redeploy (the same rule the point-shop callbacks
 follow).
 """
 
+import asyncio
+import io
 import logging
 
 import discord
@@ -45,6 +52,10 @@ COMPETITION_PAGE_ID = "levels_comp_page"
 # Hard cap on pages. 200 rows is far past what anyone scrolls to, and it bounds
 # both the OFFSET the database sees and the page count in the label.
 MAX_PAGES = 20
+
+# Attachment name the panel uploads the banner under. Lives here because both
+# the panel and the ephemeral pager attach it, and panel.py imports this module.
+BANNER_FILENAME = "leaderboard-banner.png"
 
 
 def _page_count(total: int) -> int:
@@ -398,26 +409,33 @@ def build_board_embed(
     empty_text,
     footer=None,
 ):
-    """The board as a rich embed: banner image on top, then the columns.
+    """The board as a rich embed: three inline columns.
 
     `columns` is the [(name, value, inline)] list from leaderboard_columns /
     competition_columns. Three inline fields render as three real columns —
     Discord aligns them, so a variable-width @mention in the first cannot push
     the other two out of line.
 
-    `banner_filename` references an attachment on the SAME message (the standing
-    panel, which uploads the PNG). `banner_url` points at an already-uploaded
-    one — the ephemeral pager reuses the panel's image that way rather than
-    re-uploading a copy per page turn.
+    THE BANNER IS NOT PART OF THIS EMBED when it is an attachment on the same
+    message. `set_image` always renders at the BOTTOM of an embed, below the
+    fields, and no embed slot puts a full-width image above them — so the
+    standing panel uploads the banner as a plain attachment instead, which
+    Discord lays out ABOVE the embed. `banner_filename` is therefore accepted
+    and deliberately not referenced here; it exists so callers read as
+    symmetrical and so this comment sits where the mistake would be made.
+
+    `banner_url` is the ephemeral pager's case: an ephemeral reply cannot carry
+    an attachment, so it reuses the panel's already-uploaded image. There the
+    banner HAS to ride inside the embed, and it lands under the columns — the
+    trade for not re-uploading a few hundred KB on every page turn.
     """
     embed = discord.Embed(colour=ACCENT_COLOR)
 
-    image = banner_url or (f"attachment://{banner_filename}" if banner_filename else None)
-    if image:
-        embed.set_image(url=image)
-    else:
-        # No banner (the render failed) — the title carries the board instead,
-        # so the panel still reads rather than posting an untitled embed.
+    if banner_url:
+        embed.set_image(url=banner_url)
+    elif not banner_filename:
+        # No banner at all (the render failed) — the title carries the board so
+        # the panel still reads rather than posting an untitled embed.
         embed.title = header
 
     if subheader:
@@ -438,17 +456,52 @@ def build_board_embed(
 # ── Ephemeral pager ─────────────────────────────────────────────────────────
 
 
-def _banner_url_from(message):
-    """The banner already attached to the panel message, if it is still there.
+async def _render_banner_for(bot, engine, guild_id, prefix):
+    """(file, header) — the banner for an ephemeral page, or (None, header).
 
-    Reused by the ephemeral pager so paging never re-uploads the image: the
-    banner is identical on every page, and a fresh upload per click would cost
-    a render and a few hundred KB each time.
+    Re-rendered rather than reusing the panel's uploaded copy by URL. Pointing
+    an embed at that URL was the cheaper option, but `set_image` renders at the
+    BOTTOM of an embed: the pager would then show the banner UNDER the columns
+    while the panel shows it above, and the two would not look like the same
+    board. Rendering costs ~200ms on a thread and is only paid on a click.
     """
-    for attachment in getattr(message, "attachments", ()) or ():
-        if attachment.filename.endswith(".png"):
-            return attachment.url
-    return None
+    from .cards import BannerTheme
+
+    getter = getattr(bot, "get_guild_settings", None)
+    theme = BannerTheme()
+    if callable(getter):
+        try:
+            theme = BannerTheme.from_settings(getter(guild_id))
+        except Exception:
+            pass
+
+    try:
+        if prefix == COMPETITION_PAGE_ID:
+            competition = get_active_competition(engine, guild_id)
+            label = PERIOD_LABELS.get((competition or {}).get("period_type"), "Activity")
+            header = f"{label} Competition"
+            png = await asyncio.to_thread(
+                render_banner_png,
+                header,
+                "Top 3 most active members win prizes",
+                competition_stats(competition) if competition else [],
+                theme,
+            )
+        else:
+            header = "Community Leaderboard"
+            png = await asyncio.to_thread(
+                render_banner_png,
+                header,
+                "Every member's lifetime XP",
+                leaderboard_stats(engine, guild_id),
+                theme,
+            )
+        return discord.File(io.BytesIO(png), filename=BANNER_FILENAME), header
+    except Exception as e:
+        # A failed banner must not cost the reader their page — the embed falls
+        # back to a plain title.
+        logger.warning(f"[levels] banner render failed for guild {guild_id}: {e}")
+        return None, "Community Leaderboard" if prefix != COMPETITION_PAGE_ID else "Competition"
 
 
 async def handle_page_click(bot, interaction, prefix, page):
@@ -465,28 +518,28 @@ async def handle_page_click(bot, interaction, prefix, page):
         return
 
     guild_id = interaction.guild_id
-    banner_url = _banner_url_from(interaction.message)
 
     try:
+        banner, header = await _render_banner_for(bot, engine, guild_id, prefix)
+
         if prefix == COMPETITION_PAGE_ID:
             competition = get_active_competition(engine, guild_id)
             if not competition:
                 await interaction.response.send_message("No competition is running.", ephemeral=True)
                 return
             rows, total, page = fetch_competition_page(engine, competition["id"], page)
-            label = PERIOD_LABELS.get(competition["period_type"], "Activity")
             embed = build_board_embed(
                 columns=competition_columns(rows),
-                banner_url=banner_url,
-                header=f"{label} Competition",
+                banner_filename=BANNER_FILENAME if banner else None,
+                header=header,
                 empty_text="No activity yet this period.",
             )
         else:
             rows, total, page = fetch_leaderboard_page(engine, guild_id, page)
             embed = build_board_embed(
                 columns=leaderboard_columns(rows),
-                banner_url=banner_url,
-                header="Community Leaderboard",
+                banner_filename=BANNER_FILENAME if banner else None,
+                header=header,
                 empty_text="No activity yet.",
             )
         view = BoardPager(prefix, page, total) if total > PAGE_SIZE else None
@@ -495,9 +548,11 @@ async def handle_page_click(bot, interaction, prefix, page):
         await interaction.response.send_message("Could not load that page.", ephemeral=True)
         return
 
+    files = [banner] if banner else []
+
     # Edit the ephemeral in place when the click came from one, so a reader
     # paging through does not accumulate a message per page.
     if interaction.message and interaction.message.flags.ephemeral:
-        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.response.edit_message(embed=embed, view=view, attachments=files)
     else:
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        await interaction.response.send_message(embed=embed, view=view, files=files, ephemeral=True)

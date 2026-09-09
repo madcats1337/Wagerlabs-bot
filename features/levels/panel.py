@@ -43,6 +43,7 @@ from .competition import (
     renew_competition,
 )
 from .pagination import (
+    BANNER_FILENAME,
     COMPETITION_PAGE_ID,
     LEADERBOARD_PAGE_ID,
     PAGE_SIZE,
@@ -61,9 +62,6 @@ logger = logging.getLogger(__name__)
 
 PANEL_TYPE = "levels_leaderboard"
 COMPETITION_PANEL_TYPE = "levels_competition"
-
-# Attachment name the panel's MediaGallery references.
-BANNER_FILENAME = "leaderboard-banner.png"
 
 ACCENT_COLOR = 0xFACC15  # Wagerlabs yellow
 
@@ -124,10 +122,14 @@ class LevelsPanel:
         """(file, embed, view) for this panel, or (None, None, None) when it has
         nothing to show (competition panel with no competition running).
 
-        The board is a rich EMBED: the banner as its image, then three inline
-        fields — "# USER", "MESSAGES", "XP" — which is Discord's own column
-        mechanism. The pager is a classic View alongside it, because a
-        Components V2 message cannot carry an embed.
+        The banner is a plain ATTACHMENT and the board is a rich EMBED beneath
+        it — Discord lays attachments out above embeds, which is the only way to
+        get a full-width banner above the rows (an embed's own `set_image`
+        always renders at the bottom, under the fields).
+
+        The board's three inline fields — "# USER", "MESSAGES", "XP" — are
+        Discord's own column mechanism. The pager is a classic View alongside
+        the embed, because a Components V2 message cannot carry one.
 
         The standing message always shows page 1; paging is served privately to
         whoever clicks, so a refresh never moves another reader's page.
