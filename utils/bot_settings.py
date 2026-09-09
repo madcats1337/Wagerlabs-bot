@@ -330,8 +330,20 @@ class BotSettingsManager:
 
     @property
     def levels_channel_id(self) -> Optional[int]:
-        """Discord channel ID for the XP leaderboard panel + level-up/rank-up announcements"""
+        """Channel for the standing XP leaderboard panel."""
         return self.get_int("levels_channel_id")
+
+    @property
+    def levels_announcement_channel_id(self) -> Optional[int]:
+        """Channel for the level-up / rank-up cards.
+
+        Split out from levels_channel_id, which used to carry both the standing
+        leaderboard panel and the per-award cards — the cards are chatter and
+        the panel is a pinned board, so servers want them apart. Falls back to
+        levels_channel_id at the call site so servers configured before the
+        split keep announcing where they always did.
+        """
+        return self.get_int("levels_announcement_channel_id")
 
     @property
     def levels_competition_channel_id(self) -> Optional[int]:

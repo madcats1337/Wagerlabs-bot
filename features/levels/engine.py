@@ -166,11 +166,19 @@ async def _announce_transition(
 
     A rank change always implies a level change too, so the rank-up card wins
     and only ONE message is posted per award.
+
+    These cards go to levels_announcement_channel_id, which is separate from
+    the standing leaderboard panel's channel (levels_channel_id) — per-award
+    chatter and a pinned board want different homes.
     """
     if settings is None:
         return
 
-    channel_id = settings.levels_channel_id
+    # Dedicated announcement channel, falling back to the leaderboard panel's
+    # channel for servers configured before the two were split.
+    channel_id = getattr(settings, "levels_announcement_channel_id", None) or getattr(
+        settings, "levels_channel_id", None
+    )
     if not channel_id:
         return
 
