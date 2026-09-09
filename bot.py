@@ -10027,6 +10027,18 @@ async def on_ready():
             except Exception as e:
                 logger.warning(f"⚠️ Giveaway panel view registration failed (non-fatal): {e}")
 
+            # Levels leaderboard paging: the Prev/Next buttons carry their page
+            # in the custom_id, so they register as a dynamic item rather than a
+            # fixed template view — one registration serves every page of both
+            # boards, on panels posted before this restart included.
+            try:
+                from features.levels.pagination import PageButton
+
+                bot.add_dynamic_items(PageButton)
+                logger.debug(f"✅ Levels leaderboard pager registered (handles all guilds)")
+            except Exception as e:
+                logger.warning(f"⚠️ Levels pager registration failed (non-fatal): {e}")
+
             # Trivia: the panel carries no buttons, so there is no persistent
             # view to register — what has to survive a restart is the CLOCK.
             # The ticker re-reads every live event and re-arms its phase

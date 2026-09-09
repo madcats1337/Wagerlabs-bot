@@ -354,6 +354,25 @@ class BotSettingsManager:
         """
         return self.get_int("levels_competition_channel_id")
 
+    # Banner theming. get() returns "" for an unset key, but the renderer wants
+    # None to mean "keep the stock look" — an empty string would otherwise be
+    # treated as a configured (and unparseable) value. Normalised here so every
+    # caller gets the same answer.
+    @property
+    def levels_banner_font(self) -> Optional[str]:
+        """Bundled face key for the leaderboard banner (see cards._BANNER_FONTS)."""
+        return self.get("levels_banner_font") or None
+
+    @property
+    def levels_banner_title_color(self) -> Optional[str]:
+        """Banner title colour as a CSS colour string; None = the stock yellow."""
+        return self.get("levels_banner_title_color") or None
+
+    @property
+    def levels_banner_background(self) -> Optional[str]:
+        """Banner background: a CSS colour or linear-gradient(); None = stock card."""
+        return self.get("levels_banner_background") or None
+
     @property
     def levels_enabled(self) -> bool:
         """Whether the XP/leveling system is active for this server (default on)"""

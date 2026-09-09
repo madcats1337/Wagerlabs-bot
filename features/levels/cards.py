@@ -37,6 +37,8 @@ Discord's CDN, not a micro-optimisation.
 import asyncio
 import io
 import logging
+import os
+import re
 
 import aiohttp
 import discord
@@ -318,45 +320,74 @@ def _finish(canvas, light, rgb=None):
 # ── Card shell ──────────────────────────────────────────────────────────────
 
 
-def _new_card(width: int, height: int):
+def _new_card(width: int, height: int, background=None, pad=None, radius=None, shadow=True):
     """Transparent canvas holding a rounded, shadowed, gradient-filled card.
 
     `width`/`height` are RENDER px. Returns (canvas, draw, ox, oy, light) —
     content is positioned relative to the card's top-left corner at (ox, oy),
     so callers never deal with the margin. `light` collects emissive shapes for
     _apply_bloom at the end.
+
+    `background` is an optional RGB Image of exactly (width, height) used as the
+    card's fill — how the themable banner paints a custom colour or gradient.
+    When None the stock CARD_TOP -> CARD_BOTTOM gradient is used, so every
+    existing caller renders bit-for-bit what it always did.
+
+    Three knobs exist for the BANNER, which is not a free-floating card but the
+    top element of a Components V2 container that clips and rounds the image
+    itself:
+
+      `pad`    — the transparent margin holding the drop shadow. 0 for the
+                 banner: Discord fits the image edge-to-edge, so the margin is
+                 not a shadow but dead space beside the rows beneath it.
+      `radius` — 0 for the banner. Rounded corners on an image the container
+                 ALREADY rounds leave transparent notches, and the container's
+                 own surface shows through them as a square behind the banner.
+      `shadow` — off for the banner, for the same reason: with no margin to
+                 fall into, the blur just darkens the bottom edge.
+
+    The standalone cards keep all three: their shadow falls on Discord's own
+    background and reads as depth.
     """
-    total = (width + PAD * 2, height + PAD * 2)
+    pad = PAD if pad is None else pad
+    radius = RADIUS if radius is None else radius
+    total = (width + pad * 2, height + pad * 2)
     canvas = Image.new("RGBA", total, (0, 0, 0, 0))
 
-    body_mask = _rounded_mask((width, height), RADIUS)
+    body_mask = _rounded_mask((width, height), radius)
 
     # Drop shadow: the body silhouette, blurred, pushed down, laid underneath.
-    shadow_mask = Image.new("L", total, 0)
-    shadow_mask.paste(body_mask, (PAD, PAD))
-    shadow = _tint(shadow_mask.filter(ImageFilter.GaussianBlur(SHADOW_BLUR)), (0, 0, 0), SHADOW_ALPHA)
-    canvas.alpha_composite(shadow, dest=(0, SHADOW_OFFSET))
+    if shadow:
+        shadow_mask = Image.new("L", total, 0)
+        shadow_mask.paste(body_mask, (pad, pad))
+        blurred = _tint(shadow_mask.filter(ImageFilter.GaussianBlur(SHADOW_BLUR)), (0, 0, 0), SHADOW_ALPHA)
+        canvas.alpha_composite(blurred, dest=(0, SHADOW_OFFSET))
 
-    body = _vertical_gradient((width, height), CARD_TOP, CARD_BOTTOM).convert("RGBA")
+    if background is not None:
+        body = background.convert("RGBA")
+        if body.size != (width, height):
+            body = body.resize((width, height), Image.Resampling.BILINEAR)
+    else:
+        body = _vertical_gradient((width, height), CARD_TOP, CARD_BOTTOM).convert("RGBA")
     body.putalpha(body_mask)
-    canvas.alpha_composite(body, dest=(PAD, PAD))
+    canvas.alpha_composite(body, dest=(pad, pad))
 
     border = _tint(
-        _rounded_outline_mask((width, height), RADIUS, max(1, SCALE // 2)),
+        _rounded_outline_mask((width, height), radius, max(1, SCALE // 2)),
         CARD_BORDER,
         CARD_BORDER_ALPHA,
     )
-    canvas.alpha_composite(border, dest=(PAD, PAD))
+    canvas.alpha_composite(border, dest=(pad, pad))
 
-    highlight = _tint(_top_highlight((width, height), RADIUS), (255, 255, 255), 46)
-    canvas.alpha_composite(highlight, dest=(PAD, PAD))
+    highlight = _tint(_top_highlight((width, height), radius), (255, 255, 255), 46)
+    canvas.alpha_composite(highlight, dest=(pad, pad))
 
     # Bloom is clipped to the card body so light lands on the surface instead
     # of haloing out into the transparent margin and over the drop shadow.
     clip = Image.new("L", total, 0)
-    clip.paste(body_mask, (PAD, PAD))
+    clip.paste(body_mask, (pad, pad))
 
-    return canvas, ImageDraw.Draw(canvas), PAD, PAD, _Light(total, clip)
+    return canvas, ImageDraw.Draw(canvas), pad, pad, _Light(total, clip)
 
 
 def _draw_avatar(canvas, light, avatar, x, y, size: int, ring_color, ring_width: int = 5):
@@ -951,3 +982,371 @@ async def render_competition_winners_card(winners, period_label: str) -> discord
         x += column_w + gap
 
     return _to_file(_apply_bloom(canvas, light), "competition-winners.png")
+
+
+# -- Leaderboard banners -----------------------------------------------------
+#
+# The banner is the standing panel's header image. It replaces the old
+# full-board render: the ROWS are now text in the message body (paginated, 10
+# to a page), so the image only carries identity and a few headline values.
+#
+# That split is deliberate. A rendered row costs an image re-render and a
+# re-upload on every page turn and every refresh, and none of it is selectable
+# or copyable in Discord. A banner is rendered once per refresh and stays valid
+# across every page, so paging is a pure message edit.
+#
+# Appearance is themable from the dashboard (Levels -> Appearance): title font,
+# title colour and background. See BannerTheme below.
+
+BANNER_W = 820
+BANNER_H = 200
+
+_BANNER_CHIP_TINT = (255, 255, 255)
+_BANNER_CHIP_ALPHA = 10
+_BANNER_CHIP_BORDER_ALPHA = 20
+
+_FONT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "assets", "fonts")
+
+# Fonts the RENDERER can actually use, keyed by the value the dashboard stores.
+#
+# Deliberately a closed set of faces bundled in assets/fonts/ rather than the
+# widget editor's ~30 webfonts: those are loaded by the BROWSER, and PIL can
+# only draw a face that exists on the bot host. Offering a font we cannot
+# rasterise would silently fall back to the default and make the dashboard
+# preview a lie. Keep in sync with BANNER_FONTS in the dashboard's
+# utils/levels_banner.py -- the dropdown is built from that mirror.
+#
+# `weight` is the variable-font weight axis to pin for the bold/title cut;
+# None means the file is already the weight we want.
+_BANNER_FONTS = {
+    # "default" points at the BUNDLED DejaVu rather than falling through to
+    # _load_font's host search. That search resolves DejaVu on Railway and Arial
+    # on a Windows dev box — two different faces, so the dashboard's preview and
+    # the posted banner would disagree depending on which host drew them.
+    # Bundling makes the default deterministic on every host.
+    "default": {"regular": "DejaVuSans.ttf", "bold": "DejaVuSans-Bold.ttf", "weight": None},
+    "anton": {"regular": "Anton.ttf", "bold": "Anton.ttf", "weight": None},
+    "bebas": {"regular": "BebasNeue.ttf", "bold": "BebasNeue.ttf", "weight": None},
+    "oswald": {"regular": "Oswald.ttf", "bold": "Oswald.ttf", "weight": 700},
+    "russo": {"regular": "RussoOne.ttf", "bold": "RussoOne.ttf", "weight": None},
+    "orbitron": {"regular": "Orbitron.ttf", "bold": "Orbitron.ttf", "weight": 700},
+    "poppins": {"regular": "Poppins-Regular.ttf", "bold": "Poppins-Bold.ttf", "weight": None},
+    "playfair": {"regular": "PlayfairDisplay.ttf", "bold": "PlayfairDisplay.ttf", "weight": 700},
+    "inter": {"regular": "Inter.ttf", "bold": "Inter.ttf", "weight": 700},
+}
+
+DEFAULT_BANNER_FONT = "default"
+
+
+def _load_banner_font(font_key: str, size: int, bold: bool = False):
+    """A bundled face at `size` design units, or the built-in default.
+
+    Falls back to _load_font for an unknown key or a missing/corrupt file, so a
+    stale setting degrades to the stock look instead of failing the render.
+    """
+    spec = _BANNER_FONTS.get(font_key or DEFAULT_BANNER_FONT)
+    if not spec or not spec.get("bold" if bold else "regular"):
+        return _load_font(size, bold=bold)
+
+    path = os.path.join(_FONT_DIR, spec["bold"] if bold else spec["regular"])
+    font = _open_font(path, _s(size))
+    if font is None:
+        return _load_font(size, bold=bold)
+
+    # Variable faces default to Regular; pin the weight axis for the bold cut.
+    weight = spec.get("weight")
+    if bold and weight:
+        try:
+            font.set_variation_by_axes([float(weight)])
+        except Exception:
+            # A static instance of a face we expected to be variable: the file
+            # is already at its only weight, so it is fine as-is.
+            pass
+    return font
+
+
+def _parse_color(value, fallback):
+    """A CSS-ish colour string -> an RGB tuple, or `fallback`.
+
+    Accepts "#rgb", "#rrggbb", "#rrggbbaa" and "rgb()/rgba()" -- the forms the
+    dashboard colour picker emits. Alpha is parsed but dropped: the banner
+    composites onto its own opaque card, so a translucent fill would read as a
+    muddied colour rather than as transparency.
+    """
+    if not value or not isinstance(value, str):
+        return fallback
+    text_value = value.strip().lower()
+
+    if text_value.startswith("#"):
+        hex_digits = text_value[1:]
+        if len(hex_digits) == 3:
+            hex_digits = "".join(c * 2 for c in hex_digits)
+        if len(hex_digits) in (6, 8):
+            try:
+                return tuple(int(hex_digits[i : i + 2], 16) for i in (0, 2, 4))
+            except ValueError:
+                return fallback
+        return fallback
+
+    if text_value.startswith("rgb"):
+        inner = text_value[text_value.find("(") + 1 : text_value.rfind(")")]
+        parts = [p.strip() for p in inner.split(",")[:3]]
+        # Must be exactly three components: a short "rgb(1,2)" would otherwise
+        # return a 2-tuple, which PIL then rejects deep inside a fill call
+        # rather than here where it can fall back cleanly.
+        if len(parts) != 3:
+            return fallback
+        try:
+            return tuple(max(0, min(255, int(round(float(p))))) for p in parts)
+        except (ValueError, IndexError):
+            return fallback
+
+    return fallback
+
+
+# linear-gradient(<angle>deg, <color> <pos>%, ...) -- the picker output form.
+# Only the colour stops are read; see _banner_background for the angle handling.
+_GRADIENT_STOP = re.compile(r"(#[0-9a-fA-F]{3,8}|rgba?\([^)]*\))")
+
+
+def _parse_gradient(value):
+    """(kind, colors, angle) for a background string.
+
+    kind is "solid" or "linear". Anything unparseable comes back as a solid
+    fallback so a malformed setting cannot blank the banner.
+    """
+    if not value or not isinstance(value, str):
+        return "solid", [None], 0
+
+    text_value = value.strip()
+    if not text_value.lower().startswith("linear-gradient"):
+        return "solid", [text_value], 0
+
+    stops = _GRADIENT_STOP.findall(text_value)
+    if len(stops) < 2:
+        return "solid", [stops[0] if stops else None], 0
+
+    angle = 180.0
+    angle_match = re.search(r"(-?\d+(?:\.\d+)?)deg", text_value)
+    if angle_match:
+        angle = float(angle_match.group(1))
+    return "linear", stops, angle
+
+
+def _multi_gradient(size, colors, horizontal: bool) -> Image.Image:
+    """An N-stop linear gradient, stops spaced evenly along the axis."""
+    width, height = size
+    span = width if horizontal else height
+    strip = Image.new("RGB", (span, 1) if horizontal else (1, span))
+    pixels = strip.load()
+
+    segments = len(colors) - 1
+    for i in range(span):
+        t = i / max(1, span - 1) * segments
+        index = min(int(t), segments - 1)
+        local = t - index
+        start, end = colors[index], colors[index + 1]
+        blended = tuple(int(round(start[c] + (end[c] - start[c]) * local)) for c in range(3))
+        if horizontal:
+            pixels[i, 0] = blended
+        else:
+            pixels[0, i] = blended
+
+    return strip.resize(size, Image.Resampling.BILINEAR)
+
+
+def _banner_background(size, background):
+    """The banner body fill: a solid colour, a gradient, or the stock card.
+
+    Returns None to mean "use the default card gradient", so an unset theme
+    takes the exact path the unthemed card always did.
+
+    The picker emits a CSS angle, but PIL has no cheap rotated-gradient fill.
+    Rather than rasterise a rotated ramp (and handle the corner coverage that
+    needs), the angle snaps to the nearer of vertical/horizontal -- the two that
+    actually read as intentional at an 820x200 banner's aspect.
+    """
+    if not background:
+        return None
+
+    kind, raw_colors, angle = _parse_gradient(background)
+    if kind == "solid":
+        solid = _parse_color(raw_colors[0], None)
+        return Image.new("RGB", size, solid) if solid else None
+
+    colors = [c for c in (_parse_color(c, None) for c in raw_colors) if c is not None]
+    if len(colors) < 2:
+        return Image.new("RGB", size, colors[0]) if colors else None
+
+    # CSS 0deg points up and angles run clockwise, so 90/270 are the horizontal
+    # axis and 0/180 the vertical one.
+    horizontal = 45 <= (angle % 180) < 135
+    return _multi_gradient(size, colors, horizontal)
+
+
+class BannerTheme:
+    """Dashboard-controlled banner appearance.
+
+    Any field left None keeps the stock look, so an unconfigured server renders
+    exactly what it rendered before theming existed.
+    """
+
+    __slots__ = ("font", "title_color", "background")
+
+    def __init__(self, font=None, title_color=None, background=None):
+        self.font = font or DEFAULT_BANNER_FONT
+        self.title_color = title_color
+        self.background = background
+
+    @classmethod
+    def from_settings(cls, settings):
+        """Read the theme off a BotSettingsManager, tolerating a missing one."""
+        if settings is None:
+            return cls()
+        return cls(
+            font=getattr(settings, "levels_banner_font", None),
+            title_color=getattr(settings, "levels_banner_title_color", None),
+            background=getattr(settings, "levels_banner_background", None),
+        )
+
+    @property
+    def accent(self):
+        return _parse_color(self.title_color, ACCENT)
+
+
+def _banner_chip(size, radius: int) -> Image.Image:
+    """A soft rounded plate for one headline value."""
+    plate = _tint(_rounded_mask(size, radius), _BANNER_CHIP_TINT, _BANNER_CHIP_ALPHA)
+    plate.alpha_composite(
+        _tint(_rounded_outline_mask(size, radius, max(1, SCALE // 2)), _BANNER_CHIP_TINT, _BANNER_CHIP_BORDER_ALPHA)
+    )
+    return plate
+
+
+def _ink_box(draw, text_value: str, font):
+    """(left, top, right, bottom) of a string's VISIBLE ink, relative to an
+    anchor-less draw.text at the origin.
+
+    PIL positions text by the font's ascent box, not by the glyphs, and the
+    empty space that box reserves above the cap height differs per face — 21%
+    of the em on DejaVu, far more on a display face like Bebas. Centring by
+    that box makes text sit visibly low inside a chip, and by a DIFFERENT
+    amount for every font the operator can pick. textbbox reports the real ink
+    extent, so callers can centre on what the eye actually sees.
+    """
+    return draw.textbbox((0, 0), text_value, font=font)
+
+
+def _draw_centered_ink(draw, text_value: str, font, center_x: int, center_y: int, fill):
+    """Draw `text_value` with its INK centred on (center_x, center_y)."""
+    left, top, right, bottom = _ink_box(draw, text_value, font)
+    x = center_x - (left + right) / 2
+    y = center_y - (top + bottom) / 2
+    draw.text((x, y), text_value, fill=fill, font=font)
+
+
+def _draw_banner_stats(canvas, draw, ox, oy, stats, font_key):
+    """Row of chips along the bottom of a banner.
+
+    `stats` is a list of (label, value) pairs laid out on an even grid across
+    the card's inner width, so two, three or four chips all stay balanced
+    without per-count special-casing.
+
+    Both lines are placed by their INK rather than their text box (see
+    _ink_box): the label and value are two different faces/sizes, and the
+    unequal ascent space each reserves is what made the pair read as sitting
+    low and off-centre in the chip. The two are laid out as one block —
+    measured, stacked with a fixed optical gap, then centred as a unit — so the
+    result stays balanced across every bundled font.
+    """
+    if not stats:
+        return
+
+    label_font = _load_banner_font(font_key, 17)
+    value_font = _load_banner_font(font_key, 26, bold=True)
+
+    inner_x = ox + _s(30)
+    inner_w = _s(BANNER_W) - _s(60)
+    gap = _s(12)
+    chip_w = (inner_w - gap * (len(stats) - 1)) // len(stats)
+    chip_h = _s(64)
+    chip_y = oy + _s(BANNER_H) - _s(24) - chip_h
+    plate = _banner_chip((chip_w, chip_h), _s(14))
+    max_text_w = chip_w - _s(16)
+
+    # Optical gap between the label's baseline row and the value's cap row.
+    line_gap = _s(7)
+
+    for index, (label, value) in enumerate(stats):
+        x = inner_x + index * (chip_w + gap)
+        canvas.alpha_composite(plate, dest=(x, chip_y))
+
+        label_text = _truncate(draw, str(label).upper(), label_font, max_text_w)
+        value_text = _truncate(draw, str(value), value_font, max_text_w)
+
+        # Measure both inks, stack them, and centre the whole block. Using each
+        # string's own ink height (not the font's line height) keeps a chip
+        # whose value has no descender from sitting differently to one that does.
+        _, l_top, _, l_bottom = _ink_box(draw, label_text, label_font)
+        _, v_top, _, v_bottom = _ink_box(draw, value_text, value_font)
+        label_h = l_bottom - l_top
+        value_h = v_bottom - v_top
+        block_h = label_h + line_gap + value_h
+
+        center_x = x + chip_w // 2
+        block_top = chip_y + (chip_h - block_h) / 2
+
+        _draw_centered_ink(draw, label_text, label_font, center_x, block_top + label_h / 2, MUTED_LABEL)
+        _draw_centered_ink(
+            draw, value_text, value_font, center_x, block_top + label_h + line_gap + value_h / 2, TEXT_COLOR
+        )
+
+
+def render_banner_png(title: str, subtitle: str, stats, theme=None) -> bytes:
+    """The banner as raw PNG bytes.
+
+    Split out from render_leaderboard_banner so the DASHBOARD can render a
+    byte-identical preview: it holds no discord.py dependency, and its twin in
+    Admin-Dashboard/utils/levels_banner_render.py is a copy of this same code.
+    A preview that merely approximated the real renderer would drift from it,
+    and the operator would only find out after posting.
+    """
+    theme = theme or BannerTheme()
+    W, H = _s(BANNER_W), _s(BANNER_H)
+
+    # pad=0: the banner is the top element of a Components V2 container, which
+    # fits an image edge-to-edge. The usual transparent shadow margin would
+    # render as ~16px of dead space on each side and push the banner visibly out
+    # of line with the text rows beneath it.
+    canvas, draw, ox, oy, light = _new_card(
+        W, H, background=_banner_background((W, H), theme.background), pad=0, radius=0, shadow=False
+    )
+
+    title_font = _load_banner_font(theme.font, 40, bold=True)
+    subtitle_font = _load_banner_font(theme.font, 21)
+
+    draw.text(
+        (ox + _s(30), oy + _s(26)),
+        _truncate(draw, title, title_font, W - _s(60)),
+        fill=theme.accent,
+        font=title_font,
+    )
+    if subtitle:
+        draw.text(
+            (ox + _s(30), oy + _s(76)),
+            _truncate(draw, subtitle, subtitle_font, W - _s(60)),
+            fill=SUBTEXT_COLOR,
+            font=subtitle_font,
+        )
+
+    _draw_banner_stats(canvas, draw, ox, oy, stats, theme.font)
+
+    buf = io.BytesIO()
+    _apply_bloom(canvas, light).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+async def render_leaderboard_banner(title: str, subtitle: str, stats, theme=None) -> discord.File:
+    """Header image for a paginated leaderboard panel, as a discord.File."""
+    png = render_banner_png(title, subtitle, stats, theme=theme)
+    return discord.File(io.BytesIO(png), filename="leaderboard-banner.png")

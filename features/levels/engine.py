@@ -158,6 +158,23 @@ async def award_xp(engine, bot, guild_id, discord_id, amount: int, source: str, 
         new_rank,
     )
 
+    # A level/rank change reorders the board, so repaint the standing panels.
+    # Debounced per guild inside request_panel_refresh: a burst of level-ups
+    # coalesces into one edit rather than one per award, which would trip
+    # Discord's per-channel edit rate limit on a busy server.
+    #
+    # Imported here rather than at module scope: panel.py imports the renderer,
+    # which imports this module's siblings, and a top-level import would close
+    # that cycle.
+    try:
+        from .panel import request_panel_refresh
+
+        request_panel_refresh(bot, guild_id)
+    except Exception as e:
+        # A failed repaint must never fail the AWARD — the XP is already
+        # committed, and the safety-net loop will catch the board up.
+        logger.warning(f"[levels] could not schedule panel refresh for guild {guild_id}: {e}")
+
 
 async def _announce_transition(
     bot, settings, guild_id, discord_id, username, avatar_url, new_level, old_rank, new_rank

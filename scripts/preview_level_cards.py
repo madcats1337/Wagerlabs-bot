@@ -32,9 +32,9 @@ sys.path.insert(0, REPO_ROOT)
 import aiohttp  # noqa: E402
 
 from features.levels.cards import (  # noqa: E402
-    render_competition_card,
+    BannerTheme,
+    render_banner_png,
     render_competition_winners_card,
-    render_leaderboard_card,
     render_levelup_card,
     render_rank_card,
     render_rankup_card,
@@ -87,6 +87,19 @@ def rows(count: int):
 def _in(**delta):
     """An instant `delta` from now (negative values are in the past)."""
     return datetime.now(timezone.utc) + timedelta(**delta)
+
+
+async def _banner(title, subtitle, stats, theme=None):
+    """The banner as a file-like, matching what the other factories return.
+
+    render_banner_png is synchronous (Pillow) and returns bytes; the harness
+    awaits every factory and reads `.fp`, so wrap it to match rather than
+    special-casing the caller.
+    """
+    import io as _io
+
+    png = render_banner_png(title, subtitle, stats, theme=theme)
+    return type("_Rendered", (), {"fp": _io.BytesIO(png)})()
 
 
 def _comp_rows(count: int):
@@ -260,25 +273,42 @@ GROUPS = [
         ],
     ),
     (
-        "Competition panel",
-        "Standing panel for an active competition. Scores are XP earned IN THE PERIOD, "
-        "not lifetime totals. Only the top 3 are accented. The countdown is NOT drawn here — "
-        "it lives in the Components V2 message as a client-ticked timestamp.",
+        "Competition banner",
+        "Header image for the competition panel. The entries themselves are TEXT beneath it "
+        "(paginated, 10 a page), so the banner carries identity and the three prize slots and "
+        "stays valid across every page instead of re-rendering per page turn. The countdown is "
+        "NOT drawn here — it lives in the Components V2 message as a client-ticked timestamp.",
         [
             (
-                "competition-weekly",
-                "Weekly, 5 entrants, mid-period",
-                lambda: render_competition_card(_comp_rows(5), "Weekly"),
+                "banner-competition",
+                "Weekly, all three prize types",
+                lambda: _banner(
+                    "Weekly Competition",
+                    "Top 3 most active members win prizes",
+                    [("#1 Prize", "$50.00"), ("#2 Prize", "5,000 pts"), ("#3 Prize", "Steam key")],
+                ),
             ),
             (
-                "competition-monthly",
-                "Monthly with only 2 entrants, hours left",
-                lambda: render_competition_card(_comp_rows(2), "Monthly"),
+                "banner-competition-partial",
+                "Only a first prize set — the other two still render as empty slots",
+                lambda: _banner(
+                    "Monthly Competition",
+                    "Top 3 most active members win prizes",
+                    [("#1 Prize", "$250.00"), ("#2 Prize", "—"), ("#3 Prize", "—")],
+                ),
             ),
             (
-                "competition-empty",
-                "Competition running but nobody has earned yet",
-                lambda: render_competition_card([], "Bi-Weekly"),
+                "banner-competition-long",
+                "Overflow: long prize strings truncate to the chip width",
+                lambda: _banner(
+                    "Bi-Weekly Competition",
+                    "Top 3 most active members win prizes",
+                    [
+                        ("#1 Prize", "$1,250.00"),
+                        ("#2 Prize", "1,000,000 pts"),
+                        ("#3 Prize", "Gaming chair + headset"),
+                    ],
+                ),
             ),
         ],
     ),
@@ -309,17 +339,86 @@ GROUPS = [
         ],
     ),
     (
-        "Community leaderboard panel",
-        "The standing panel edited in place in the configured channel every 10 minutes.",
+        "Community banner",
+        "Header image for the community leaderboard panel, edited in place in the configured "
+        "channel. Members + Top Rank only — a busy server's total XP runs to eight digits and "
+        "would be truncated inside a chip.",
         [
             (
-                "leaderboard-full",
-                "Full page of 10, every tier represented, last row has no username",
-                lambda: render_leaderboard_card(rows(10)),
+                "banner-community",
+                "Populated server",
+                lambda: _banner(
+                    "Community Leaderboard",
+                    "Every member's lifetime XP",
+                    [("Members", "1,204"), ("Top Rank", "Platinum")],
+                ),
             ),
-            ("leaderboard-three", "Only three members with XP", lambda: render_leaderboard_card(rows(3))),
-            ("leaderboard-one", "Single member", lambda: render_leaderboard_card(rows(1))),
-            ("leaderboard-empty", "No activity yet", lambda: render_leaderboard_card([])),
+            (
+                "banner-community-empty",
+                "No activity yet",
+                lambda: _banner(
+                    "Community Leaderboard",
+                    "Every member's lifetime XP",
+                    [("Members", "0"), ("Top Rank", "—")],
+                ),
+            ),
+        ],
+    ),
+    (
+        "Banner theming",
+        "Configured from the dashboard (Levels -> Appearance): title font, title colour and "
+        "background (solid or gradient). Fonts are a closed set bundled in assets/fonts/ — "
+        "Pillow can only draw a face that exists on the host, so the dropdown offers exactly "
+        "what renders.",
+        [
+            (
+                "banner-theme-anton",
+                "Anton, purple title, vertical gradient",
+                lambda: _banner(
+                    "Weekly Competition",
+                    "Top 3 most active members win prizes",
+                    [("#1 Prize", "$50.00"), ("#2 Prize", "5,000 pts"), ("#3 Prize", "Steam key")],
+                    BannerTheme(
+                        font="anton",
+                        title_color="#a855f7",
+                        background="linear-gradient(180deg, #2e1065 0%, #0b0614 100%)",
+                    ),
+                ),
+            ),
+            (
+                "banner-theme-bebas",
+                "Bebas Neue, cyan title, 3-stop horizontal gradient",
+                lambda: _banner(
+                    "Community Leaderboard",
+                    "Every member's lifetime XP",
+                    [("Members", "128"), ("Top Rank", "Platinum")],
+                    BannerTheme(
+                        font="bebas",
+                        title_color="rgb(34, 211, 238)",
+                        background="linear-gradient(90deg, #082f49 0%, #0c4a6e 50%, #075985 100%)",
+                    ),
+                ),
+            ),
+            (
+                "banner-theme-orbitron",
+                "Orbitron, orange title, solid background",
+                lambda: _banner(
+                    "Monthly Competition",
+                    "Top 3 most active members win prizes",
+                    [("#1 Prize", "$250.00"), ("#2 Prize", "25,000 pts"), ("#3 Prize", "Merch")],
+                    BannerTheme(font="orbitron", title_color="#f97316", background="#1c1917"),
+                ),
+            ),
+            (
+                "banner-theme-broken",
+                "Malformed theme falls back to the stock look rather than failing the render",
+                lambda: _banner(
+                    "Community Leaderboard",
+                    "Every member's lifetime XP",
+                    [("Members", "42"), ("Top Rank", "Gold")],
+                    BannerTheme(font="nope", title_color="zzz", background="linear-gradient(junk)"),
+                ),
+            ),
         ],
     ),
 ]
