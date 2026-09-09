@@ -150,8 +150,8 @@ class LevelsPanel:
             )
             ends = _relative_timestamp(competition["end_date"])
             embed = build_board_embed(
-                columns=competition_columns(rows),
                 banner_filename=BANNER_FILENAME,
+                columns=competition_columns(rows),
                 header=f"{label} Competition",
                 # The countdown is a client-ticked timestamp rather than baked
                 # into the image: the panel only re-renders on refresh, so a
@@ -172,8 +172,8 @@ class LevelsPanel:
             theme,
         )
         embed = build_board_embed(
-            columns=leaderboard_columns(rows),
             banner_filename=BANNER_FILENAME,
+            columns=leaderboard_columns(rows),
             header="Community Leaderboard",
             empty_text="No activity yet — members appear here once they start earning XP.",
         )
