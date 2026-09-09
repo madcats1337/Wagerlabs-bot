@@ -1148,43 +1148,59 @@ def _parse_color(value, fallback):
 
 # linear-gradient(<angle>deg, <color> <pos>%, ...) -- the picker output form.
 # Only the colour stops are read; see _banner_background for the angle handling.
-_GRADIENT_STOP = re.compile(r"(#[0-9a-fA-F]{3,8}|rgba?\([^)]*\))")
+_GRADIENT_STOP = re.compile(r"(#[0-9a-fA-F]{3,8}|rgba?\([^)]*\))(?:\s+(\d+(?:\.\d+)?)%)?")
 
 
 def _parse_gradient(value):
-    """(kind, colors, angle) for a background string.
-
-    kind is "solid" or "linear". Anything unparseable comes back as a solid
-    fallback so a malformed setting cannot blank the banner.
-    """
+    """(kind, stops, angle) for a background string."""
     if not value or not isinstance(value, str):
-        return "solid", [None], 0
+        return "solid", [(None, 0.0)], 0
 
     text_value = value.strip()
     if not text_value.lower().startswith("linear-gradient"):
-        return "solid", [text_value], 0
+        return "solid", [(text_value, 0.0)], 0
 
-    stops = _GRADIENT_STOP.findall(text_value)
-    if len(stops) < 2:
-        return "solid", [stops[0] if stops else None], 0
+    stops_matches = _GRADIENT_STOP.findall(text_value)
+
+    parsed_stops = []
+    for c, p in stops_matches:
+        parsed_stops.append((c, float(p) / 100.0 if p else None))
+
+    if not parsed_stops:
+        return "solid", [(None, 0.0)], 0
+
+    if parsed_stops[0][1] is None:
+        parsed_stops[0] = (parsed_stops[0][0], 0.0)
+    if parsed_stops[-1][1] is None:
+        parsed_stops[-1] = (parsed_stops[-1][0], 1.0)
+
+    for i in range(1, len(parsed_stops) - 1):
+        if parsed_stops[i][1] is None:
+            next_defined = i + 1
+            while next_defined < len(parsed_stops) and parsed_stops[next_defined][1] is None:
+                next_defined += 1
+            prev_pos = parsed_stops[i - 1][1]
+            next_pos = parsed_stops[next_defined][1]
+            step = (next_pos - prev_pos) / (next_defined - i + 1)
+            parsed_stops[i] = (parsed_stops[i][0], prev_pos + step)
 
     angle = 180.0
-    angle_match = re.search(r"(-?\d+(?:\.\d+)?)deg", text_value)
+    import re as regex
+
+    angle_match = regex.match(r"linear-gradient\(\s*(-?\d+(?:\.\d+)?)(?:deg)?\s*,", text_value, regex.IGNORECASE)
     if angle_match:
         angle = float(angle_match.group(1))
-    return "linear", stops, angle
+
+    return "linear", parsed_stops, angle
 
 
-def _multi_gradient(size, colors, angle_deg: float) -> Image.Image:
+def _multi_gradient(size, stops, angle_deg: float) -> Image.Image:
     """An N-stop linear gradient at an arbitrary angle."""
     import math
 
     width, height = size
-
-    # CSS angle to mathematical angle (0 is right, 90 is up)
     theta = math.radians(90 - angle_deg)
 
-    # Distance between the two corner-perpendiculars
     span = int(math.ceil(abs(width * math.cos(theta)) + abs(height * math.sin(theta))))
     if span < 1:
         span = 1
@@ -1192,21 +1208,37 @@ def _multi_gradient(size, colors, angle_deg: float) -> Image.Image:
     strip = Image.new("RGBA", (span, 1))
     pixels = strip.load()
 
-    segments = len(colors) - 1
-    for i in range(span):
-        t = i / max(1, span - 1) * segments
-        index = min(int(t), segments - 1)
-        local = t - index
-        start, end = colors[index], colors[index + 1]
+    stops = sorted(stops, key=lambda x: x[1])
 
-        s = start if len(start) == 4 else start + (255,)
-        e = end if len(end) == 4 else end + (255,)
+    for i in range(span):
+        t = i / max(1, span - 1)
+
+        start_idx = 0
+        for idx in range(len(stops) - 1):
+            if t <= stops[idx + 1][1]:
+                start_idx = idx
+                break
+        else:
+            start_idx = len(stops) - 2
+
+        start_c, start_pos = stops[start_idx]
+        end_c, end_pos = stops[start_idx + 1]
+
+        segment_len = end_pos - start_pos
+        if segment_len <= 0:
+            local = 1.0
+        else:
+            local = max(0.0, min(1.0, (t - start_pos) / segment_len))
+
+        s = start_c if len(start_c) == 4 else start_c + (255,)
+        e = end_c if len(end_c) == 4 else end_c + (255,)
 
         blended = tuple(int(round(s[c] + (e[c] - s[c]) * local)) for c in range(4))
         pixels[i, 0] = blended
 
-    square = strip.resize((span, span), Image.Resampling.BILINEAR)
-    rot = square.rotate(90 - angle_deg, resample=Image.Resampling.BILINEAR, expand=True)
+    diagonal = int(math.ceil(math.hypot(width, height)))
+    rect = strip.resize((span, diagonal), Image.Resampling.BILINEAR)
+    rot = rect.rotate(90 - angle_deg, resample=Image.Resampling.BILINEAR, expand=True)
 
     rx, ry = rot.size
     left = (rx - width) // 2
@@ -1215,30 +1247,32 @@ def _multi_gradient(size, colors, angle_deg: float) -> Image.Image:
 
 
 def _banner_background(size, background):
-    """The banner body fill: a solid colour, a gradient, or the stock card.
-
-    Returns None to mean "use the default card gradient", so an unset theme
-    takes the exact path the unthemed card always did.
-    """
+    """The banner body fill: a solid colour, a gradient, or the stock card."""
     if not background:
         return None
 
-    kind, raw_colors, angle = _parse_gradient(background)
+    kind, raw_stops, angle = _parse_gradient(background)
     if kind == "solid":
-        solid = _parse_color(raw_colors[0], None)
+        solid = _parse_color(raw_stops[0][0], None)
         if solid:
             solid = solid if len(solid) == 4 else solid + (255,)
             return Image.new("RGBA", size, solid)
         return None
 
-    colors = [c for c in (_parse_color(c, None) for c in raw_colors) if c is not None]
-    if len(colors) < 2:
-        if colors:
-            solid = colors[0] if len(colors[0]) == 4 else colors[0] + (255,)
+    parsed_stops = []
+    for c_str, pos in raw_stops:
+        c = _parse_color(c_str, None)
+        if c is not None:
+            parsed_stops.append((c, pos))
+
+    if len(parsed_stops) < 2:
+        if parsed_stops:
+            solid = parsed_stops[0][0]
+            solid = solid if len(solid) == 4 else solid + (255,)
             return Image.new("RGBA", size, solid)
         return None
 
-    return _multi_gradient(size, colors, angle)
+    return _multi_gradient(size, parsed_stops, angle)
 
 
 class BannerTheme:
