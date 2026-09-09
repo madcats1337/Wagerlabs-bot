@@ -1,18 +1,24 @@
 """Paginated leaderboard rendering for the standing Levels panels.
 
-The board used to be one rendered image of the top 10. It is now a BANNER image
-(identity + headline values, see cards.render_banner_png) attached above a rich
-EMBED holding the entries, ten to a page. Two reasons:
+The panel is ONE Components V2 message: a Container holding the banner
+(MediaGallery), the entries (TextDisplay) and the pager (ActionRow), ten to a
+page. The banner sits INSIDE the bordered surface and ABOVE the rows, which is
+the layout an embed cannot produce — `set_image` always renders at the bottom,
+and no embed slot puts a full-width image on top. The container is also full
+width by construction, so the banner and the board agree without any spacer
+trickery.
+
+The rows are text rather than an image for two reasons:
 
   • a rendered row costs an image re-render and a re-upload on every page turn
     and every refresh, where text is a message edit;
   • rendered text is not selectable, copyable, or searchable in Discord, and
     does not scale with the reader's accessibility settings.
 
-The columns are three `inline=True` embed fields — Discord's own column
-mechanism. Nothing is padded into alignment, so a variable-width @mention in
-one column cannot push the others out of line, which is what defeated every
-text-only attempt at a table.
+V2 has no column primitive (a Section stacks its Text Displays vertically and
+its accessory takes only a Button or Thumbnail), so figures are wrapped in
+inline-code chips: that marks them as data AND forces a monospace face, so
+equal-length numbers line up down the board.
 
 Paging is PRIVATE to the clicker. The panel is one standing message shared by
 the whole channel, so editing it on a Next click would drag every other reader's
@@ -53,6 +59,9 @@ COMPETITION_PAGE_ID = "levels_comp_page"
 # both the OFFSET the database sees and the page count in the label.
 MAX_PAGES = 20
 
+# Rows are joined into one TextDisplay.
+NEWLINE = chr(10)
+
 # Attachment name the panel uploads the banner under. Lives here because both
 # the panel and the ephemeral pager attach it, and panel.py imports this module.
 BANNER_FILENAME = "leaderboard-banner.png"
@@ -62,6 +71,11 @@ def _page_count(total: int) -> int:
     if total <= 0:
         return 1
     return min(MAX_PAGES, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+
+
+def _page_label(page, total):
+    """Reader-facing "Page 2/6" — readers count from 1, the index from 0."""
+    return f"Page {page + 1}/{_page_count(total)}"
 
 
 def _clamp_page(page: int, total: int) -> int:
@@ -261,6 +275,18 @@ def _rank_badge(rank) -> str:
     return _RANK_BADGES.get(rank, "⬜")
 
 
+def _display_name(row) -> str:
+    """The member's name as bold text.
+
+    Deliberately NOT a <@id> mention: a mention renders as a coloured pill whose
+    width Discord decides, which makes the rows read as ragged chips rather than
+    as a list, and pings nobody but still lights up as interactive.
+    """
+    name = row.get("username") or f"User {row.get('discord_id')}"
+    # A display name is user input; escape it so it cannot restyle the row.
+    return discord.utils.escape_markdown(str(name))
+
+
 def _mention(row) -> str:
     """The member as a real Discord mention, falling back to a plain name.
 
@@ -298,41 +324,77 @@ def _clip(lines):
     return "\n".join(out)
 
 
-def leaderboard_columns(rows):
-    """[(field name, field value, inline)] for the community board.
+def _medal(position: int) -> str:
+    """The position marker: a medal for the podium, `#N` for everyone else.
 
-    Three inline fields = three real columns. The position and the mention share
-    the first field so the rank badge, number and name read as one unit.
+    The top three earn a glyph because they are the part of the board people
+    actually look for; the rest stay as plain numbers so the column does not
+    turn into a wall of emoji.
     """
-    if not rows:
-        return []
+    return {1: "🥇", 2: "🥈", 3: "🥉"}.get(position, f"`#{position}`")
+
+
+def _row_line(position, name, value, suffix, detail=None):
+    """One board row, on ONE line.
+
+    Layout: <medal|#N> **name** — `value` SUFFIX  (detail)
+
+    The figure rides in an inline-code chip, which marks it as data and gives it
+    a monospace face. `detail` is the parenthesised tail — level and rank on the
+    community board, message count on a competition — kept in plain text so the
+    row has one emphasis, not three competing ones.
+    """
+    line = f"{_medal(position)} **{name}** — `{value}` {suffix}"
+    return f"{line}  ({detail})" if detail else line
+
+
+def leaderboard_lines(rows):
+    """One entry per member: medal, name, lifetime XP, then level and rank."""
     return [
-        (
-            "# USER",
-            _clip([f"{_rank_badge(r.get('current_rank'))} `#{r['position']}` {_mention(r)}" for r in rows]),
-            True,
-        ),
-        ("MESSAGES", _clip([_chip(r.get("messages_sent", 0)) for r in rows]), True),
-        ("XP", _clip([_chip(r.get("total_xp", 0)) for r in rows]), True),
+        _row_line(
+            r["position"],
+            _display_name(r),
+            f"{r.get('total_xp', 0):,}",
+            "XP",
+            detail=f"Lv {r.get('current_level', 0)} · {RANK_LABELS.get(r.get('current_rank'), '')}",
+        )
+        for r in rows
     ]
 
 
-def competition_columns(rows):
-    """[(field name, field value, inline)] for a competition board."""
-    if not rows:
-        return []
+def competition_lines(rows):
+    """One entry per entrant: medal, name, period XP, then the message count.
+
+    No rank badge — a competition ranks on activity during the period, so the
+    lifetime tier would be misleading here.
+    """
     return [
-        ("# USER", _clip([f"`#{r['position']}` {_mention(r)}" for r in rows]), True),
-        ("MESSAGES", _clip([_chip(r.get("messages_sent", 0)) for r in rows]), True),
-        ("XP", _clip([_chip(r.get("xp", 0)) for r in rows]), True),
+        _row_line(
+            r["position"],
+            _display_name(r),
+            f"{r.get('xp', 0):,}",
+            "XP",
+            detail=f"{r.get('messages_sent', 0):,} msgs",
+        )
+        for r in rows
     ]
 
 
-def _page_label(page, total):
-    return f"Page {page + 1}/{_page_count(total)}"
-
-
-# ── Views ───────────────────────────────────────────────────────────────────
+# ── Components V2 board ─────────────────────────────────────────────────────
+#
+# The whole panel is ONE Components V2 message: a Container holding the banner
+# (MediaGallery), the rows (TextDisplay) and the pager (ActionRow). Two reasons
+# this beats the embed it replaces:
+#
+#   • the banner sits INSIDE the bordered, accent-railed surface and ABOVE the
+#     rows. An embed cannot do that — set_image always renders at the bottom,
+#     and no embed slot puts a full-width image on top;
+#   • the container is full width by construction, so the banner and the board
+#     agree without the footer-spacer hack that tried to force an embed wider.
+#
+# The cost is real: V2 has no column primitive (Section stacks its Text Displays
+# vertically and its accessory takes only a Button or Thumbnail), so rows are
+# text rather than embed fields. Numbers are chipped to keep them monospaced.
 
 
 class PageButton(
@@ -346,7 +408,7 @@ class PageButton(
     to enumerate every (board, page) pair to match them. The template matches
     any page with one registration, and the callback re-reads that page from
     the database — so a button on a message posted before the last restart
-    still works, which is the same statelessness the point-shop callbacks need.
+    still works.
     """
 
     def __init__(self, board: str, page: int, label: str, emoji=None, disabled: bool = False):
@@ -371,37 +433,30 @@ class PageButton(
         await handle_page_click(interaction.client, interaction, prefix, self.page)
 
 
-class BoardPager(discord.ui.View):
-    """Prev / page-indicator / Next beneath a leaderboard embed.
-
-    A classic View rather than a LayoutView: a Components V2 message cannot
-    carry an embed, and the embed is what gives the board real columns (three
-    `inline=True` fields, laid out by Discord). Buttons alongside an embed is
-    the ordinary pattern.
-    """
-
-    def __init__(self, prefix, page, total):
-        super().__init__(timeout=None)
-        pages = _page_count(total)
-        board = "comp" if prefix == COMPETITION_PAGE_ID else "lb"
-
-        self.add_item(PageButton(board, max(0, page - 1), "Prev", emoji="◀️", disabled=page <= 0))
+def _pager_row(prefix, page, total):
+    """Prev / page indicator / Next, with the ends disabled at the bounds."""
+    pages = _page_count(total)
+    board = "comp" if prefix == COMPETITION_PAGE_ID else "lb"
+    return discord.ui.ActionRow(
+        PageButton(board, max(0, page - 1), "Prev", emoji="◀️", disabled=page <= 0),
         # The indicator is a plain disabled Button: never clickable, so it needs
         # no callback and no dynamic template.
-        self.add_item(
-            discord.ui.Button(
-                style=discord.ButtonStyle.secondary,
-                label=_page_label(page, total),
-                disabled=True,
-                custom_id=f"levels_{board}_label:{page}",
-            )
-        )
-        self.add_item(PageButton(board, min(pages - 1, page + 1), "Next", emoji="▶️", disabled=page >= pages - 1))
+        discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label=_page_label(page, total),
+            disabled=True,
+            custom_id=f"levels_{board}_label:{page}",
+        ),
+        PageButton(board, min(pages - 1, page + 1), "Next", emoji="▶️", disabled=page >= pages - 1),
+    )
 
 
-def build_board_embed(
+def build_board_view(
     *,
-    columns,
+    prefix,
+    lines,
+    page,
+    total,
     banner_filename=None,
     banner_url=None,
     header,
@@ -409,50 +464,38 @@ def build_board_embed(
     empty_text,
     footer=None,
 ):
-    """The board as a rich embed: three inline columns.
+    """The panel as one Components V2 LayoutView.
 
-    `columns` is the [(name, value, inline)] list from leaderboard_columns /
-    competition_columns. Three inline fields render as three real columns —
-    Discord aligns them, so a variable-width @mention in the first cannot push
-    the other two out of line.
-
-    THE BANNER IS NOT PART OF THIS EMBED when it is an attachment on the same
-    message. `set_image` always renders at the BOTTOM of an embed, below the
-    fields, and no embed slot puts a full-width image above them — so the
-    standing panel uploads the banner as a plain attachment instead, which
-    Discord lays out ABOVE the embed. `banner_filename` is therefore accepted
-    and deliberately not referenced here; it exists so callers read as
-    symmetrical and so this comment sits where the mistake would be made.
-
-    `banner_url` is the ephemeral pager's case: an ephemeral reply cannot carry
-    an attachment, so it reuses the panel's already-uploaded image. There the
-    banner HAS to ride inside the embed, and it lands under the columns — the
-    trade for not re-uploading a few hundred KB on every page turn.
+    `banner_filename` references an attachment on the same message; `banner_url`
+    points at an already-uploaded copy (the ephemeral pager's case, so paging
+    does not re-upload a few hundred KB per click).
     """
-    embed = discord.Embed(colour=ACCENT_COLOR)
+    view = discord.ui.LayoutView(timeout=None)
+    container = discord.ui.Container(accent_colour=ACCENT_COLOR)
 
-    if banner_url:
-        embed.set_image(url=banner_url)
-    elif not banner_filename:
-        # No banner at all (the render failed) — the title carries the board so
-        # the panel still reads rather than posting an untitled embed.
-        embed.title = header
+    media = banner_url or (f"attachment://{banner_filename}" if banner_filename else None)
+    if media:
+        container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(media)))
+    else:
+        # No banner (the render failed) — a heading keeps the panel readable.
+        container.add_item(discord.ui.TextDisplay(f"## {header}"))
 
     if subheader:
-        embed.description = subheader
+        container.add_item(discord.ui.TextDisplay(subheader))
 
-    if columns:
-        for name, value, inline in columns:
-            embed.add_field(name=name, value=value, inline=inline)
-    else:
-        embed.description = f"{subheader}\n\n{empty_text}" if subheader else empty_text
+    container.add_item(discord.ui.Separator())
+    container.add_item(discord.ui.TextDisplay(NEWLINE.join(lines) if lines else empty_text))
 
-    # The spacer runs first so the footer text reads normally beneath it; both
-    # share the one footer slot.
+    if total > PAGE_SIZE:
+        container.add_item(discord.ui.Separator())
+        container.add_item(_pager_row(prefix, page, total))
+
     if footer:
-        embed.set_footer(text=footer)
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
 
-    return embed
+    view.add_item(container)
+    return view
 
 
 # ── Ephemeral pager ─────────────────────────────────────────────────────────
@@ -530,21 +573,26 @@ async def handle_page_click(bot, interaction, prefix, page):
                 await interaction.response.send_message("No competition is running.", ephemeral=True)
                 return
             rows, total, page = fetch_competition_page(engine, competition["id"], page)
-            embed = build_board_embed(
-                columns=competition_columns(rows),
+            view = build_board_view(
+                prefix=prefix,
+                lines=competition_lines(rows),
+                page=page,
+                total=total,
                 banner_filename=BANNER_FILENAME if banner else None,
                 header=header,
                 empty_text="No activity yet this period.",
             )
         else:
             rows, total, page = fetch_leaderboard_page(engine, guild_id, page)
-            embed = build_board_embed(
-                columns=leaderboard_columns(rows),
+            view = build_board_view(
+                prefix=prefix,
+                lines=leaderboard_lines(rows),
+                page=page,
+                total=total,
                 banner_filename=BANNER_FILENAME if banner else None,
                 header=header,
                 empty_text="No activity yet.",
             )
-        view = BoardPager(prefix, page, total) if total > PAGE_SIZE else None
     except Exception as e:
         logger.error(f"[levels] page click failed for guild {guild_id}: {e}", exc_info=True)
         await interaction.response.send_message("Could not load that page.", ephemeral=True)
@@ -555,6 +603,6 @@ async def handle_page_click(bot, interaction, prefix, page):
     # Edit the ephemeral in place when the click came from one, so a reader
     # paging through does not accumulate a message per page.
     if interaction.message and interaction.message.flags.ephemeral:
-        await interaction.response.edit_message(embed=embed, view=view, attachments=files)
+        await interaction.response.edit_message(view=view, attachments=files)
     else:
-        await interaction.response.send_message(embed=embed, view=view, files=files, ephemeral=True)
+        await interaction.response.send_message(view=view, files=files, ephemeral=True)

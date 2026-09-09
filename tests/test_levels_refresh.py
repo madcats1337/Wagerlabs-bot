@@ -170,7 +170,7 @@ def _panel_over(message):
     panel.panel_channel_id = 10
     panel.panel_message_id = 20
     panel._enabled = lambda: True
-    panel._render = AsyncMock(return_value=(MagicMock(), MagicMock(), MagicMock()))
+    panel._render = AsyncMock(return_value=(MagicMock(), MagicMock()))
     panel.create_panel = AsyncMock(return_value=True)
 
     channel = MagicMock()
@@ -187,16 +187,17 @@ def _message(components_v2):
     return message
 
 
-def test_a_components_v2_panel_is_reposted_not_edited():
-    """The IS_COMPONENTS_V2 flag is set at creation and cannot be cleared.
+def test_a_pre_v2_panel_is_reposted_not_edited():
+    """The IS_COMPONENTS_V2 flag is fixed at creation and cannot be added.
 
-    Editing an embed onto such a message silently does nothing, so a panel
-    posted by the older V2 layout would render the old design forever and every
-    fix would look like it had no effect. This shipped exactly that way.
+    A message posted WITHOUT it can never become a V2 message, so editing this
+    layout onto one silently does nothing — the panel would render the old
+    design forever and every fix would look like it had no effect. That shipped
+    exactly that way, in both directions.
     """
 
     async def _test():
-        message = _message(components_v2=True)
+        message = _message(components_v2=False)
         panel, _ = _panel_over(message)
 
         await panel.refresh()
@@ -208,11 +209,11 @@ def test_a_components_v2_panel_is_reposted_not_edited():
     asyncio.run(_test())
 
 
-def test_an_embed_panel_is_edited_in_place():
+def test_a_v2_panel_is_edited_in_place():
     """The normal path: no repost, so the message keeps its place in channel."""
 
     async def _test():
-        message = _message(components_v2=False)
+        message = _message(components_v2=True)
         panel, _ = _panel_over(message)
 
         await panel.refresh()
@@ -228,7 +229,7 @@ def test_the_stale_panel_survives_a_failed_repost():
     """Post before delete: a failure must leave the old board, not nothing."""
 
     async def _test():
-        message = _message(components_v2=True)
+        message = _message(components_v2=False)
         panel, _ = _panel_over(message)
         panel.create_panel = AsyncMock(return_value=False)
 
@@ -237,3 +238,23 @@ def test_the_stale_panel_survives_a_failed_repost():
         message.delete.assert_not_awaited()
 
     asyncio.run(_test())
+
+
+# ── Startup refresh ─────────────────────────────────────────────────────────
+
+
+def test_the_loop_repaints_once_before_its_first_interval():
+    """tasks.loop waits a FULL interval before its first run.
+
+    Without a startup repaint a deploy left every board stale for ten minutes,
+    and any change to how the panel renders looked like it had simply not
+    shipped. The before_loop hook must therefore refresh once itself.
+    """
+    import inspect
+
+    source = inspect.getsource(PANEL.start_levels_panel_refresh_loop)
+    before = source[source.index("before_loop") :]
+    assert "refresh_all_panels" in before, "the loop does not repaint on startup"
+    assert before.index("wait_until_ready") < before.index(
+        "refresh_all_panels"
+    ), "must wait for the gateway before touching channels"

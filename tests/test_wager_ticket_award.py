@@ -142,3 +142,25 @@ def test_shuffle_style_rate_still_works():
     award = compute_wager_award(0.0, 0.0, 175.0, 20)
     assert award.tickets == 3
     assert award.paid_through == 150.0  # $25 pending
+
+
+def test_shuffle_small_polls_still_pay_at_the_higher_rate():
+    """The same defect at rate 20/$1,000 -> $50 a ticket.
+
+    A viewer wagering $2,759.46 in 222 small polls is owed 55 tickets. No single
+    poll reaches $50, so the old per-poll floor paid exactly 0 of them.
+
+    Worth guarding separately from the rate-5 cases above: at this rate a heavy
+    wagerer's occasional large poll DOES clear the threshold, so the board still
+    looks like it is working while everyone wagering in small increments earns
+    nothing at all.
+    """
+    polls = [12.43] * 222
+    assert max(polls) < 1000 / 20  # no single poll can buy a ticket
+
+    tickets, _, reported = _replay(polls, rate=20)
+    assert reported == 2759.46
+    assert tickets == 55
+
+    # The old rule floored each poll independently: 222 x int(12.43/50) == 0.
+    assert sum(int(d / 1000.0 * 20) for d in polls) == 0

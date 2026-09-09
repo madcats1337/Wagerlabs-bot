@@ -76,60 +76,76 @@ def _competitor(**over):
     return row
 
 
-def test_board_is_three_inline_columns_in_order():
-    """PLACEMENT/USER, MESSAGES, XP — and inline, or they stack instead of
-    sitting side by side."""
-    cols = P.leaderboard_columns([_member()])
-    assert [name for name, _, _ in cols] == ["# USER", "MESSAGES", "XP"]
-    assert all(inline for _, _, inline in cols)
-
-
-def test_competition_uses_the_same_columns():
-    cols = P.competition_columns([_competitor()])
-    assert [name for name, _, _ in cols] == ["# USER", "MESSAGES", "XP"]
-    assert all(inline for _, _, inline in cols)
-
-
-def test_every_column_has_one_entry_per_row():
-    """A short column silently misaligns the whole board — row 7 of MESSAGES
-    would sit beside row 8 of USER."""
+def test_one_line_entry_per_row():
     rows = [_member(position=i + 1, discord_id=1000 + i) for i in range(10)]
-    for _, value, _ in P.leaderboard_columns(rows):
-        assert len(value.split("\n")) == 10
+    assert len(P.leaderboard_lines(rows)) == 10
+    assert len(P.competition_lines([_competitor()])) == 1
 
 
-def test_users_are_real_mentions():
-    """A mention renders with the reader's own view of that member and stays
-    correct when they rename — the denormalised username column does not."""
-    _, value, _ = P.leaderboard_columns([_member(discord_id=987654321)])[0]
-    assert "<@987654321>" in value
+def test_names_are_bold_text_not_mentions():
+    """A mention renders as a coloured pill whose width Discord decides.
+
+    That makes the rows read as ragged chips rather than as a list, and lights
+    up as interactive while pinging nobody.
+    """
+    line = P.leaderboard_lines([_member(username="streamerkid")])[0]
+    assert "**streamerkid**" in line
+    assert "<@" not in line
+
+
+def test_names_are_markdown_escaped():
+    """A display name is user input and must not restyle the row."""
+    line = P.leaderboard_lines([_member(username="**bold**_it_")])[0]
+    assert r"\*\*bold\*\*" in line
 
 
 def test_missing_id_falls_back_to_an_escaped_name():
-    _, value, _ = P.leaderboard_columns([_member(discord_id=None, username="**bold**")])[0]
-    assert "<@" not in value
-    assert r"\*\*bold" in value
+    line = P.leaderboard_lines([_member(discord_id=None, username="**bold**")])[0]
+    assert "<@" not in line
+    assert r"\*\*bold" in line
 
 
-def test_numbers_are_code_chips():
-    """The chip forces a monospace face, which is what lines the digits up down
-    each column."""
-    cols = P.leaderboard_columns([_member(messages_sent=3200, total_xp=48000)])
-    assert cols[1][1] == "`3,200`"
-    assert cols[2][1] == "`48,000`"
+def test_xp_rides_in_a_code_chip():
+    """The chip marks the figure as data and gives it a monospace face."""
+    line = P.leaderboard_lines([_member(total_xp=48000)])[0]
+    assert "`48,000`" in line
+    assert "XP" in line
 
 
-def test_numbers_are_thousands_separated():
-    cols = P.leaderboard_columns([_member(total_xp=1234567)])
-    assert "1,234,567" in cols[2][1]
+def test_level_and_rank_trail_the_row():
+    line = P.leaderboard_lines([_member(current_level=80, current_rank="platinum")])[0]
+    assert "(Lv 80" in line
+    assert "Platinum" in line
 
 
-def test_position_and_rank_share_the_user_column():
-    """The badge, number and name read as one unit, which frees the other two
-    fields to be pure numbers."""
-    _, value, _ = P.leaderboard_columns([_member(position=7, current_rank="gold")])[0]
-    assert "`#7`" in value
-    assert P._rank_badge("gold") in value
+def test_competition_rows_show_the_message_count():
+    """A competition ranks on period activity, so msgs replaces level/rank."""
+    line = P.competition_lines([_competitor(xp=5400, messages_sent=420)])[0]
+    assert "`5,400`" in line
+    assert "420 msgs" in line
+    assert "Lv " not in line
+
+
+def test_a_row_is_one_line():
+    """Member, message count and XP all sit on the SAME line.
+
+    An earlier version wrapped the figures onto a second indented line, which
+    read as two loose rows per member rather than one board row.
+    """
+    for line in P.leaderboard_lines([_member()]) + P.competition_lines([_competitor()]):
+        assert chr(10) not in line
+
+
+def test_the_podium_gets_medals_and_the_rest_get_numbers():
+    """The top three are what people look for; the rest stay plain so the
+    column does not become a wall of emoji."""
+    rows = [_member(position=i + 1, discord_id=1000 + i) for i in range(5)]
+    lines = P.leaderboard_lines(rows)
+    assert lines[0].startswith("🥇")
+    assert lines[1].startswith("🥈")
+    assert lines[2].startswith("🥉")
+    assert lines[3].startswith("`#4`")
+    assert lines[4].startswith("`#5`")
 
 
 def test_rank_badges_differ_per_tier():
@@ -143,23 +159,15 @@ def test_unknown_rank_still_renders_a_badge():
     assert P._rank_badge("not-a-tier")
 
 
-def test_competition_board_has_no_rank_badge():
+def test_competition_rows_have_no_rank_badge():
     """A competition ranks on period activity, not lifetime tier."""
-    _, value, _ = P.competition_columns([_competitor()])[0]
-    assert P._rank_badge("platinum") not in value
+    line = P.competition_lines([_competitor()])[0]
+    assert P._rank_badge("platinum") not in line
 
 
-def test_empty_board_renders_no_columns():
-    assert P.leaderboard_columns([]) == []
-    assert P.competition_columns([]) == []
-
-
-def test_column_values_stay_within_discord_field_limit():
-    """A field over 1024 chars is rejected by the API, taking the whole panel
-    with it."""
-    rows = [_member(position=i + 1, discord_id=10**17 + i, total_xp=999_999_999) for i in range(P.PAGE_SIZE)]
-    for _, value, _ in P.leaderboard_columns(rows):
-        assert len(value) <= P._FIELD_LIMIT
+def test_position_leads_the_row():
+    line = P.leaderboard_lines([_member(position=7)])[0]
+    assert line.lstrip("`").lstrip().startswith("#7")
 
 
 # ── Banner chips ────────────────────────────────────────────────────────────
@@ -205,130 +213,138 @@ def test_competition_stats_shortens_points_for_the_chip():
     assert stats[1] == ("#2 Prize", "Steam key")
 
 
-# ── Embed + pager construction ──────────────────────────────────────────────
+# ── Components V2 view ──────────────────────────────────────────────────────
 
 
-def test_attached_banner_is_not_pulled_into_the_embed():
-    """The banner must stay a plain attachment, which Discord renders ABOVE the
-    embed.
+def _walk(view):
+    """Every item in the view's container tree, depth first."""
+    found = []
 
-    An embed's own `set_image` always renders at the BOTTOM, under the fields —
-    referencing the attachment there put the banner below the leaderboard rows.
-    No embed slot places a full-width image above them, so the panel attaches
-    the file and leaves the embed imageless.
+    def visit(item):
+        found.append(item)
+        for child in getattr(item, "children", ()) or ():
+            visit(child)
+
+    for child in view.children:
+        visit(child)
+    return found
+
+
+def _kinds(view):
+    return [type(i).__name__ for i in _walk(view)]
+
+
+def test_banner_is_a_media_gallery_above_the_rows():
+    """The whole point of the V2 layout.
+
+    An embed cannot do this — set_image always renders at the BOTTOM, and no
+    embed slot puts a full-width image on top. A MediaGallery inside the
+    Container can, and it sits inside the bordered surface rather than floating
+    above it as a bare attachment.
     """
-    embed = P.build_board_embed(
-        columns=P.leaderboard_columns([_member()]),
+    view = P.build_board_view(
+        prefix=P.LEADERBOARD_PAGE_ID,
+        lines=["row"],
+        page=0,
+        total=1,
         banner_filename="leaderboard-banner.png",
         header="Community Leaderboard",
         empty_text="none",
     )
-    assert embed.image.url is None, "banner was pulled into the embed and renders below the rows"
-    assert embed.title is None, "an attached banner carries the identity; the title would duplicate it"
-    assert [f.name for f in embed.fields] == ["# USER", "MESSAGES", "XP"]
-    assert all(f.inline for f in embed.fields)
+    kinds = _kinds(view)
+    assert "MediaGallery" in kinds, "banner is not in the container"
+    assert kinds.index("MediaGallery") < kinds.index("TextDisplay"), "banner must precede the rows"
 
 
-def test_footer_is_only_set_when_there_is_one():
-    """The width-forcing spacer is gone.
-
-    It tried to stretch a narrow embed out to the banner's width and could not
-    be verified — invisible by design, and Discord trims trailing whitespace.
-    The banner is now RENDERED at the embed's width instead, so there is
-    nothing left to force.
-    """
-    plain = P.build_board_embed(
-        columns=P.leaderboard_columns([_member()]),
+def test_everything_lives_in_one_container():
+    """One bordered surface, so the banner and the board read as one panel."""
+    view = P.build_board_view(
+        prefix=P.LEADERBOARD_PAGE_ID,
+        lines=["row"],
+        page=0,
+        total=25,
         banner_filename="b.png",
         header="h",
         empty_text="none",
     )
-    assert plain.footer.text is None
+    assert _kinds(view).count("Container") == 1
 
-    with_footer = P.build_board_embed(
-        columns=P.leaderboard_columns([_member()]),
+
+def test_falls_back_to_a_heading_without_a_banner():
+    view = P.build_board_view(
+        prefix=P.LEADERBOARD_PAGE_ID,
+        lines=["row"],
+        page=0,
+        total=1,
+        header="Community Leaderboard",
+        empty_text="none",
+    )
+    texts = [i.content for i in _walk(view) if type(i).__name__ == "TextDisplay"]
+    assert any("Community Leaderboard" in t for t in texts)
+
+
+def test_pager_is_omitted_on_a_single_page():
+    """Prev/Next on a one-page board is noise."""
+    view = P.build_board_view(
+        prefix=P.LEADERBOARD_PAGE_ID,
+        lines=["a"],
+        page=0,
+        total=2,
         banner_filename="b.png",
         header="h",
         empty_text="none",
-        footer="Scores count XP earned during this competition only.",
     )
-    assert with_footer.footer.text == "Scores count XP earned during this competition only."
-
-
-def test_ephemeral_pager_may_embed_a_banner_by_url():
-    """The one case where the banner does ride inside the embed."""
-    embed = P.build_board_embed(
-        columns=P.leaderboard_columns([_member()]),
-        banner_url="https://cdn.discordapp.com/x/leaderboard-banner.png",
-        header="Community Leaderboard",
-        empty_text="none",
-    )
-    assert embed.image.url.endswith("leaderboard-banner.png")
-
-
-def test_embed_falls_back_to_a_title_when_the_banner_failed():
-    """An untitled embed with no image reads as a broken message."""
-    embed = P.build_board_embed(
-        columns=P.leaderboard_columns([_member()]),
-        header="Community Leaderboard",
-        empty_text="none",
-    )
-    assert embed.image.url is None
-    assert embed.title == "Community Leaderboard"
-
-
-def test_empty_board_describes_itself_instead_of_rendering_columns():
-    embed = P.build_board_embed(
-        columns=[],
-        banner_filename="b.png",
-        header="Community Leaderboard",
-        empty_text="No activity yet.",
-    )
-    assert not embed.fields
-    assert "No activity yet." in (embed.description or "")
-
-
-def test_subheader_and_empty_text_both_survive():
-    """The competition countdown must not be swallowed by the empty state."""
-    embed = P.build_board_embed(
-        columns=[],
-        banner_filename="b.png",
-        header="Weekly Competition",
-        subheader="Ends <t:123:R>.",
-        empty_text="No activity yet this period.",
-    )
-    assert "Ends <t:123:R>." in embed.description
-    assert "No activity yet this period." in embed.description
-
-
-def test_pager_has_prev_indicator_and_next():
-    view = P.BoardPager(P.LEADERBOARD_PAGE_ID, page=1, total=55)
-    labels = [c.label if hasattr(c, "label") else c.item.label for c in view.children]
-    assert len(view.children) == 3
-    assert "Page 2/6" in labels
+    assert not [i for i in _walk(view) if type(i).__name__ == "PageButton"]
 
 
 def test_prev_is_disabled_on_the_first_page_and_next_on_the_last():
-    first = P.BoardPager(P.LEADERBOARD_PAGE_ID, page=0, total=25).children
-    assert first[0].item.disabled is True  # Prev
-    assert first[2].item.disabled is False  # Next
+    def buttons(page):
+        view = P.build_board_view(
+            prefix=P.LEADERBOARD_PAGE_ID,
+            lines=["a"],
+            page=page,
+            total=25,
+            banner_filename="b.png",
+            header="h",
+            empty_text="none",
+        )
+        return [i for i in _walk(view) if type(i).__name__ == "PageButton"]
 
-    last = P.BoardPager(P.LEADERBOARD_PAGE_ID, page=2, total=25).children
+    first = buttons(0)
+    assert first[0].item.disabled is True
+    assert first[1].item.disabled is False
+
+    last = buttons(2)
     assert last[0].item.disabled is False
-    assert last[2].item.disabled is True
+    assert last[1].item.disabled is True
 
 
-def test_pager_is_dispatchable_across_restarts():
+def test_empty_board_shows_its_empty_text():
+    view = P.build_board_view(
+        prefix=P.LEADERBOARD_PAGE_ID,
+        lines=[],
+        page=0,
+        total=0,
+        banner_filename="b.png",
+        header="h",
+        empty_text="No activity yet.",
+    )
+    texts = [i.content for i in _walk(view) if type(i).__name__ == "TextDisplay"]
+    assert any("No activity yet." in t for t in texts)
+
+
+def test_view_is_dispatchable_across_restarts():
     """Buttons on a panel posted before a redeploy must still work."""
-    assert P.BoardPager(P.LEADERBOARD_PAGE_ID, page=0, total=25).is_dispatchable()
-
-
-def test_page_indicator_is_not_matched_by_the_button_template():
-    """The disabled indicator must not dispatch — it has no callback."""
-    view = P.BoardPager(P.LEADERBOARD_PAGE_ID, page=1, total=55)
-    indicator = view.children[1]
-    assert indicator.disabled is True
-    assert P.PageButton.__discord_ui_compiled_template__.fullmatch(indicator.custom_id) is None
+    view = P.build_board_view(
+        prefix=P.LEADERBOARD_PAGE_ID,
+        lines=["a"],
+        page=0,
+        total=25,
+        banner_filename="b.png",
+        header="h",
+        empty_text="none",
+    )
+    assert view.is_dispatchable()
 
 
 # ── Dynamic custom_id round-trip ────────────────────────────────────────────
