@@ -106,12 +106,22 @@ def test_numbers_are_code_chips():
     assert "3,200" in line and "48,000" in line
 
 
+def test_a_row_is_one_line():
+    """Member, message count and XP all sit on the SAME line.
+
+    An earlier version wrapped the figures onto a second indented line, which
+    read as two loose rows per member rather than one board row.
+    """
+    for line in P.leaderboard_lines([_member()]) + P.competition_lines([_competitor()]):
+        assert chr(10) not in line
+
+
 def test_numeric_chips_are_a_fixed_width():
-    """Right-padded so the chips form a column regardless of magnitude."""
+    """Right-padded so the chips hold their width whatever the magnitude."""
     small = P.leaderboard_lines([_member(total_xp=5, messages_sent=1)])[0]
     large = P.leaderboard_lines([_member(total_xp=1_234_567, messages_sent=999_999)])[0]
-    # The second line of each row holds the two chips.
-    assert len(small.split(chr(10))[1]) == len(large.split(chr(10))[1])
+    # Compare the chip run that follows the mention on each row.
+    assert len(small.split(">")[-1]) == len(large.split(">")[-1])
 
 
 def test_rank_badges_differ_per_tier():

@@ -313,27 +313,24 @@ def _clip(lines):
 
 
 def _row_line(position, mention, messages, xp, badge=None):
-    """One board row.
+    """One board row, on ONE line.
 
-    Layout is `#N  <badge>  @user  ·  msgs  ·  xp`, with the numbers in inline
-    code chips. The chips do double duty: they mark the figures as data, and
-    they force a monospace face so digits of the same length line up down the
-    board even though the surrounding text is proportional.
+    Layout: `#N` <badge> @user  `msgs` msgs  `xp` XP
 
-    The mention sits BEFORE the numbers rather than after because a mention's
-    rendered width is Discord's to decide — anything following it inherits that
-    variance, so the columns that can align are kept clear of it.
+    The figures ride in inline-code chips, which mark them as data and force a
+    monospace face so equal-length numbers line up down the board. The chips are
+    right-padded to a fixed width so the columns hold whatever the magnitudes
+    are — a 3-digit count and a 7-digit one occupy the same space.
+
+    The mention sits between the position and the numbers. Its rendered width is
+    Discord's to decide, so the numbers after it cannot align perfectly with
+    each other across rows; the chips keep each column internally consistent,
+    which is as far as Discord's text layout allows.
     """
     lead = f"`{position:>3}`"
     if badge:
         lead = f"{lead} {badge}"
-    return f"{lead} {mention}\n{_ROW_INDENT}`{messages:>9}` msgs  ·  `{xp:>11}` XP"
-
-
-# Indents the second line of a row under the first, so a row reads as one block
-# rather than as two loose lines. Figure spaces survive Discord's whitespace
-# collapsing; ordinary spaces do not.
-_ROW_INDENT = " " * 6
+    return f"{lead} {mention}  `{messages:>7}` msgs  `{xp:>9}` XP"
 
 
 def leaderboard_lines(rows):
