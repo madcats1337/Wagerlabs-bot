@@ -47,13 +47,12 @@ from .pagination import (
     COMPETITION_PAGE_ID,
     LEADERBOARD_PAGE_ID,
     PAGE_SIZE,
-    BoardPager,
-    build_board_embed,
-    competition_columns,
+    build_board_view,
+    competition_lines,
     competition_stats,
     fetch_competition_page,
     fetch_leaderboard_page,
-    leaderboard_columns,
+    leaderboard_lines,
     leaderboard_stats,
 )
 from .prizes import describe_prize, pay_all_prizes
@@ -119,17 +118,13 @@ class LevelsPanel:
             return BannerTheme()
 
     async def _render(self):
-        """(file, embed, view) for this panel, or (None, None, None) when it has
-        nothing to show (competition panel with no competition running).
+        """(file, view) for this panel, or (None, None) when it has nothing to
+        show (competition panel with no competition running).
 
-        The banner is a plain ATTACHMENT and the board is a rich EMBED beneath
-        it — Discord lays attachments out above embeds, which is the only way to
-        get a full-width banner above the rows (an embed's own `set_image`
-        always renders at the bottom, under the fields).
-
-        The board's three inline fields — "# USER", "MESSAGES", "XP" — are
-        Discord's own column mechanism. The pager is a classic View alongside
-        the embed, because a Components V2 message cannot carry one.
+        The panel is ONE Components V2 message: a Container holding the banner
+        (MediaGallery), the rows (TextDisplay) and the pager (ActionRow) — see
+        ./pagination. The banner therefore sits inside the bordered surface and
+        above the rows, which an embed cannot do.
 
         The standing message always shows page 1; paging is served privately to
         whoever clicks, so a refresh never moves another reader's page.
@@ -139,7 +134,7 @@ class LevelsPanel:
         if self.panel_type == COMPETITION_PANEL_TYPE:
             competition = get_active_competition(self.engine, self.guild_id)
             if not competition:
-                return None, None, None
+                return None, None
 
             label = PERIOD_LABELS.get(competition["period_type"], "Activity")
             rows, total, page = fetch_competition_page(self.engine, competition["id"], 0)
@@ -151,9 +146,12 @@ class LevelsPanel:
                 theme,
             )
             ends = _relative_timestamp(competition["end_date"])
-            embed = build_board_embed(
+            view = build_board_view(
+                prefix=COMPETITION_PAGE_ID,
+                lines=competition_lines(rows),
+                page=page,
+                total=total,
                 banner_filename=BANNER_FILENAME,
-                columns=competition_columns(rows),
                 header=f"{label} Competition",
                 # The countdown is a client-ticked timestamp rather than baked
                 # into the image: the panel only re-renders on refresh, so a
@@ -162,8 +160,7 @@ class LevelsPanel:
                 empty_text="No activity yet this period.",
                 footer="Scores count XP earned during this competition only — separate from the community leaderboard.",
             )
-            view = BoardPager(COMPETITION_PAGE_ID, page, total) if total > PAGE_SIZE else None
-            return discord.File(io.BytesIO(png), filename=BANNER_FILENAME), embed, view
+            return discord.File(io.BytesIO(png), filename=BANNER_FILENAME), view
 
         rows, total, page = fetch_leaderboard_page(self.engine, self.guild_id, 0)
         png = await asyncio.to_thread(
@@ -173,14 +170,16 @@ class LevelsPanel:
             leaderboard_stats(self.engine, self.guild_id),
             theme,
         )
-        embed = build_board_embed(
+        view = build_board_view(
+            prefix=LEADERBOARD_PAGE_ID,
+            lines=leaderboard_lines(rows),
+            page=page,
+            total=total,
             banner_filename=BANNER_FILENAME,
-            columns=leaderboard_columns(rows),
             header="Community Leaderboard",
             empty_text="No activity yet — members appear here once they start earning XP.",
         )
-        view = BoardPager(LEADERBOARD_PAGE_ID, page, total) if total > PAGE_SIZE else None
-        return discord.File(io.BytesIO(png), filename=BANNER_FILENAME), embed, view
+        return discord.File(io.BytesIO(png), filename=BANNER_FILENAME), view
 
     def _load_panel_info(self):
         try:
@@ -228,11 +227,11 @@ class LevelsPanel:
     async def create_panel(self, channel: discord.TextChannel):
         """Post the panel fresh in `channel` (used for the initial post and moves)."""
         try:
-            file, embed, view = await self._render()
+            file, view = await self._render()
             if file is None:
                 logger.info(f"[levels] no active competition for guild {self.guild_id}; panel not posted")
                 return False
-            message = await channel.send(file=file, embed=embed, view=view)
+            message = await channel.send(file=file, view=view)
             self.panel_channel_id = channel.id
             self.panel_message_id = message.id
             self._save_panel_info(channel.id, message.id)
@@ -287,29 +286,28 @@ class LevelsPanel:
                 return
 
         try:
-            file, embed, view = await self._render()
+            file, view = await self._render()
             if file is None:
                 return
             message = await channel.fetch_message(self.panel_message_id)
 
-            # A message posted as Components V2 can NEVER carry an embed: the
-            # IS_COMPONENTS_V2 flag is set at creation and cannot be cleared, so
-            # editing embed= onto it silently does nothing. Panels posted by the
-            # older V2 layout therefore have to be re-POSTED once to pick up the
-            # embed board — otherwise they keep rendering the old design forever
-            # and every "fix" appears to have no effect.
-            if message.flags.components_v2:
+            # The IS_COMPONENTS_V2 flag is fixed at creation: a message posted
+            # WITHOUT it can never become a V2 message, so editing this layout
+            # onto one silently does nothing. Panels posted by the interim embed
+            # version therefore have to be re-POSTED once — otherwise they keep
+            # rendering the old design forever and every fix looks like a no-op.
+            if not message.flags.components_v2:
                 logger.info(
-                    f"[levels] {self.panel_type} panel for guild {self.guild_id} is a "
-                    "Components V2 message and cannot hold an embed; reposting"
+                    f"[levels] {self.panel_type} panel for guild {self.guild_id} predates the "
+                    "Components V2 layout and cannot be edited into it; reposting"
                 )
                 await self._replace_panel(channel, message)
                 return
 
-            # Embed and view are re-sent alongside the image: the rows change on
-            # every refresh, and the competition countdown is a client-ticked
+            # The view is re-sent alongside the image: the rows change on every
+            # refresh, and the competition countdown is a client-ticked
             # timestamp that must track a period which may have renewed.
-            await message.edit(attachments=[file], embed=embed, view=view)
+            await message.edit(attachments=[file], view=view)
         except discord.NotFound:
             logger.info(f"[levels] {self.panel_type} panel message gone for guild {self.guild_id}; reposting")
             await self.create_panel(channel)
@@ -537,6 +535,14 @@ def start_levels_panel_refresh_loop(bot):
     @refresh_levels_panels.before_loop
     async def _before():
         await bot.wait_until_ready()
+        # tasks.loop waits a FULL interval before its first run, so without this
+        # a deploy left every board stale for ten minutes — and any change to
+        # how the panel renders looked like it had simply not shipped. Repaint
+        # once on startup so a restart is itself a refresh.
+        try:
+            await refresh_all_panels(bot)
+        except Exception as e:
+            logger.error(f"[levels] startup panel refresh failed: {e}", exc_info=True)
 
     _levels_refresh_tasks["main"] = refresh_levels_panels
     refresh_levels_panels.start()
