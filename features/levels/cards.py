@@ -998,8 +998,31 @@ async def render_competition_winners_card(winners, period_label: str) -> discord
 # Appearance is themable from the dashboard (Levels -> Appearance): title font,
 # title colour and background. See BannerTheme below.
 
-BANNER_W = 820
-BANNER_H = 200
+# DISPLAY size. 520 matches the width Discord gives an EMBED, so the banner
+# attached above the board lines up with it instead of overhanging by the ~30px
+# an image gets from the wider message content area. The height keeps the
+# original 4.1:1 proportion.
+BANNER_W = 520
+BANNER_H = 127
+
+# The banner's interior is still authored against the ORIGINAL 820x200 canvas —
+# every type size and offset below is in those units. _bs() folds in the ratio
+# to the display size, so the whole design scales as one piece and the numbers
+# stay comparable to the cards' own.
+_BANNER_DESIGN_W = 820
+
+# Rasterise at 3x the display size rather than the cards' 2x: at 520 display px
+# a 2x render is only 1040px, which Discord upscales on a HiDPI display and
+# softens. 3x keeps the type crisp at the smaller size.
+BANNER_SCALE = 3
+
+_BANNER_UNIT = BANNER_SCALE * BANNER_W / _BANNER_DESIGN_W
+
+
+def _bs(value) -> int:
+    """Banner design units (820-wide canvas) -> render pixels."""
+    return int(round(value * _BANNER_UNIT))
+
 
 _BANNER_CHIP_TINT = (255, 255, 255)
 _BANNER_CHIP_ALPHA = 10
@@ -1038,20 +1061,39 @@ _BANNER_FONTS = {
 DEFAULT_BANNER_FONT = "default"
 
 
-def _load_banner_font(font_key: str, size: int, bold: bool = False):
-    """A bundled face at `size` design units, or the built-in default.
+def _banner_fallback_font(size: int, bold: bool):
+    """The stock face at BANNER_SCALE.
 
-    Falls back to _load_font for an unknown key or a missing/corrupt file, so a
-    stale setting degrades to the stock look instead of failing the render.
+    _load_font scales by the CARDS' SCALE, which would render banner type at the
+    wrong size the moment a font key is unknown or its file is missing — so the
+    fallback resolves the same paths itself at the banner's scale.
+    """
+    candidates = (
+        ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "arialbd.ttf"]
+        if bold
+        else ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "arial.ttf"]
+    )
+    for path in candidates:
+        font = _open_font(path, _bs(size))
+        if font is not None:
+            return font
+    return ImageFont.load_default()
+
+
+def _load_banner_font(font_key: str, size: int, bold: bool = False):
+    """A bundled face at `size` banner-design units, or the built-in default.
+
+    Falls back to the stock face for an unknown key or a missing/corrupt file,
+    so a stale setting degrades to the stock look instead of failing the render.
     """
     spec = _BANNER_FONTS.get(font_key or DEFAULT_BANNER_FONT)
     if not spec or not spec.get("bold" if bold else "regular"):
-        return _load_font(size, bold=bold)
+        return _banner_fallback_font(size, bold)
 
     path = os.path.join(_FONT_DIR, spec["bold"] if bold else spec["regular"])
-    font = _open_font(path, _s(size))
+    font = _open_font(path, _bs(size))
     if font is None:
-        return _load_font(size, bold=bold)
+        return _banner_fallback_font(size, bold)
 
     # Variable faces default to Regular; pin the weight axis for the bold cut.
     weight = spec.get("weight")
@@ -1245,7 +1287,7 @@ def _draw_centered_ink(draw, text_value: str, font, center_x: int, center_y: int
     draw.text((x, y), text_value, fill=fill, font=font)
 
 
-def _draw_banner_stats(canvas, draw, ox, oy, stats, font_key):
+def _draw_banner_stats(canvas, draw, ox, oy, stats, font_key, H_render):
     """Row of chips along the bottom of a banner.
 
     `stats` is a list of (label, value) pairs laid out on an even grid across
@@ -1265,17 +1307,17 @@ def _draw_banner_stats(canvas, draw, ox, oy, stats, font_key):
     label_font = _load_banner_font(font_key, 17)
     value_font = _load_banner_font(font_key, 26, bold=True)
 
-    inner_x = ox + _s(30)
-    inner_w = _s(BANNER_W) - _s(60)
-    gap = _s(12)
+    inner_x = ox + _bs(30)
+    inner_w = (canvas.width - 2 * ox) - _bs(60)
+    gap = _bs(12)
     chip_w = (inner_w - gap * (len(stats) - 1)) // len(stats)
-    chip_h = _s(64)
-    chip_y = oy + _s(BANNER_H) - _s(24) - chip_h
-    plate = _banner_chip((chip_w, chip_h), _s(14))
-    max_text_w = chip_w - _s(16)
+    chip_h = _bs(64)
+    chip_y = oy + H_render - _bs(24) - chip_h
+    plate = _banner_chip((chip_w, chip_h), _bs(14))
+    max_text_w = chip_w - _bs(16)
 
     # Optical gap between the label's baseline row and the value's cap row.
-    line_gap = _s(7)
+    line_gap = _bs(7)
 
     for index, (label, value) in enumerate(stats):
         x = inner_x + index * (chip_w + gap)
@@ -1312,7 +1354,9 @@ def render_banner_png(title: str, subtitle: str, stats, theme=None) -> bytes:
     and the operator would only find out after posting.
     """
     theme = theme or BannerTheme()
-    W, H = _s(BANNER_W), _s(BANNER_H)
+    # BANNER_W/H are DISPLAY dimensions, so they scale by BANNER_SCALE alone —
+    # _bs() is for the 820-canvas design units used inside.
+    W, H = BANNER_W * BANNER_SCALE, BANNER_H * BANNER_SCALE
 
     # pad=0: the banner is the top element of a Components V2 container, which
     # fits an image edge-to-edge. The usual transparent shadow margin would
@@ -1326,20 +1370,20 @@ def render_banner_png(title: str, subtitle: str, stats, theme=None) -> bytes:
     subtitle_font = _load_banner_font(theme.font, 21)
 
     draw.text(
-        (ox + _s(30), oy + _s(26)),
-        _truncate(draw, title, title_font, W - _s(60)),
+        (ox + _bs(30), oy + _bs(26)),
+        _truncate(draw, title, title_font, W - _bs(60)),
         fill=theme.accent,
         font=title_font,
     )
     if subtitle:
         draw.text(
-            (ox + _s(30), oy + _s(76)),
-            _truncate(draw, subtitle, subtitle_font, W - _s(60)),
+            (ox + _bs(30), oy + _bs(76)),
+            _truncate(draw, subtitle, subtitle_font, W - _bs(60)),
             fill=SUBTEXT_COLOR,
             font=subtitle_font,
         )
 
-    _draw_banner_stats(canvas, draw, ox, oy, stats, theme.font)
+    _draw_banner_stats(canvas, draw, ox, oy, stats, theme.font, H)
 
     buf = io.BytesIO()
     _apply_bloom(canvas, light).save(buf, format="PNG")

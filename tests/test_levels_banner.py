@@ -48,18 +48,21 @@ def _open(png_bytes):
 def _chip_geometry(chip_count):
     """(x, y, w, h) of the FIRST stat chip, mirroring _draw_banner_stats.
 
-    The banner renders with pad=0 — it sits at the top of a Components V2
-    container, which fits an image edge-to-edge, so the usual transparent
-    shadow margin would just be dead space beside the text rows below it.
+    The banner renders with pad=0 — it is attached above the board's embed, so
+    a transparent shadow margin would just be dead space beside it. Interior
+    metrics come from cards._bs(), which folds the 820-canvas design units into
+    the banner's smaller display size.
     """
-    s = cards._s
+    bs = cards._bs
     ox = oy = 0
-    inner_x = ox + s(30)
-    inner_w = s(cards.BANNER_W) - s(60)
-    gap = s(12)
+    inner_x = ox + bs(30)
+    width = cards.BANNER_W * cards.BANNER_SCALE
+    height = cards.BANNER_H * cards.BANNER_SCALE
+    inner_w = (width - 2 * ox) - bs(60)
+    gap = bs(12)
     chip_w = (inner_w - gap * (chip_count - 1)) // chip_count
-    chip_h = s(64)
-    chip_y = oy + s(cards.BANNER_H) - s(24) - chip_h
+    chip_h = bs(64)
+    chip_y = oy + height - bs(24) - chip_h
     return inner_x, chip_y, chip_w, chip_h
 
 
@@ -166,7 +169,7 @@ def test_malformed_theme_still_renders():
         COMMUNITY_STATS,
         theme=cards.BannerTheme(font="no-such-font", title_color="zzz", background="linear-gradient(nonsense)"),
     )
-    assert _open(png).size == (cards._s(cards.BANNER_W), cards._s(cards.BANNER_H))
+    assert _open(png).size == (cards.BANNER_W * cards.BANNER_SCALE, cards.BANNER_H * cards.BANNER_SCALE)
 
 
 def test_banner_has_no_transparent_margin():
@@ -179,7 +182,7 @@ def test_banner_has_no_transparent_margin():
     """
     png = cards.render_banner_png("Community Leaderboard", "sub", COMMUNITY_STATS)
     img = _open(png)
-    assert img.size == (cards._s(cards.BANNER_W), cards._s(cards.BANNER_H))
+    assert img.size == (cards.BANNER_W * cards.BANNER_SCALE, cards.BANNER_H * cards.BANNER_SCALE)
 
     # Corners are rounded, so probe the edge MIDPOINTS: opaque there means the
     # card body reaches every edge.
@@ -192,6 +195,31 @@ def test_banner_has_no_transparent_margin():
         "bottom": (w // 2, h - 1),
     }.items():
         assert px[x, y][3] > 250, f"{name} edge is transparent — the banner is inset"
+
+
+def test_banner_displays_at_the_embed_width():
+    """The banner must be as wide as the embed beneath it, not wider.
+
+    A plain attachment is scaled to the message content area (~550px) while an
+    embed maxes out at 520px, so a banner authored wider overhangs the board by
+    ~30px. Rendering it AT 520 display px is what makes the two line up — an
+    earlier attempt did the reverse and tried to stretch the embed with an
+    invisible footer spacer, which could not be verified.
+    """
+    assert cards.BANNER_W == 520
+
+    png = cards.render_banner_png("Community Leaderboard", "sub", COMMUNITY_STATS)
+    width, height = _open(png).size
+    assert width == cards.BANNER_W * cards.BANNER_SCALE
+    assert height == cards.BANNER_H * cards.BANNER_SCALE
+
+    # Rendered above 1x so it stays crisp when Discord scales it down.
+    assert width > cards.BANNER_W
+
+
+def test_banner_keeps_its_proportions():
+    """The interior is still authored on the original 820-wide canvas."""
+    assert abs(cards.BANNER_W / cards.BANNER_H - 820 / 200) < 0.05
 
 
 def test_unset_theme_uses_the_stock_accent():
