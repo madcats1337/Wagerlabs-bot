@@ -57,6 +57,21 @@ MAX_PAGES = 20
 # the panel and the ephemeral pager attach it, and panel.py imports this module.
 BANNER_FILENAME = "leaderboard-banner.png"
 
+# An embed is sized by its CONTENT and shrinks to fit; the banner attached above
+# it is scaled to the full message width. Left alone the two disagree, and the
+# board reads as a narrow card hanging under a wide image.
+#
+# This spacer forces the embed to that same maximum width. U+2007 FIGURE SPACE
+# is used rather than an ordinary space because Discord collapses runs of those,
+# and it renders as blank rather than as a visible glyph. It rides in the footer,
+# which spans the embed's width without adding a visible row to the board.
+#
+# 78 is measured, not guessed: at the footer's 12px size a figure space is
+# ~6.47px, so 78 of them span ~505px — just under the ~506px of content width an
+# embed allows. Going over wraps the footer onto a second blank line, which
+# leaves a visible gap under the board.
+_WIDTH_SPACER = "\u2007" * 78
+
 
 def _page_count(total: int) -> int:
     if total <= 0:
@@ -447,8 +462,9 @@ def build_board_embed(
     else:
         embed.description = f"{subheader}\n\n{empty_text}" if subheader else empty_text
 
-    if footer:
-        embed.set_footer(text=footer)
+    # The spacer runs first so the footer text reads normally beneath it; both
+    # share the one footer slot.
+    embed.set_footer(text=f"{_WIDTH_SPACER}\n{footer}" if footer else _WIDTH_SPACER)
 
     return embed
 

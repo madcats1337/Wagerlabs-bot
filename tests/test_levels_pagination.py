@@ -229,6 +229,37 @@ def test_attached_banner_is_not_pulled_into_the_embed():
     assert all(f.inline for f in embed.fields)
 
 
+def test_embed_is_forced_to_the_banner_width():
+    """An embed shrinks to its content; the banner above it fills the message.
+
+    Without a spacer the board renders as a narrow card hanging under a wide
+    image. The spacer must be FIGURE SPACES — Discord collapses runs of
+    ordinary spaces, so those would have no effect at all.
+    """
+    embed = P.build_board_embed(
+        columns=P.leaderboard_columns([_member()]),
+        banner_filename="leaderboard-banner.png",
+        header="Community Leaderboard",
+        empty_text="none",
+    )
+    assert embed.footer.text, "no width spacer — the embed will shrink to its content"
+    assert " " in embed.footer.text, "spacer must be figure spaces, not collapsible ones"
+    assert " " not in embed.footer.text, "ordinary spaces collapse and would not force the width"
+
+
+def test_real_footer_text_survives_the_spacer():
+    """The competition board's footer shares the one footer slot."""
+    embed = P.build_board_embed(
+        columns=P.leaderboard_columns([_member()]),
+        banner_filename="b.png",
+        header="h",
+        empty_text="none",
+        footer="Scores count XP earned during this competition only.",
+    )
+    assert embed.footer.text.endswith("Scores count XP earned during this competition only.")
+    assert " " in embed.footer.text
+
+
 def test_ephemeral_pager_may_embed_a_banner_by_url():
     """The one case where the banner does ride inside the embed."""
     embed = P.build_board_embed(
