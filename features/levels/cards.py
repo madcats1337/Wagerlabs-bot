@@ -1148,7 +1148,13 @@ def _parse_color(value, fallback):
 
 # linear-gradient(<angle>deg, <color> <pos>%, ...) -- the picker output form.
 # Only the colour stops are read; see _banner_background for the angle handling.
-_GRADIENT_STOP = re.compile(r"(#[0-9a-fA-F]{3,8}|rgba?\([^)]*\))(?:\s+(\d+(?:\.\d+)?)%)?")
+#
+# IGNORECASE: the dashboard's colour picker upper-cases the stop being edited
+# ("RGBA(...)"). The dashboard now strips that before storing, but rows saved
+# before that fix still carry it, and a case-sensitive match would drop the
+# stop and render an N-stop gradient with N-1 stops. MIRRORS the dashboard's
+# utils/levels_banner_render.py -- keep the two in sync.
+_GRADIENT_STOP = re.compile(r"(#[0-9a-fA-F]{3,8}|rgba?\([^)]*\))(?:\s+(\d+(?:\.\d+)?)%)?", re.IGNORECASE)
 
 
 def _parse_gradient(value):
