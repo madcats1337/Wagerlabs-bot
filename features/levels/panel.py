@@ -117,6 +117,23 @@ class LevelsPanel:
         except Exception:
             return BannerTheme()
 
+    def _embed_config(self):
+        """Custom embed styling & buttons saved via the dashboard Embed Tool."""
+        key = "levels_leaderboard_embed_config" if self.panel_type == PANEL_TYPE else "levels_competition_embed_config"
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT value FROM bot_settings WHERE key = :k AND discord_server_id = :g LIMIT 1"),
+                    {"k": key, "g": self.guild_id},
+                ).fetchone()
+                if row and row[0]:
+                    import json
+
+                    return json.loads(row[0])
+        except Exception as e:
+            logger.debug(f"[levels] Could not load embed config for {self.panel_type} in guild {self.guild_id}: {e}")
+        return {}
+
     async def _render(self):
         """(file, view) for this panel, or (None, None) when it has nothing to
         show (competition panel with no competition running).
@@ -130,6 +147,15 @@ class LevelsPanel:
         whoever clicks, so a refresh never moves another reader's page.
         """
         theme = self._banner_theme()
+        embed_cfg = self._embed_config()
+
+        accent_color = None
+        if embed_cfg.get("accentColor"):
+            try:
+                accent_color = int(str(embed_cfg["accentColor"]).lstrip("#"), 16)
+            except Exception:
+                accent_color = None
+        custom_buttons = embed_cfg.get("buttons") or []
 
         if self.panel_type == COMPETITION_PANEL_TYPE:
             competition = get_active_competition(self.engine, self.guild_id)
@@ -140,44 +166,58 @@ class LevelsPanel:
             rows, total, page = fetch_competition_page(self.engine, competition["id"], 0)
             png = await asyncio.to_thread(
                 render_banner_png,
-                f"{label} Competition",
-                "Top 3 most active members win prizes",
+                embed_cfg.get("title") or f"{label} Competition",
+                embed_cfg.get("description") or "Top 3 most active members win prizes",
                 competition_stats(competition),
                 theme,
             )
             ends = _relative_timestamp(competition["end_date"])
+            header = embed_cfg.get("title") or f"{label} Competition"
+            subheader = embed_cfg.get("description") or (f"Ends {ends}." if ends else None)
+            footer = (
+                embed_cfg.get("footer")
+                or "Scores count XP earned during this competition only — separate from the community leaderboard."
+            )
+
             view = build_board_view(
                 prefix=COMPETITION_PAGE_ID,
                 lines=competition_lines(rows),
                 page=page,
                 total=total,
                 banner_filename=BANNER_FILENAME,
-                header=f"{label} Competition",
-                # The countdown is a client-ticked timestamp rather than baked
-                # into the image: the panel only re-renders on refresh, so a
-                # drawn "3d 3h left" is wrong for almost its entire life.
-                subheader=f"Ends {ends}." if ends else None,
+                header=header,
+                subheader=subheader,
                 empty_text="No activity yet this period.",
-                footer="Scores count XP earned during this competition only — separate from the community leaderboard.",
+                footer=footer,
+                accent_color=accent_color,
+                custom_buttons=custom_buttons,
             )
             return discord.File(io.BytesIO(png), filename=BANNER_FILENAME), view
 
         rows, total, page = fetch_leaderboard_page(self.engine, self.guild_id, 0)
         png = await asyncio.to_thread(
             render_banner_png,
-            "Community Leaderboard",
-            "Every member's lifetime XP",
+            embed_cfg.get("title") or "Community Leaderboard",
+            embed_cfg.get("description") or "Every member's lifetime XP",
             leaderboard_stats(self.engine, self.guild_id),
             theme,
         )
+        header = embed_cfg.get("title") or "Community Leaderboard"
+        subheader = embed_cfg.get("description") or None
+        footer = embed_cfg.get("footer") or "Members appear here once they start earning XP."
+
         view = build_board_view(
             prefix=LEADERBOARD_PAGE_ID,
             lines=leaderboard_lines(rows),
             page=page,
             total=total,
             banner_filename=BANNER_FILENAME,
-            header="Community Leaderboard",
+            header=header,
+            subheader=subheader,
             empty_text="No activity yet — members appear here once they start earning XP.",
+            footer=footer,
+            accent_color=accent_color,
+            custom_buttons=custom_buttons,
         )
         return discord.File(io.BytesIO(png), filename=BANNER_FILENAME), view
 

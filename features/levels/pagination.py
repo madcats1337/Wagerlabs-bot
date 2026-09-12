@@ -463,6 +463,8 @@ def build_board_view(
     subheader=None,
     empty_text,
     footer=None,
+    accent_color=None,
+    custom_buttons=None,
 ):
     """The panel as one Components V2 LayoutView.
 
@@ -471,7 +473,8 @@ def build_board_view(
     does not re-upload a few hundred KB per click).
     """
     view = discord.ui.LayoutView(timeout=None)
-    container = discord.ui.Container(accent_colour=ACCENT_COLOR)
+    accent = accent_color if accent_color is not None else ACCENT_COLOR
+    container = discord.ui.Container(accent_colour=accent)
 
     media = banner_url or (f"attachment://{banner_filename}" if banner_filename else None)
     if media:
@@ -489,6 +492,24 @@ def build_board_view(
     if total > PAGE_SIZE:
         container.add_item(discord.ui.Separator())
         container.add_item(_pager_row(prefix, page, total))
+
+    if custom_buttons:
+        action_buttons = []
+        for btn in custom_buttons[:5]:
+            url = btn.get("url") or ""
+            label = btn.get("label") or "Link"
+            if url:
+                action_buttons.append(
+                    discord.ui.Button(
+                        style=discord.ButtonStyle.link,
+                        label=label,
+                        url=url,
+                        emoji=btn.get("emoji") or None,
+                    )
+                )
+        if action_buttons:
+            container.add_item(discord.ui.Separator())
+            container.add_item(discord.ui.ActionRow(*action_buttons))
 
     if footer:
         container.add_item(discord.ui.Separator())

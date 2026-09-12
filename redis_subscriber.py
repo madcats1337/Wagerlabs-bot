@@ -28,7 +28,7 @@ from sqlalchemy import create_engine, text  # type: ignore
 from features.games.guess_the_balance import gtb_rank_marker
 from utils.log_context import server_context
 from utils.redis_signing import signing_enabled, verify_payload
-from utils.server_urls import get_server_public_page_url
+from utils.server_urls import get_server_base_url, get_server_public_page_url
 
 logger = logging.getLogger(__name__)
 
@@ -1827,6 +1827,12 @@ class RedisSubscriber:
             # Dashboard chose a channel for a link/verify panel → post (or move) it there.
             await self._post_panel(data)
 
+        elif action == "post_custom_embed":
+            await self._post_custom_embed(data)
+
+        elif action == "delete_custom_embed":
+            await self._delete_custom_embed(data)
+
     async def _post_panel(self, data):
         """Post or move a link/verify panel into the channel chosen on the dashboard.
 
@@ -1921,6 +1927,205 @@ class RedisSubscriber:
             import traceback
 
             traceback.print_exc()
+
+    async def _post_custom_embed(self, data):
+        """Post or edit a custom Discord embed / Components V2 message in target channel.
+
+        data: {
+            "discord_server_id": guild_id,
+            "channel_id": channel_id,
+            "message_id": message_id,
+            "banner_url": banner_url,
+            "containers": [
+                {
+                    "title": str,
+                    "body": str,
+                    "accentColor": str,
+                    "footer": str,
+                    "buttons": [{"label": str, "url": str, "emoji": str}]
+                }
+            ]
+        }
+        """
+        guild_id = data.get("discord_server_id")
+        channel_id = data.get("channel_id")
+        message_id = data.get("message_id")
+        banner_url = data.get("banner_url")
+        containers_data = data.get("containers") or []
+
+        if not channel_id or not guild_id:
+            logger.warning(f"⚠️ post_custom_embed missing channel_id or guild_id: {data}")
+            return
+
+        try:
+            guild_id = int(guild_id)
+            channel_id = int(channel_id)
+        except (TypeError, ValueError):
+            logger.warning(f"⚠️ post_custom_embed bad ids: guild={guild_id!r} channel={channel_id!r}")
+            return
+
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except Exception as e:
+                logger.warning(f"⚠️ post_custom_embed channel {channel_id} not found: {e}")
+                return
+
+        # Resolve relative banner URL if necessary
+        if banner_url and banner_url.startswith("/"):
+            base_url = get_server_base_url(get_engine(), guild_id)
+            if base_url:
+                banner_url = f"{base_url}{banner_url}"
+
+        # Build Components V2 LayoutView
+        view = discord.ui.LayoutView(timeout=None)
+
+        if not containers_data:
+            containers_data = [{"title": "Embed", "body": "", "accentColor": "#FACC15"}]
+
+        for idx, c_data in enumerate(containers_data[:5]):
+            accent_hex = c_data.get("accentColor") or "#FACC15"
+            try:
+                accent_val = int(str(accent_hex).lstrip("#"), 16)
+            except Exception:
+                accent_val = 0xFACC15
+
+            container = discord.ui.Container(accent_colour=accent_val)
+
+            # Banner on first container if provided
+            if idx == 0 and banner_url:
+                try:
+                    container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(banner_url)))
+                except Exception as me:
+                    logger.debug(f"[embed] could not add banner media gallery: {me}")
+
+            # Title
+            title = (c_data.get("title") or "").strip()
+            if title:
+                header_text = title if title.startswith("#") else f"## {title}"
+                container.add_item(discord.ui.TextDisplay(header_text))
+
+            # Body: split by separator line '---'
+            body = (c_data.get("body") or "").strip()
+            if body:
+                lines = body.split("\n")
+                current_chunk = []
+                for line in lines:
+                    if line.strip() == "---":
+                        chunk_str = "\n".join(current_chunk).strip()
+                        if chunk_str:
+                            container.add_item(discord.ui.TextDisplay(chunk_str))
+                        container.add_item(discord.ui.Separator())
+                        current_chunk = []
+                    else:
+                        current_chunk.append(line)
+                chunk_str = "\n".join(current_chunk).strip()
+                if chunk_str:
+                    container.add_item(discord.ui.TextDisplay(chunk_str))
+
+            # ActionRow Buttons
+            buttons_data = c_data.get("buttons") or []
+            action_buttons = []
+            for btn in buttons_data[:5]:
+                b_url = btn.get("url") or ""
+                b_lbl = btn.get("label") or "Link"
+                if b_url:
+                    action_buttons.append(
+                        discord.ui.Button(
+                            style=discord.ButtonStyle.link,
+                            label=b_lbl,
+                            url=b_url,
+                            emoji=btn.get("emoji") or None,
+                        )
+                    )
+            if action_buttons:
+                container.add_item(discord.ui.Separator())
+                container.add_item(discord.ui.ActionRow(*action_buttons))
+
+            # Footer
+            footer = (c_data.get("footer") or "").strip()
+            if footer:
+                container.add_item(discord.ui.Separator())
+                container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+
+            view.add_item(container)
+
+        # Try to edit existing message if message_id provided
+        sent_message = None
+        if message_id:
+            try:
+                msg = await channel.fetch_message(int(message_id))
+                await msg.edit(view=view)
+                sent_message = msg
+                logger.info(f"✅ Updated custom embed message {message_id} in channel {channel_id}")
+            except (discord.NotFound, discord.HTTPException) as err:
+                logger.info(f"ℹ️ Message {message_id} not found/editable ({err}); posting fresh")
+                sent_message = None
+
+        if sent_message is None:
+            try:
+                sent_message = await channel.send(view=view)
+                logger.info(f"✅ Posted fresh custom embed message {sent_message.id} in channel {channel_id}")
+            except Exception as e:
+                logger.error(f"❌ Failed to send custom embed message in channel {channel_id}: {e}")
+                return
+
+        # Record new message_id in discord_embed_configs in DB if it changed
+        new_mid = str(sent_message.id)
+        if new_mid != str(message_id):
+            try:
+                eng = get_engine()
+                with eng.begin() as conn:
+                    row = conn.execute(
+                        text(
+                            "SELECT value FROM bot_settings WHERE key = 'discord_embed_configs' AND discord_server_id = :gid LIMIT 1"
+                        ),
+                        {"gid": guild_id},
+                    ).fetchone()
+                    cfg_map = json.loads(row[0]) if (row and row[0]) else {}
+                    ch_key = str(channel_id)
+                    if ch_key in cfg_map:
+                        cfg_map[ch_key]["messageId"] = new_mid
+                    else:
+                        cfg_map[ch_key] = {
+                            "channelId": ch_key,
+                            "messageId": new_mid,
+                            "containers": containers_data,
+                            "bannerUrl": banner_url,
+                        }
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO bot_settings (key, discord_server_id, value)
+                            VALUES ('discord_embed_configs', :gid, :val)
+                            ON CONFLICT (key, discord_server_id)
+                            DO UPDATE SET value = EXCLUDED.value
+                            """
+                        ),
+                        {"val": json.dumps(cfg_map), "gid": guild_id},
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ Could not update message_id in discord_embed_configs for guild {guild_id}: {e}")
+
+    async def _delete_custom_embed(self, data):
+        """Delete a posted custom embed message from Discord."""
+        channel_id = data.get("channel_id")
+        message_id = data.get("message_id")
+
+        if not channel_id or not message_id:
+            return
+
+        try:
+            channel = self.bot.get_channel(int(channel_id))
+            if channel is None:
+                channel = await self.bot.fetch_channel(int(channel_id))
+            if channel:
+                msg = await channel.fetch_message(int(message_id))
+                await msg.delete()
+                logger.info(f"🗑️ Deleted custom embed message {message_id} from channel {channel_id}")
+        except Exception as e:
+            logger.info(f"ℹ️ Could not delete custom embed message {message_id}: {e}")
 
     async def handle_giveaway_event(self, action, data):
         """Handle giveaway events from dashboard"""

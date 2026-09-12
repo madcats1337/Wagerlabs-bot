@@ -32,6 +32,9 @@ FREE = [
     # requires a live Discord guild (see REQUIRES_DISCORD below). Mirror of
     # Admin-Dashboard/utils/tiers.py.
     "levels",
+    # Discord Embed Tool for custom channel embeds & leaderboard embeds. Free
+    # for all tiers, requires a live Discord guild.
+    "embed_tool",
 ]
 TIER2 = FREE + [
     "point_shop",
@@ -82,6 +85,7 @@ REQUIRES_DISCORD = {
     "full_dashboard",
     "leaderboard_generator",
     "levels",
+    "embed_tool",
 }
 
 
