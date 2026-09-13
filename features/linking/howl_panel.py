@@ -24,6 +24,7 @@ from features.linking.panel_embed_config import (
     add_container_body,
     load_panel_embed_config,
     resolve_accent,
+    resolve_banner_attachment,
     resolve_banner_url,
     resolve_description,
     resolve_footer,
@@ -97,14 +98,21 @@ _LOGO_PATH = os.path.join(_ASSET_ROOT, "branding", "howl_logo.png")
 _LOGO_FILENAME = "howl_logo.png"
 
 
-def _build_panel_message_kwargs(view, has_logo=False, clear_attachments=False, for_send=False):
+def _build_panel_message_kwargs(view, banner_file=None, has_logo=False, clear_attachments=False, for_send=False):
+    """Build send/edit kwargs for a howl panel message, including the banner or logo attachment when needed."""
     kwargs = {"view": view}
+    files = []
+    if banner_file:
+        files.append(banner_file)
+    elif has_logo:
+        files.append(discord.File(_LOGO_PATH, filename=_LOGO_FILENAME))
+
     if for_send:
-        if has_logo:
-            kwargs["files"] = [discord.File(_LOGO_PATH, filename=_LOGO_FILENAME)]
+        if files:
+            kwargs["files"] = files
     else:
-        if has_logo:
-            kwargs["attachments"] = [discord.File(_LOGO_PATH, filename=_LOGO_FILENAME)]
+        if files:
+            kwargs["attachments"] = files
         elif clear_attachments:
             kwargs["attachments"] = []
     return kwargs
@@ -473,6 +481,7 @@ class HowlPanelView(LayoutView):
         campaign_code=None,
         embed_cfg=None,
         guild_id=None,
+        banner_media_url=None,
     ):
         super().__init__(timeout=None)
         self.bot = bot
@@ -482,7 +491,7 @@ class HowlPanelView(LayoutView):
         self.guild_id = guild_id
 
         cfg = embed_cfg or {}
-        banner_url = resolve_banner_url(cfg, engine=engine, guild_id=guild_id)
+        banner_url = banner_media_url or resolve_banner_url(cfg, engine=engine, guild_id=guild_id)
 
         # howl_campaign_code may hold several comma-separated codes (they all
         # count for wager tracking). The panel names the FIRST one — it's the
@@ -639,8 +648,11 @@ class HowlPanel:
     async def create_panel(self, channel: discord.TextChannel):
         try:
             embed_cfg = load_panel_embed_config(self.engine, channel.guild.id, HOWL_EMBED_CONFIG_KEY)
-            banner_url = resolve_banner_url(embed_cfg)
-            # A dashboard banner URL renders directly, so the bundled logo is not attached.
+            banner_url = resolve_banner_url(embed_cfg, engine=self.engine, guild_id=channel.guild.id)
+            banner_media_url, banner_file = (
+                await resolve_banner_attachment(banner_url, engine=self.engine) if banner_url else ("", None)
+            )
+            # A dashboard banner URL renders directly or via attachment, so the bundled logo is not attached.
             has_logo = (not banner_url) and os.path.isfile(_LOGO_PATH)
             campaign_code = self._campaign_code(channel.guild.id)
             view = HowlPanelView(
@@ -652,30 +664,36 @@ class HowlPanel:
                 campaign_code=campaign_code,
                 embed_cfg=embed_cfg,
                 guild_id=channel.guild.id,
+                banner_media_url=banner_media_url,
             )
             if not has_logo and not banner_url:
                 logger.warning(f"[Howl] {_LOGO_PATH} not found — posting panel without the logotype banner.")
 
             try:
-                message = await channel.send(**_build_panel_message_kwargs(view, has_logo=has_logo, for_send=True))
+                message = await channel.send(
+                    **_build_panel_message_kwargs(view, banner_file=banner_file, has_logo=has_logo, for_send=True)
+                )
             except discord.Forbidden as e:
-                if has_logo:
+                if has_logo or banner_file:
                     logger.warning(
-                        f"[Howl] Missing permissions to send with logo (likely 'Attach Files'). Retrying without logo..."
+                        "[Howl] Missing permissions to send with attachment (likely 'Attach Files'). Retrying without attachment..."
                     )
-                    # Recreate view without logo to avoid missing attachment references
-                    view_no_logo = HowlPanelView(
+                    # Recreate view without logo/banner to avoid missing attachment references
+                    view_no_attachment = HowlPanelView(
                         self.bot,
                         self.engine,
                         self.settings_getter,
                         howl_emoji=self.howl_emoji,
                         show_logo=False,
                         campaign_code=campaign_code,
-                        embed_cfg=embed_cfg,
+                        embed_cfg={**embed_cfg, "bannerUrl": ""},
                         guild_id=channel.guild.id,
+                        banner_media_url="",
                     )
                     message = await channel.send(
-                        **_build_panel_message_kwargs(view_no_logo, has_logo=False, for_send=True)
+                        **_build_panel_message_kwargs(
+                            view_no_attachment, banner_file=None, has_logo=False, for_send=True
+                        )
                     )
                 else:
                     raise e
@@ -694,9 +712,10 @@ class HowlPanel:
                     campaign_code=campaign_code,
                     embed_cfg={**embed_cfg, "bannerUrl": ""},
                     guild_id=channel.guild.id,
+                    banner_media_url="",
                 )
                 message = await channel.send(
-                    **_build_panel_message_kwargs(view_no_banner, has_logo=has_logo, for_send=True)
+                    **_build_panel_message_kwargs(view_no_banner, banner_file=None, has_logo=has_logo, for_send=True)
                 )
 
             self.panel_guild_id = channel.guild.id
@@ -725,7 +744,11 @@ class HowlPanel:
 
         try:
             embed_cfg = load_panel_embed_config(self.engine, channel.guild.id, HOWL_EMBED_CONFIG_KEY)
-            has_logo = (not resolve_banner_url(embed_cfg)) and os.path.isfile(_LOGO_PATH)
+            banner_url = resolve_banner_url(embed_cfg, engine=self.engine, guild_id=channel.guild.id)
+            banner_media_url, banner_file = (
+                await resolve_banner_attachment(banner_url, engine=self.engine) if banner_url else ("", None)
+            )
+            has_logo = (not banner_url) and os.path.isfile(_LOGO_PATH)
             view = HowlPanelView(
                 self.bot,
                 self.engine,
@@ -735,10 +758,16 @@ class HowlPanel:
                 campaign_code=self._campaign_code(channel.guild.id),
                 embed_cfg=embed_cfg,
                 guild_id=channel.guild.id,
+                banner_media_url=banner_media_url,
             )
             # clear_attachments drops a previously attached logo when a banner URL
             # took over; otherwise it would linger below the container.
-            await message.edit(**_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo))
+            clear_attachments = not banner_file and not has_logo
+            await message.edit(
+                **_build_panel_message_kwargs(
+                    view, banner_file=banner_file, has_logo=has_logo, clear_attachments=clear_attachments
+                )
+            )
             logger.info(f"[Howl] Refreshed panel in place for guild {self.guild_id}")
             return True
         except Exception as e:
@@ -754,7 +783,7 @@ async def setup_howl_panel_system(bot, engine, settings_getter):
     for guild in bot.guilds:
         panel = HowlPanel(bot, engine, settings_getter, guild_id=guild.id, howl_emoji=howl_emoji)
         panels[guild.id] = panel
-        logger.debug(f"✅ Howl verify panel initialized")
+        logger.debug("✅ Howl verify panel initialized")
 
     @bot.hybrid_command(name="createhowlpanel")
     @app_commands.default_permissions(administrator=True)
@@ -785,7 +814,11 @@ async def setup_howl_panel_system(bot, engine, settings_getter):
                             logger.info(f"[Howl] Re-posted missing panel for guild {guild_id}")
                         continue
                     embed_cfg = load_panel_embed_config(engine, guild_id, HOWL_EMBED_CONFIG_KEY)
-                    has_logo = (not resolve_banner_url(embed_cfg)) and os.path.isfile(_LOGO_PATH)
+                    banner_url = resolve_banner_url(embed_cfg, engine=engine, guild_id=guild_id)
+                    banner_media_url, banner_file = (
+                        await resolve_banner_attachment(banner_url, engine=engine) if banner_url else ("", None)
+                    )
+                    has_logo = (not banner_url) and os.path.isfile(_LOGO_PATH)
                     view = HowlPanelView(
                         bot,
                         engine,
@@ -795,9 +828,13 @@ async def setup_howl_panel_system(bot, engine, settings_getter):
                         campaign_code=panel._campaign_code(guild_id),
                         embed_cfg=embed_cfg,
                         guild_id=guild_id,
+                        banner_media_url=banner_media_url,
                     )
+                    clear_attachments = not banner_file and not has_logo
                     await message.edit(
-                        **_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo)
+                        **_build_panel_message_kwargs(
+                            view, banner_file=banner_file, has_logo=has_logo, clear_attachments=clear_attachments
+                        )
                     )
                     logger.info(f"[Howl] Refreshed panel view for guild {guild_id}")
             except Exception as e:

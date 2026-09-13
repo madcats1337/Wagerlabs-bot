@@ -10,10 +10,14 @@ classes hold self.guild_id, load the config and pass it in as a kwarg — the sa
 way HowlPanelView already receives campaign_code.
 """
 
+import io
 import json
 import logging
 import re
+from typing import Optional, Tuple
 
+import aiohttp
+import discord
 from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
@@ -67,6 +71,69 @@ def resolve_banner_url(cfg, engine=None, guild_id=None) -> str:
         except Exception:
             pass
     return raw
+
+
+async def resolve_banner_attachment(
+    banner_url: str,
+    engine=None,
+    filename: str = "banner.png",
+) -> Tuple[str, Optional[discord.File]]:
+    """Resolves a banner URL into a direct discord.File attachment when possible,
+    returning ('attachment://banner.<ext>', discord.File) so Discord serves it at
+    100% original resolution without external proxy compression.
+
+    Checks the shared PostgreSQL `uploaded_files` table first for dashboard uploads,
+    otherwise fetches via aiohttp if it's an HTTP(S) URL.
+    Falls back gracefully to (banner_url, None) on any failure.
+    """
+    if not banner_url:
+        return "", None
+
+    # 1. Dashboard upload path: check PostgreSQL uploaded_files table directly
+    if "/static/uploads/" in banner_url and engine is not None:
+        try:
+            idx = banner_url.find("/static/uploads/")
+            path = banner_url[idx:]
+            ext = path.rsplit(".", 1)[-1].lower() if "." in path else "png"
+            if ext not in ("png", "jpg", "jpeg", "webp", "gif"):
+                ext = "png"
+            out_filename = f"banner.{ext}"
+
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT file_bytes FROM uploaded_files WHERE file_path = :p OR file_path = :p_clean LIMIT 1"),
+                    {"p": path, "p_clean": path.lstrip("/")},
+                ).fetchone()
+                if row and row[0]:
+                    raw_bytes = bytes(row[0])
+                    if len(raw_bytes) > 0:
+                        file_obj = discord.File(io.BytesIO(raw_bytes), filename=out_filename)
+                        return f"attachment://{out_filename}", file_obj
+        except Exception as e:
+            logger.debug(f"[panel-embed] DB fetch for banner {banner_url} failed: {e}")
+
+    # 2. HTTP/HTTPS URL: fetch bytes via aiohttp
+    if banner_url.startswith(("http://", "https://")):
+        try:
+            clean_url = banner_url.split("?")[0]
+            ext = clean_url.rsplit(".", 1)[-1].lower() if "." in clean_url else "png"
+            if ext not in ("png", "jpg", "jpeg", "webp", "gif"):
+                ext = "png"
+            out_filename = f"banner.{ext}"
+
+            timeout = aiohttp.ClientTimeout(total=8)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(banner_url, headers={"User-Agent": "WagerlabsBot/1.0"}) as resp:
+                    if resp.status == 200:
+                        raw_bytes = await resp.read()
+                        if raw_bytes and len(raw_bytes) <= 15 * 1024 * 1024:  # 15MB limit
+                            file_obj = discord.File(io.BytesIO(raw_bytes), filename=out_filename)
+                            return f"attachment://{out_filename}", file_obj
+        except Exception as e:
+            logger.debug(f"[panel-embed] HTTP fetch for banner {banner_url} failed: {e}")
+
+    # 3. Fallback to raw URL directly (previous behavior)
+    return banner_url, None
 
 
 def resolve_title(cfg, default_heading: str) -> str:

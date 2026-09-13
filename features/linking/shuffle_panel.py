@@ -27,6 +27,7 @@ from features.linking.panel_embed_config import (
     add_container_body,
     load_panel_embed_config,
     resolve_accent,
+    resolve_banner_attachment,
     resolve_banner_url,
     resolve_description,
     resolve_footer,
@@ -105,20 +106,26 @@ _LOGO_PATH = os.path.join(_ASSET_ROOT, "branding", "shuffle_logo.png")
 _LOGO_FILENAME = "shuffle_logo.png"
 
 
-def _build_panel_message_kwargs(view, has_logo=False, clear_attachments=False, for_send=False):
-    """Build send/edit kwargs for a shuffle panel message, including the logo attachment when needed.
+def _build_panel_message_kwargs(view, banner_file=None, has_logo=False, clear_attachments=False, for_send=False):
+    """Build send/edit kwargs for a shuffle panel message, including the banner or logo attachment when needed.
 
     Messageable.send() and Message.edit() take different kwargs for files:
     send() wants files=[...] (and can't clear anything), edit() wants attachments=[...]
     (where [] clears existing attachments). Pass for_send=True from the create path.
     """
     kwargs = {"view": view}
+    files = []
+    if banner_file:
+        files.append(banner_file)
+    elif has_logo:
+        files.append(discord.File(_LOGO_PATH, filename=_LOGO_FILENAME))
+
     if for_send:
-        if has_logo:
-            kwargs["files"] = [discord.File(_LOGO_PATH, filename=_LOGO_FILENAME)]
+        if files:
+            kwargs["files"] = files
     else:
-        if has_logo:
-            kwargs["attachments"] = [discord.File(_LOGO_PATH, filename=_LOGO_FILENAME)]
+        if files:
+            kwargs["attachments"] = files
         elif clear_attachments:
             kwargs["attachments"] = []
     return kwargs
@@ -476,7 +483,17 @@ class ShufflePanelView(LayoutView):
     "Verify Shuffle Account" button (stable custom_id, so the message re-binds
     its handler after a restart) opens the verification modal."""
 
-    def __init__(self, bot, engine, settings_getter, shuffle_emoji=None, show_logo=True, embed_cfg=None, guild_id=None):
+    def __init__(
+        self,
+        bot,
+        engine,
+        settings_getter,
+        shuffle_emoji=None,
+        show_logo=True,
+        embed_cfg=None,
+        guild_id=None,
+        banner_media_url=None,
+    ):
         super().__init__(timeout=None)
         self.bot = bot
         self.engine = engine
@@ -485,7 +502,7 @@ class ShufflePanelView(LayoutView):
         self.guild_id = guild_id
 
         cfg = embed_cfg or {}
-        banner_url = resolve_banner_url(cfg, engine=engine, guild_id=guild_id)
+        banner_url = banner_media_url or resolve_banner_url(cfg, engine=engine, guild_id=guild_id)
 
         container = Container(accent_colour=resolve_accent(cfg, ACCENT_COLOR))
         # Shuffle logotype banner at the very top. Normally shown from the message's
@@ -626,12 +643,14 @@ class ShufflePanel:
         try:
             # Components V2: the panel is a LayoutView (no embed — a V2 message
             # can't carry one). All copy lives inside the view's TextDisplays.
-            # The logotype banner is attached and shown via the view's MediaGallery
-            # (attachment://shuffle_logo.png); skip the gallery if the file is
-            # missing so the panel still posts.
+            # The banner is attached directly or rendered via URL, falling back to
+            # the bundled logo file when no banner is configured.
             embed_cfg = load_panel_embed_config(self.engine, channel.guild.id, SHUFFLE_EMBED_CONFIG_KEY)
-            banner_url = resolve_banner_url(embed_cfg)
-            # A dashboard banner URL renders directly, so the bundled logo is not attached.
+            banner_url = resolve_banner_url(embed_cfg, engine=self.engine, guild_id=channel.guild.id)
+            banner_media_url, banner_file = (
+                await resolve_banner_attachment(banner_url, engine=self.engine) if banner_url else ("", None)
+            )
+            # A dashboard banner URL renders directly or via attachment, so the bundled logo is not attached.
             has_logo = (not banner_url) and os.path.isfile(_LOGO_PATH)
             view = ShufflePanelView(
                 self.bot,
@@ -641,11 +660,14 @@ class ShufflePanel:
                 show_logo=has_logo,
                 embed_cfg=embed_cfg,
                 guild_id=channel.guild.id,
+                banner_media_url=banner_media_url,
             )
             if not has_logo and not banner_url:
                 logger.warning(f"[Shuffle] {_LOGO_PATH} not found — posting panel without the logotype banner.")
             try:
-                message = await channel.send(**_build_panel_message_kwargs(view, has_logo=has_logo, for_send=True))
+                message = await channel.send(
+                    **_build_panel_message_kwargs(view, banner_file=banner_file, has_logo=has_logo, for_send=True)
+                )
             except discord.HTTPException as e:
                 if not banner_url:
                     raise
@@ -660,8 +682,11 @@ class ShufflePanel:
                     show_logo=has_logo,
                     embed_cfg={**embed_cfg, "bannerUrl": ""},
                     guild_id=channel.guild.id,
+                    banner_media_url="",
                 )
-                message = await channel.send(**_build_panel_message_kwargs(view, has_logo=has_logo, for_send=True))
+                message = await channel.send(
+                    **_build_panel_message_kwargs(view, banner_file=None, has_logo=has_logo, for_send=True)
+                )
 
             self.panel_guild_id = channel.guild.id
             self.panel_channel_id = channel.id
@@ -689,7 +714,10 @@ class ShufflePanel:
 
         try:
             embed_cfg = load_panel_embed_config(self.engine, channel.guild.id, SHUFFLE_EMBED_CONFIG_KEY)
-            banner_url = resolve_banner_url(embed_cfg)
+            banner_url = resolve_banner_url(embed_cfg, engine=self.engine, guild_id=channel.guild.id)
+            banner_media_url, banner_file = (
+                await resolve_banner_attachment(banner_url, engine=self.engine) if banner_url else ("", None)
+            )
             has_logo = (not banner_url) and os.path.isfile(_LOGO_PATH)
             view = ShufflePanelView(
                 self.bot,
@@ -699,10 +727,16 @@ class ShufflePanel:
                 show_logo=has_logo,
                 embed_cfg=embed_cfg,
                 guild_id=channel.guild.id,
+                banner_media_url=banner_media_url,
             )
             # clear_attachments drops a previously attached logo when a banner URL
             # took over; otherwise it would linger below the container.
-            await message.edit(**_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo))
+            clear_attachments = not banner_file and not has_logo
+            await message.edit(
+                **_build_panel_message_kwargs(
+                    view, banner_file=banner_file, has_logo=has_logo, clear_attachments=clear_attachments
+                )
+            )
             logger.info(f"[Shuffle] Refreshed panel in place for guild {self.guild_id}")
             return True
         except Exception as e:
@@ -721,7 +755,7 @@ async def setup_shuffle_panel_system(bot, engine, settings_getter):
     for guild in bot.guilds:
         panel = ShufflePanel(bot, engine, settings_getter, guild_id=guild.id, shuffle_emoji=shuffle_emoji)
         panels[guild.id] = panel
-        logger.debug(f"✅ Shuffle verify panel initialized")
+        logger.debug("✅ Shuffle verify panel initialized")
 
     @bot.hybrid_command(name="createshufflepanel")
     @app_commands.default_permissions(administrator=True)
@@ -758,7 +792,11 @@ async def setup_shuffle_panel_system(bot, engine, settings_getter):
                             logger.info(f"[Shuffle] Re-posted missing panel for guild {guild_id}")
                         continue
                     embed_cfg = load_panel_embed_config(engine, guild_id, SHUFFLE_EMBED_CONFIG_KEY)
-                    has_logo = (not resolve_banner_url(embed_cfg)) and os.path.isfile(_LOGO_PATH)
+                    banner_url = resolve_banner_url(embed_cfg, engine=engine, guild_id=guild_id)
+                    banner_media_url, banner_file = (
+                        await resolve_banner_attachment(banner_url, engine=engine) if banner_url else ("", None)
+                    )
+                    has_logo = (not banner_url) and os.path.isfile(_LOGO_PATH)
                     view = ShufflePanelView(
                         bot,
                         engine,
@@ -767,9 +805,13 @@ async def setup_shuffle_panel_system(bot, engine, settings_getter):
                         show_logo=has_logo,
                         embed_cfg=embed_cfg,
                         guild_id=guild_id,
+                        banner_media_url=banner_media_url,
                     )
+                    clear_attachments = not banner_file and not has_logo
                     await message.edit(
-                        **_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo)
+                        **_build_panel_message_kwargs(
+                            view, banner_file=banner_file, has_logo=has_logo, clear_attachments=clear_attachments
+                        )
                     )
                     logger.info(f"[Shuffle] Refreshed panel view for guild {guild_id}")
             except Exception as e:

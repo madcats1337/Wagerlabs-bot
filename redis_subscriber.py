@@ -2021,10 +2021,24 @@ class RedisSubscriber:
                 return
 
         # Resolve relative banner URL if necessary
+        eng = get_engine()
         if banner_url and banner_url.startswith("/"):
-            base_url = get_server_base_url(get_engine(), guild_id)
+            base_url = get_server_base_url(eng, guild_id)
             if base_url:
                 banner_url = f"{base_url}{banner_url}"
+
+        # Resolve banner into a direct discord.File attachment to bypass proxy compression
+        banner_media_url = banner_url
+        banner_file = None
+        if banner_url:
+            try:
+                from features.linking.panel_embed_config import resolve_banner_attachment
+
+                banner_media_url, banner_file = await resolve_banner_attachment(banner_url, engine=eng)
+            except Exception as e:
+                logger.debug(f"[embed] resolve_banner_attachment failed: {e}")
+                banner_media_url = banner_url
+                banner_file = None
 
         # Build Components V2 LayoutView
         view = discord.ui.LayoutView(timeout=None)
@@ -2042,9 +2056,9 @@ class RedisSubscriber:
             container = discord.ui.Container(accent_colour=accent_val)
 
             # Banner on first container if provided
-            if idx == 0 and banner_url:
+            if idx == 0 and banner_media_url:
                 try:
-                    container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(banner_url)))
+                    container.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(banner_media_url)))
                 except Exception as me:
                     logger.debug(f"[embed] could not add banner media gallery: {me}")
 
@@ -2104,7 +2118,12 @@ class RedisSubscriber:
         if message_id:
             try:
                 msg = await channel.fetch_message(int(message_id))
-                await msg.edit(view=view)
+                edit_kwargs = {"view": view}
+                if banner_file:
+                    edit_kwargs["attachments"] = [banner_file]
+                else:
+                    edit_kwargs["attachments"] = []
+                await msg.edit(**edit_kwargs)
                 sent_message = msg
                 logger.info(f"✅ Updated custom embed message {message_id} in channel {channel_id}")
             except (discord.NotFound, discord.HTTPException) as err:
@@ -2113,7 +2132,10 @@ class RedisSubscriber:
 
         if sent_message is None:
             try:
-                sent_message = await channel.send(view=view)
+                send_kwargs = {"view": view}
+                if banner_file:
+                    send_kwargs["files"] = [banner_file]
+                sent_message = await channel.send(**send_kwargs)
                 logger.info(f"✅ Posted fresh custom embed message {sent_message.id} in channel {channel_id}")
             except Exception as e:
                 logger.error(f"❌ Failed to send custom embed message in channel {channel_id}: {e}")
