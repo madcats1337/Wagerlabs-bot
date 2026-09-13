@@ -137,14 +137,11 @@ async def resolve_banner_attachment(
 
 
 def resolve_title(cfg, default_heading: str) -> str:
-    """Panel heading. Configured titles are stored without markdown, so wrap them
-    to match the hardcoded '## ' headings."""
+    """Panel heading without hardcoded formatting syntax."""
     title = (str((cfg or {}).get("title") or "")).strip()
     if not title:
         return default_heading
-    if title.startswith("#"):
-        return title
-    return f"## {title}"
+    return title
 
 
 def resolve_footer(cfg) -> str:

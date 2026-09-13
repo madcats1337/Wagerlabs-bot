@@ -2065,8 +2065,7 @@ class RedisSubscriber:
             # Title
             title = (c_data.get("title") or "").strip()
             if title:
-                header_text = title if title.startswith("#") else f"## {title}"
-                container.add_item(discord.ui.TextDisplay(header_text))
+                container.add_item(discord.ui.TextDisplay(title))
 
             # Body: split by separator line '---'
             body = (c_data.get("body") or "").strip()
@@ -2109,7 +2108,7 @@ class RedisSubscriber:
             footer = (c_data.get("footer") or "").strip()
             if footer:
                 container.add_item(discord.ui.Separator())
-                container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+                container.add_item(discord.ui.TextDisplay(footer))
 
             view.add_item(container)
 

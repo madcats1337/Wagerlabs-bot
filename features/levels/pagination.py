@@ -513,7 +513,7 @@ def build_board_view(
 
     if footer:
         container.add_item(discord.ui.Separator())
-        container.add_item(discord.ui.TextDisplay(f"-# {footer}"))
+        container.add_item(discord.ui.TextDisplay(footer))
 
     view.add_item(container)
     return view

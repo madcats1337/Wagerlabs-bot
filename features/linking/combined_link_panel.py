@@ -202,7 +202,7 @@ class CombinedLinkPanelView(LayoutView):
                 container.add_item(MediaGallery(MediaGalleryItem(banner_url)))
             elif show_logo:
                 container.add_item(MediaGallery(MediaGalleryItem(f"attachment://{_LOGO_FILENAME}")))
-        container.add_item(TextDisplay(resolve_title(cfg, "## 🔗 Link Your Account")))
+        container.add_item(TextDisplay(resolve_title(cfg, "🔗 Link Your Account")))
         custom_desc = resolve_description(cfg)
         if custom_desc:
             add_container_body(container, custom_desc, TextDisplay, Separator)
@@ -259,6 +259,7 @@ class CombinedLinkPanelView(LayoutView):
 
         footer = resolve_footer(cfg)
         if footer:
+            container.add_item(Separator())
             container.add_item(TextDisplay(footer))
 
         self.add_item(container)

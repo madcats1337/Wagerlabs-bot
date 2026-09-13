@@ -515,7 +515,7 @@ class HowlPanelView(LayoutView):
                 container.add_item(MediaGallery(MediaGalleryItem(banner_url)))
             elif show_logo:
                 container.add_item(MediaGallery(MediaGalleryItem(f"attachment://{_LOGO_FILENAME}")))
-        container.add_item(TextDisplay(resolve_title(cfg, "## Verify Your Howl Account")))
+        container.add_item(TextDisplay(resolve_title(cfg, "Verify Your Howl Account")))
         custom_desc = resolve_description(cfg)
         if custom_desc:
             add_container_body(container, custom_desc, TextDisplay, Separator)
@@ -552,6 +552,7 @@ class HowlPanelView(LayoutView):
 
         footer = resolve_footer(cfg)
         if footer:
+            container.add_item(Separator())
             container.add_item(TextDisplay(footer))
 
         self.add_item(container)
