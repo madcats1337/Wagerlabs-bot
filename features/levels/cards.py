@@ -998,23 +998,18 @@ async def render_competition_winners_card(winners, period_label: str) -> discord
 # Appearance is themable from the dashboard (Levels -> Appearance): title font,
 # title colour and background. See BannerTheme below.
 
-# DISPLAY size. 520 matches the width Discord gives an EMBED, so the banner
-# attached above the board lines up with it instead of overhanging by the ~30px
-# an image gets from the wider message content area. The height keeps the
-# original 4.1:1 proportion.
-BANNER_W = 520
-BANNER_H = 127
+# DISPLAY size. 600x200 matches the 3:1 leaderboard banner aspect ratio.
+BANNER_W = 600
+BANNER_H = 200
 
-# The banner's interior is still authored against the ORIGINAL 820x200 canvas —
+# The banner's interior is authored against the 820-wide reference canvas —
 # every type size and offset below is in those units. _bs() folds in the ratio
 # to the display size, so the whole design scales as one piece and the numbers
 # stay comparable to the cards' own.
 _BANNER_DESIGN_W = 820
 
-# Rasterise at 3x the display size rather than the cards' 2x: at 520 display px
-# a 2x render is only 1040px, which Discord upscales on a HiDPI display and
-# softens. 3x keeps the type crisp at the smaller size.
-BANNER_SCALE = 3
+# Rasterise at 2x the display size: 600x200 display px -> 1200x400 render px.
+BANNER_SCALE = 2
 
 _BANNER_UNIT = BANNER_SCALE * BANNER_W / _BANNER_DESIGN_W
 

@@ -198,28 +198,24 @@ def test_banner_has_no_transparent_margin():
 
 
 def test_banner_displays_at_the_embed_width():
-    """The banner must be as wide as the embed beneath it, not wider.
-
-    A plain attachment is scaled to the message content area (~550px) while an
-    embed maxes out at 520px, so a banner authored wider overhangs the board by
-    ~30px. Rendering it AT 520 display px is what makes the two line up — an
-    earlier attempt did the reverse and tried to stretch the embed with an
-    invisible footer spacer, which could not be verified.
-    """
-    assert cards.BANNER_W == 520
+    """The banner is 600x200 display px, rasterised at 2x (1200x400)."""
+    assert cards.BANNER_W == 600
+    assert cards.BANNER_H == 200
+    assert cards.BANNER_SCALE == 2
 
     png = cards.render_banner_png("Community Leaderboard", "sub", COMMUNITY_STATS)
     width, height = _open(png).size
     assert width == cards.BANNER_W * cards.BANNER_SCALE
     assert height == cards.BANNER_H * cards.BANNER_SCALE
+    assert (width, height) == (1200, 400)
 
     # Rendered above 1x so it stays crisp when Discord scales it down.
     assert width > cards.BANNER_W
 
 
 def test_banner_keeps_its_proportions():
-    """The interior is still authored on the original 820-wide canvas."""
-    assert abs(cards.BANNER_W / cards.BANNER_H - 820 / 200) < 0.05
+    """The banner maintains a 3:1 aspect ratio (600x200 / 1200x400)."""
+    assert cards.BANNER_W / cards.BANNER_H == 600 / 200
 
 
 def test_unset_theme_uses_the_stock_accent():
