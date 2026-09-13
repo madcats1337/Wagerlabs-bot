@@ -1833,6 +1833,33 @@ class RedisSubscriber:
         elif action == "delete_custom_embed":
             await self._delete_custom_embed(data)
 
+        elif action == "sync_discord_profile":
+            await self._sync_discord_profile(data)
+
+    async def _sync_discord_profile(self, data):
+        """Synchronize a server's bot profile (nickname, avatar, bio, banner) on Discord.
+
+        data: {guild_id, discord_bot_nickname, discord_bot_avatar, discord_bot_bio, discord_bot_banner}
+        """
+        guild_id = data.get("guild_id")
+        if not guild_id:
+            logger.warning("sync_discord_profile event missing guild_id")
+            return
+
+        try:
+            from features.discord_profile.profile_sync import apply_guild_bot_profile
+
+            success, err = await apply_guild_bot_profile(
+                self.bot,
+                int(guild_id),
+                settings=data,
+                engine=get_engine(),
+            )
+            if not success and err:
+                logger.warning(f"Profile sync for guild {guild_id} reported: {err}")
+        except Exception as e:
+            logger.error(f"Error handling sync_discord_profile for guild {guild_id}: {e}", exc_info=True)
+
     async def _post_panel(self, data):
         """Post or move a link/verify panel into the channel chosen on the dashboard.
 

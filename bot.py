@@ -9135,6 +9135,18 @@ async def on_member_join(member):
 
 
 @bot.event
+async def on_guild_join(guild):
+    """Apply any existing configured server profile when the bot joins a guild."""
+    logger.info(f"🎉 Joined guild: {guild.name} ({guild.id})")
+    try:
+        from features.discord_profile.profile_sync import apply_guild_bot_profile_safe
+
+        await apply_guild_bot_profile_safe(bot, guild.id, engine=engine)
+    except Exception as e:
+        logger.debug(f"Bot profile sync skipped on guild join for {guild.id}: {e}")
+
+
+@bot.event
 async def on_guild_remove(guild):
     """Free per-guild state when the bot is removed from a guild.
 
@@ -9964,6 +9976,14 @@ async def on_ready():
                     bot.custom_commands_managers = {}
                 bot.custom_commands_managers[guild.id] = custom_commands_manager
                 logger.debug(f"✅ Custom commands system initialized")
+
+                # Setup custom bot profile for this guild if configured
+                try:
+                    from features.discord_profile.profile_sync import apply_guild_bot_profile_safe
+
+                    await apply_guild_bot_profile_safe(bot, guild.id, engine=engine)
+                except Exception as prof_err:
+                    logger.debug(f"Bot profile sync skipped on startup for guild {guild.id}: {prof_err}")
 
             # Per-guild init loop done — clear context so the global setup below
             # (cogs, views, summaries) isn't mis-tagged with the last guild.
