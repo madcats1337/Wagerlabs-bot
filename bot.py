@@ -1730,6 +1730,24 @@ engine = create_engine(
 
 try:
     with engine.begin() as conn:
+        # Create uploaded_files table (persistent asset storage across ephemeral containers)
+        conn.execute(
+            text(
+                """
+        CREATE TABLE IF NOT EXISTS uploaded_files (
+            id SERIAL PRIMARY KEY,
+            file_path TEXT UNIQUE NOT NULL,
+            file_bytes BYTEA NOT NULL,
+            content_type VARCHAR(100) NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            discord_server_id BIGINT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_uploaded_files_path ON uploaded_files (file_path);
+        """
+            )
+        )
+
         # Create watchtime table (multiserver-aware)
         conn.execute(
             text(

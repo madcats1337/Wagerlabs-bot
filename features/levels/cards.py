@@ -1304,6 +1304,10 @@ def _load_custom_background(custom_image: str, target_size: tuple[int, int]) -> 
                 return _cover_fit(img.convert("RGBA"), target_size)
 
         local_candidates = []
+        if custom_image.startswith("/static/uploads/"):
+            sub = custom_image[len("/static/uploads/") :]
+            local_candidates.append(os.path.join("/data/uploads", sub))
+
         if os.path.isabs(custom_image) and os.path.exists(custom_image):
             local_candidates.append(custom_image)
         elif custom_image.startswith("/"):
@@ -1317,10 +1321,35 @@ def _load_custom_background(custom_image: str, target_size: tuple[int, int]) -> 
 
         for path in local_candidates:
             try:
-                with Image.open(path) as img:
-                    return _cover_fit(img.convert("RGBA"), target_size)
+                if os.path.exists(path):
+                    with Image.open(path) as img:
+                        return _cover_fit(img.convert("RGBA"), target_size)
             except Exception as e:
                 logger.warning(f"Failed to open local banner image {path}: {e}")
+
+        # Check DB uploaded_files if available in bot
+        if custom_image.startswith(("/static/uploads/", "/uploads/")):
+            try:
+                from database import get_engine
+                from sqlalchemy import text
+
+                engine = get_engine()
+                with engine.connect() as conn:
+                    row = conn.execute(
+                        text(
+                            """
+                            SELECT file_bytes FROM uploaded_files
+                            WHERE file_path = :path OR file_path = :alt_path
+                            LIMIT 1
+                            """
+                        ),
+                        {"path": custom_image, "alt_path": "/" + custom_image.lstrip("/")},
+                    ).fetchone()
+                    if row and row[0]:
+                        with Image.open(io.BytesIO(bytes(row[0]))) as img:
+                            return _cover_fit(img.convert("RGBA"), target_size)
+            except Exception as e:
+                logger.debug(f"DB read for custom banner failed in bot: {e}")
 
         if custom_image.startswith(("http://", "https://")):
             import urllib.request

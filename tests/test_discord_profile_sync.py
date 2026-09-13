@@ -105,7 +105,7 @@ def test_apply_guild_bot_profile_safe_never_raises(mock_bot):
 
 
 def test_fetch_or_read_data_uri():
-    """Test data URI pass-through and null handling."""
+    """Test data URI pass-through, null handling, and DB engine lookup."""
     data_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA"
     result = asyncio.run(fetch_or_read_data_uri(data_uri))
     assert result == data_uri
@@ -113,3 +113,15 @@ def test_fetch_or_read_data_uri():
     assert asyncio.run(fetch_or_read_data_uri(None)) is None
     assert asyncio.run(fetch_or_read_data_uri("")) is None
     assert asyncio.run(fetch_or_read_data_uri("   ")) is None
+
+    # Test DB engine lookup when file is not on disk
+    mock_engine = MagicMock()
+    mock_conn = MagicMock()
+    mock_engine.connect.return_value.__enter__.return_value = mock_conn
+    mock_conn.execute.return_value.fetchone.return_value = (b"\x89PNGfakebytes", "image/png")
+
+    db_res = asyncio.run(
+        fetch_or_read_data_uri("/static/uploads/bot-profiles/test.png", engine=mock_engine, guild_id=123)
+    )
+    assert db_res is not None
+    assert db_res.startswith("data:image/png;base64,")

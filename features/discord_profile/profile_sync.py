@@ -35,7 +35,21 @@ async def fetch_or_read_data_uri(
     if path_or_url.startswith("data:image/"):
         return path_or_url
 
-    # Check local filesystem first (in dev or shared disk setups)
+    # 1. Check persistent volume /data/uploads directly (if mounted)
+    if path_or_url.startswith("/static/uploads/"):
+        volume_path = os.path.join("/data/uploads", path_or_url[len("/static/uploads/") :])
+        if os.path.isfile(volume_path):
+            try:
+                mime_type, _ = mimetypes.guess_type(volume_path)
+                if not mime_type or not mime_type.startswith("image/"):
+                    mime_type = "image/png"
+                with open(volume_path, "rb") as f:
+                    encoded = base64.b64encode(f.read()).decode("utf-8")
+                return f"data:{mime_type};base64,{encoded}"
+            except Exception as e:
+                logger.warning(f"Failed to read volume image file {volume_path}: {e}")
+
+    # 2. Check local filesystem (in dev or shared disk setups)
     if path_or_url.startswith("/static/"):
         # Check standard relative path to Admin-Dashboard
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -53,7 +67,29 @@ async def fetch_or_read_data_uri(
             except Exception as e:
                 logger.warning(f"Failed to read local image file {local_path}: {e}")
 
-    # Fallback to fetching via HTTP/HTTPS (for remote or Railway container environments)
+    # 3. Check database uploaded_files table directly if engine is provided
+    if engine and (path_or_url.startswith("/static/uploads/") or path_or_url.startswith("/uploads/")):
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT file_bytes, content_type FROM uploaded_files
+                        WHERE file_path = :path OR file_path = :alt_path
+                        LIMIT 1
+                        """
+                    ),
+                    {"path": path_or_url, "alt_path": "/" + path_or_url.lstrip("/")},
+                ).fetchone()
+                if row and row[0]:
+                    file_bytes = bytes(row[0])
+                    mime_type = row[1] or "image/png"
+                    encoded = base64.b64encode(file_bytes).decode("utf-8")
+                    return f"data:{mime_type};base64,{encoded}"
+        except Exception as e:
+            logger.debug(f"DB lookup for uploaded profile asset failed: {e}")
+
+    # 4. Fallback to fetching via HTTP/HTTPS (for remote or Railway container environments)
     target_url = path_or_url
     if path_or_url.startswith("/static/"):
         base_url = None
