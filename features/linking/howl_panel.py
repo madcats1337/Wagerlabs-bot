@@ -19,6 +19,16 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import text
 
+from features.linking.panel_embed_config import (
+    HOWL_EMBED_CONFIG_KEY,
+    load_panel_embed_config,
+    resolve_accent,
+    resolve_banner_url,
+    resolve_description,
+    resolve_footer,
+    resolve_title,
+)
+
 try:
     from discord import MediaGalleryItem
 except Exception:  # pragma: no cover
@@ -452,12 +462,17 @@ class HowlVerifyModal(Modal, title="Verify Your Howl Account"):
 
 
 class HowlPanelView(LayoutView):
-    def __init__(self, bot, engine, settings_getter, howl_emoji=None, show_logo=True, campaign_code=None):
+    def __init__(
+        self, bot, engine, settings_getter, howl_emoji=None, show_logo=True, campaign_code=None, embed_cfg=None
+    ):
         super().__init__(timeout=None)
         self.bot = bot
         self.engine = engine
         self.settings_getter = settings_getter
         self.howl_emoji = howl_emoji or FALLBACK_EMOJI
+
+        cfg = embed_cfg or {}
+        banner_url = resolve_banner_url(cfg)
 
         # howl_campaign_code may hold several comma-separated codes (they all
         # count for wager tracking). The panel names the FIRST one — it's the
@@ -469,21 +484,29 @@ class HowlPanelView(LayoutView):
             if code
             else "Sign up under our code to unlock rewards!"
         )
+        # Stays computed even when a custom description replaces signup_line, so the
+        # campaign code is still surfaced — and appears on its own once a code is set.
         bullet_line = (
             f"• Make sure you signed up on code **{code}**" if code else "• Make sure you signed up on our code"
         )
 
-        container = Container(accent_colour=ACCENT_COLOR)
-        if show_logo and MediaGalleryItem is not None:
-            container.add_item(MediaGallery(MediaGalleryItem(f"attachment://{_LOGO_FILENAME}")))
-        container.add_item(TextDisplay("## Verify Your Howl Account"))
+        container = Container(accent_colour=resolve_accent(cfg, ACCENT_COLOR))
+        if MediaGalleryItem is not None:
+            if banner_url:
+                container.add_item(MediaGallery(MediaGalleryItem(banner_url)))
+            elif show_logo:
+                container.add_item(MediaGallery(MediaGalleryItem(f"attachment://{_LOGO_FILENAME}")))
+        container.add_item(TextDisplay(resolve_title(cfg, "## Verify Your Howl Account")))
         container.add_item(
             TextDisplay(
-                f"{signup_line}\n\n"
-                "**How to Verify:**\n"
-                "Click the **'Verify Howl Account'** button below and enter your "
-                "Howl.gg UID. We'll check it against our affiliate stats and "
-                "grant your role instantly."
+                resolve_description(cfg)
+                or (
+                    f"{signup_line}\n\n"
+                    "**How to Verify:**\n"
+                    "Click the **'Verify Howl Account'** button below and enter your "
+                    "Howl.gg UID. We'll check it against our affiliate stats and "
+                    "grant your role instantly."
+                )
             )
         )
         container.add_item(
@@ -506,6 +529,10 @@ class HowlPanelView(LayoutView):
         row = ActionRow()
         row.add_item(verify_btn)
         container.add_item(row)
+
+        footer = resolve_footer(cfg)
+        if footer:
+            container.add_item(TextDisplay(footer))
 
         self.add_item(container)
 
@@ -600,7 +627,10 @@ class HowlPanel:
 
     async def create_panel(self, channel: discord.TextChannel):
         try:
-            has_logo = os.path.isfile(_LOGO_PATH)
+            embed_cfg = load_panel_embed_config(self.engine, channel.guild.id, HOWL_EMBED_CONFIG_KEY)
+            banner_url = resolve_banner_url(embed_cfg)
+            # A dashboard banner URL renders directly, so the bundled logo is not attached.
+            has_logo = (not banner_url) and os.path.isfile(_LOGO_PATH)
             campaign_code = self._campaign_code(channel.guild.id)
             view = HowlPanelView(
                 self.bot,
@@ -609,8 +639,9 @@ class HowlPanel:
                 howl_emoji=self.howl_emoji,
                 show_logo=has_logo,
                 campaign_code=campaign_code,
+                embed_cfg=embed_cfg,
             )
-            if not has_logo:
+            if not has_logo and not banner_url:
                 logger.warning(f"[Howl] {_LOGO_PATH} not found — posting panel without the logotype banner.")
 
             try:
@@ -628,12 +659,31 @@ class HowlPanel:
                         howl_emoji=self.howl_emoji,
                         show_logo=False,
                         campaign_code=campaign_code,
+                        embed_cfg=embed_cfg,
                     )
                     message = await channel.send(
                         **_build_panel_message_kwargs(view_no_logo, has_logo=False, for_send=True)
                     )
                 else:
                     raise e
+            except discord.HTTPException as e:
+                if not banner_url:
+                    raise
+                # An unreachable/invalid banner URL makes Discord reject the message.
+                logger.warning(f"[Howl] Banner URL rejected ({e}); re-posting with the bundled logo.")
+                has_logo = os.path.isfile(_LOGO_PATH)
+                view_no_banner = HowlPanelView(
+                    self.bot,
+                    self.engine,
+                    self.settings_getter,
+                    howl_emoji=self.howl_emoji,
+                    show_logo=has_logo,
+                    campaign_code=campaign_code,
+                    embed_cfg={**embed_cfg, "bannerUrl": ""},
+                )
+                message = await channel.send(
+                    **_build_panel_message_kwargs(view_no_banner, has_logo=has_logo, for_send=True)
+                )
 
             self.panel_guild_id = channel.guild.id
             self.panel_channel_id = channel.id
@@ -660,7 +710,8 @@ class HowlPanel:
             return False
 
         try:
-            has_logo = os.path.isfile(_LOGO_PATH)
+            embed_cfg = load_panel_embed_config(self.engine, channel.guild.id, HOWL_EMBED_CONFIG_KEY)
+            has_logo = (not resolve_banner_url(embed_cfg)) and os.path.isfile(_LOGO_PATH)
             view = HowlPanelView(
                 self.bot,
                 self.engine,
@@ -668,7 +719,10 @@ class HowlPanel:
                 howl_emoji=self.howl_emoji,
                 show_logo=has_logo,
                 campaign_code=self._campaign_code(channel.guild.id),
+                embed_cfg=embed_cfg,
             )
+            # clear_attachments drops a previously attached logo when a banner URL
+            # took over; otherwise it would linger below the container.
             await message.edit(**_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo))
             logger.info(f"[Howl] Refreshed panel in place for guild {self.guild_id}")
             return True
@@ -715,7 +769,8 @@ async def setup_howl_panel_system(bot, engine, settings_getter):
                         if await panel.create_panel(channel):
                             logger.info(f"[Howl] Re-posted missing panel for guild {guild_id}")
                         continue
-                    has_logo = os.path.isfile(_LOGO_PATH)
+                    embed_cfg = load_panel_embed_config(engine, guild_id, HOWL_EMBED_CONFIG_KEY)
+                    has_logo = (not resolve_banner_url(embed_cfg)) and os.path.isfile(_LOGO_PATH)
                     view = HowlPanelView(
                         bot,
                         engine,
@@ -723,6 +778,7 @@ async def setup_howl_panel_system(bot, engine, settings_getter):
                         howl_emoji=howl_emoji,
                         show_logo=has_logo,
                         campaign_code=panel._campaign_code(guild_id),
+                        embed_cfg=embed_cfg,
                     )
                     await message.edit(
                         **_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo)

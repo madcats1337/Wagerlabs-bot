@@ -24,6 +24,16 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy import text
 
+from features.linking.panel_embed_config import (
+    LINK_EMBED_CONFIG_KEY,
+    load_panel_embed_config,
+    resolve_accent,
+    resolve_banner_url,
+    resolve_description,
+    resolve_footer,
+    resolve_title,
+)
+
 try:
     from discord import MediaGalleryItem
 except Exception:  # pragma: no cover - compatibility with older discord.py versions
@@ -158,6 +168,7 @@ class CombinedLinkPanelView(LayoutView):
         twitch_emoji=None,
         platforms=None,
         show_logo=True,
+        embed_cfg=None,
     ):
         super().__init__(timeout=None)  # Persistent
         self.bot = bot
@@ -168,6 +179,9 @@ class CombinedLinkPanelView(LayoutView):
         self.kick_emoji = kick_emoji or FALLBACK_EMOJI["kick"]
         self.twitch_emoji = twitch_emoji or FALLBACK_EMOJI["twitch"]
 
+        cfg = embed_cfg or {}
+        banner_url = resolve_banner_url(cfg)
+
         # None → global persistent view: both platforms, generic copy.
         show_kick = platforms is None or "kick" in platforms
         show_twitch = platforms is None or "twitch" in platforms
@@ -177,19 +191,25 @@ class CombinedLinkPanelView(LayoutView):
             names = "Kick & Twitch"
         accent = TWITCH_COLOUR if platforms == ["twitch"] else KICK_COLOUR
 
-        container = Container(accent_colour=accent)
-        if show_logo and MediaGalleryItem is not None:
-            container.add_item(MediaGallery(MediaGalleryItem(f"attachment://{_LOGO_FILENAME}")))
-        container.add_item(TextDisplay("## 🔗 Link Your Account"))
+        container = Container(accent_colour=resolve_accent(cfg, accent))
+        if MediaGalleryItem is not None:
+            if banner_url:
+                container.add_item(MediaGallery(MediaGalleryItem(banner_url)))
+            elif show_logo:
+                container.add_item(MediaGallery(MediaGalleryItem(f"attachment://{_LOGO_FILENAME}")))
+        container.add_item(TextDisplay(resolve_title(cfg, "## 🔗 Link Your Account")))
         container.add_item(
             TextDisplay(
-                f"Link your {names} account with Discord to participate in raffles and track your watchtime!\n\n"
-                "**Benefits:**\n"
-                "• Earn raffle tickets from watchtime\n"
-                "• Get bonus tickets from subscriptions\n"
-                "• Participate in raffles and giveaways\n"
-                "• Earn roles based on chat activity\n"
-                "• Track your stats and progress"
+                resolve_description(cfg)
+                or (
+                    f"Link your {names} account with Discord to participate in raffles and track your watchtime!\n\n"
+                    "**Benefits:**\n"
+                    "• Earn raffle tickets from watchtime\n"
+                    "• Get bonus tickets from subscriptions\n"
+                    "• Participate in raffles and giveaways\n"
+                    "• Earn roles based on chat activity\n"
+                    "• Track your stats and progress"
+                )
             )
         )
         if show_kick and show_twitch:
@@ -230,6 +250,10 @@ class CombinedLinkPanelView(LayoutView):
             twitch_btn.callback = self._twitch_callback
             row.add_item(twitch_btn)
         container.add_item(row)
+
+        footer = resolve_footer(cfg)
+        if footer:
+            container.add_item(TextDisplay(footer))
 
         self.add_item(container)
 
@@ -381,11 +405,14 @@ def _build_view_for_guild(
     kick_emoji=None,
     twitch_emoji=None,
     show_logo=True,
+    embed_cfg=None,
 ):
     """Build a view showing only the buttons for the guild's active platforms.
     Used when POSTING the panel (so a kick-only server shows just the Kick button).
     The global persistent view (platforms=None) keeps both custom_ids alive."""
     platforms = _active_platforms(engine, guild_id)
+    if embed_cfg is None:
+        embed_cfg = load_panel_embed_config(engine, guild_id, LINK_EMBED_CONFIG_KEY)
     view = CombinedLinkPanelView(
         bot,
         engine,
@@ -395,6 +422,7 @@ def _build_view_for_guild(
         twitch_emoji=twitch_emoji,
         platforms=platforms,
         show_logo=show_logo,
+        embed_cfg=embed_cfg,
     )
     return view, platforms
 
@@ -466,7 +494,10 @@ class CombinedLinkPanel:
 
     async def create_panel(self, channel: discord.TextChannel):
         try:
-            has_logo = os.path.isfile(_LOGO_PATH)
+            embed_cfg = load_panel_embed_config(self.engine, channel.guild.id, LINK_EMBED_CONFIG_KEY)
+            banner_url = resolve_banner_url(embed_cfg)
+            # A dashboard banner URL renders directly, so the bundled logo is not attached.
+            has_logo = (not banner_url) and os.path.isfile(_LOGO_PATH)
             view, platforms = _build_view_for_guild(
                 self.bot,
                 self.engine,
@@ -476,13 +507,33 @@ class CombinedLinkPanel:
                 kick_emoji=self.kick_emoji,
                 twitch_emoji=self.twitch_emoji,
                 show_logo=has_logo,
+                embed_cfg=embed_cfg,
             )
             names = " & ".join(p.capitalize() for p in platforms)
             # Components V2: the panel is a LayoutView (no embed — a V2 message
             # can't carry one). All copy lives inside the view's TextDisplays.
-            if not has_logo:
+            if not has_logo and not banner_url:
                 logger.warning(f"[CombinedLink] {_LOGO_PATH} not found — posting panel without the logotype banner.")
-            message = await channel.send(**_build_panel_message_kwargs(view, has_logo=has_logo, for_send=True))
+            try:
+                message = await channel.send(**_build_panel_message_kwargs(view, has_logo=has_logo, for_send=True))
+            except discord.HTTPException as e:
+                if not banner_url:
+                    raise
+                # An unreachable/invalid banner URL makes Discord reject the message.
+                logger.warning(f"[CombinedLink] Banner URL rejected ({e}); re-posting with the bundled logo.")
+                has_logo = os.path.isfile(_LOGO_PATH)
+                view, platforms = _build_view_for_guild(
+                    self.bot,
+                    self.engine,
+                    self.kick_url_generator,
+                    self.twitch_url_generator,
+                    channel.guild.id,
+                    kick_emoji=self.kick_emoji,
+                    twitch_emoji=self.twitch_emoji,
+                    show_logo=has_logo,
+                    embed_cfg={**embed_cfg, "bannerUrl": ""},
+                )
+                message = await channel.send(**_build_panel_message_kwargs(view, has_logo=has_logo, for_send=True))
             self.panel_guild_id = channel.guild.id
             self.panel_channel_id = channel.id
             self.panel_message_id = message.id
@@ -514,7 +565,8 @@ class CombinedLinkPanel:
             return False
 
         try:
-            has_logo = os.path.isfile(_LOGO_PATH)
+            embed_cfg = load_panel_embed_config(self.engine, channel.guild.id, LINK_EMBED_CONFIG_KEY)
+            has_logo = (not resolve_banner_url(embed_cfg)) and os.path.isfile(_LOGO_PATH)
             view, _platforms = _build_view_for_guild(
                 self.bot,
                 self.engine,
@@ -524,7 +576,10 @@ class CombinedLinkPanel:
                 kick_emoji=self.kick_emoji,
                 twitch_emoji=self.twitch_emoji,
                 show_logo=has_logo,
+                embed_cfg=embed_cfg,
             )
+            # clear_attachments drops a previously attached logo when a banner URL
+            # took over; otherwise it would linger below the container.
             await message.edit(**_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo))
             logger.info(f"[CombinedLink] Refreshed panel in place for guild {self.guild_id}")
             return True
@@ -602,7 +657,8 @@ async def setup_combined_link_panel_system(bot, engine, kick_url_generator, twit
                         if await panel.create_panel(channel):
                             logger.info(f"[CombinedLink] Re-posted missing panel for guild {guild_id}")
                         continue
-                    has_logo = os.path.isfile(_LOGO_PATH)
+                    embed_cfg = load_panel_embed_config(engine, guild_id, LINK_EMBED_CONFIG_KEY)
+                    has_logo = (not resolve_banner_url(embed_cfg)) and os.path.isfile(_LOGO_PATH)
                     view, _ = _build_view_for_guild(
                         bot,
                         engine,
@@ -612,6 +668,7 @@ async def setup_combined_link_panel_system(bot, engine, kick_url_generator, twit
                         kick_emoji=kick_emoji,
                         twitch_emoji=twitch_emoji,
                         show_logo=has_logo,
+                        embed_cfg=embed_cfg,
                     )
                     await message.edit(
                         **_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo)
