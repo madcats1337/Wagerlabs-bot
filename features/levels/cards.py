@@ -1415,12 +1415,20 @@ class BannerTheme:
         show_title_key = f"levels_banner_{kind}_show_title"
         show_subtitle_key = f"levels_banner_{kind}_show_subtitle"
 
-        custom_image = getattr(settings, image_key, None)
+        # These three are per-KIND keys, so BotSettingsManager has no @property
+        # for them and attribute access silently returned the getattr default --
+        # the dashboard's saved banner image and toggles never reached the render.
+        # get() does a real key lookup; "" (unset) normalises back to None.
+        getter = getattr(settings, "get", None)
+        if not callable(getter):
+            return cls(font=font, title_color=title_color, background=background)
+
+        custom_image = getter(image_key) or None
         if custom_image and base_url and custom_image.startswith("/static/"):
             custom_image = f"{base_url.rstrip('/')}{custom_image}"
 
-        show_title_val = getattr(settings, show_title_key, None)
-        show_subtitle_val = getattr(settings, show_subtitle_key, None)
+        show_title_val = getter(show_title_key) or None
+        show_subtitle_val = getter(show_subtitle_key) or None
 
         return cls(
             font=font,
