@@ -1921,6 +1921,26 @@ class RedisSubscriber:
         # announcement and earlier releases must stay in the channel — so we never
         # delete the previous patch-notes message, we just track the newest one.
         FEED_PANEL_TYPES = ("patchnotes", "patchnotes_extension")
+
+        # Same channel as the panel already lives in? Then this is a refresh, not
+        # a move: edit the existing message in place. Deleting + re-posting an
+        # unchanged panel pushes it to the bottom of the channel and reads as
+        # spam. Falls through to the post path when there is nothing to edit
+        # (no stored message, or it was deleted in Discord).
+        old_channel_id = getattr(panel, "panel_channel_id", None)
+        if (
+            panel_type not in FEED_PANEL_TYPES
+            and old_channel_id
+            and int(old_channel_id) == channel_id
+            and hasattr(panel, "refresh_panel")
+        ):
+            try:
+                if await panel.refresh_panel(new_channel):
+                    logger.info(f"✅ Refreshed {panel_type} panel in place (channel {channel_id}, guild {guild_id})")
+                    return
+            except Exception as e:
+                logger.warning(f"⚠️ In-place refresh of {panel_type} panel failed, re-posting instead: {e}")
+
         if panel_type not in FEED_PANEL_TYPES:
             # If the panel already exists somewhere, delete the old message (move semantics)
             old_channel_id = getattr(panel, "panel_channel_id", None)

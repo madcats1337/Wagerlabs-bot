@@ -646,6 +646,36 @@ class HowlPanel:
             logger.error(f"Failed to create Howl panel: {e}")
             return False
 
+    async def refresh_panel(self, channel: discord.TextChannel):
+        """Re-render the standing panel message in place (see CombinedLinkPanel)."""
+        if not self.panel_message_id or not self.panel_channel_id:
+            return False
+        try:
+            message = await channel.fetch_message(int(self.panel_message_id))
+        except discord.NotFound:
+            logger.info(f"[Howl] Stored panel message for guild {self.guild_id} is gone; will re-post.")
+            return False
+        except Exception as e:
+            logger.warning(f"[Howl] Could not fetch panel message for guild {self.guild_id}: {e}")
+            return False
+
+        try:
+            has_logo = os.path.isfile(_LOGO_PATH)
+            view = HowlPanelView(
+                self.bot,
+                self.engine,
+                self.settings_getter,
+                howl_emoji=self.howl_emoji,
+                show_logo=has_logo,
+                campaign_code=self._campaign_code(channel.guild.id),
+            )
+            await message.edit(**_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo))
+            logger.info(f"[Howl] Refreshed panel in place for guild {self.guild_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"[Howl] Failed to edit panel for guild {self.guild_id}: {e}")
+            return False
+
 
 async def setup_howl_panel_system(bot, engine, settings_getter):
     panels = {}

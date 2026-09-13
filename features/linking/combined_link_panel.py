@@ -493,6 +493,45 @@ class CombinedLinkPanel:
             logger.error(f"[CombinedLink] Failed to create panel: {e}")
             return False
 
+    async def refresh_panel(self, channel: discord.TextChannel):
+        """Re-render the standing panel message in place.
+
+        Returns True if the existing message was edited. Returns False when
+        there is nothing to edit (no stored message, or it is gone) so the
+        caller can fall back to posting a fresh panel. Editing keeps the panel
+        where it is instead of deleting + re-posting, which spammed the channel
+        on every dashboard save.
+        """
+        if not self.panel_message_id or not self.panel_channel_id:
+            return False
+        try:
+            message = await channel.fetch_message(int(self.panel_message_id))
+        except discord.NotFound:
+            logger.info(f"[CombinedLink] Stored panel message for guild {self.guild_id} is gone; will re-post.")
+            return False
+        except Exception as e:
+            logger.warning(f"[CombinedLink] Could not fetch panel message for guild {self.guild_id}: {e}")
+            return False
+
+        try:
+            has_logo = os.path.isfile(_LOGO_PATH)
+            view, _platforms = _build_view_for_guild(
+                self.bot,
+                self.engine,
+                self.kick_url_generator,
+                self.twitch_url_generator,
+                channel.guild.id,
+                kick_emoji=self.kick_emoji,
+                twitch_emoji=self.twitch_emoji,
+                show_logo=has_logo,
+            )
+            await message.edit(**_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo))
+            logger.info(f"[CombinedLink] Refreshed panel in place for guild {self.guild_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"[CombinedLink] Failed to edit panel for guild {self.guild_id}: {e}")
+            return False
+
 
 async def setup_combined_link_panel_system(bot, engine, kick_url_generator, twitch_url_generator):
     """Set up the combined link panel: per-guild instances, a global persistent

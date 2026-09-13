@@ -621,6 +621,35 @@ class ShufflePanel:
             logger.error(f"Failed to create Shuffle panel: {e}")
             return False
 
+    async def refresh_panel(self, channel: discord.TextChannel):
+        """Re-render the standing panel message in place (see CombinedLinkPanel)."""
+        if not self.panel_message_id or not self.panel_channel_id:
+            return False
+        try:
+            message = await channel.fetch_message(int(self.panel_message_id))
+        except discord.NotFound:
+            logger.info(f"[Shuffle] Stored panel message for guild {self.guild_id} is gone; will re-post.")
+            return False
+        except Exception as e:
+            logger.warning(f"[Shuffle] Could not fetch panel message for guild {self.guild_id}: {e}")
+            return False
+
+        try:
+            has_logo = os.path.isfile(_LOGO_PATH)
+            view = ShufflePanelView(
+                self.bot,
+                self.engine,
+                self.settings_getter,
+                shuffle_emoji=self.shuffle_emoji,
+                show_logo=has_logo,
+            )
+            await message.edit(**_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo))
+            logger.info(f"[Shuffle] Refreshed panel in place for guild {self.guild_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"[Shuffle] Failed to edit panel for guild {self.guild_id}: {e}")
+            return False
+
 
 async def setup_shuffle_panel_system(bot, engine, settings_getter):
     """Set up the Shuffle verify panel system with per-guild instances."""
