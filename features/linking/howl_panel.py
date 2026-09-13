@@ -463,16 +463,25 @@ class HowlVerifyModal(Modal, title="Verify Your Howl Account"):
 
 class HowlPanelView(LayoutView):
     def __init__(
-        self, bot, engine, settings_getter, howl_emoji=None, show_logo=True, campaign_code=None, embed_cfg=None
+        self,
+        bot,
+        engine,
+        settings_getter,
+        howl_emoji=None,
+        show_logo=True,
+        campaign_code=None,
+        embed_cfg=None,
+        guild_id=None,
     ):
         super().__init__(timeout=None)
         self.bot = bot
         self.engine = engine
         self.settings_getter = settings_getter
         self.howl_emoji = howl_emoji or FALLBACK_EMOJI
+        self.guild_id = guild_id
 
         cfg = embed_cfg or {}
-        banner_url = resolve_banner_url(cfg)
+        banner_url = resolve_banner_url(cfg, engine=engine, guild_id=guild_id)
 
         # howl_campaign_code may hold several comma-separated codes (they all
         # count for wager tracking). The panel names the FIRST one — it's the
@@ -497,10 +506,12 @@ class HowlPanelView(LayoutView):
             elif show_logo:
                 container.add_item(MediaGallery(MediaGalleryItem(f"attachment://{_LOGO_FILENAME}")))
         container.add_item(TextDisplay(resolve_title(cfg, "## Verify Your Howl Account")))
-        container.add_item(
-            TextDisplay(
-                resolve_description(cfg)
-                or (
+        custom_desc = resolve_description(cfg)
+        if custom_desc:
+            container.add_item(TextDisplay(custom_desc))
+        else:
+            container.add_item(
+                TextDisplay(
                     f"{signup_line}\n\n"
                     "**How to Verify:**\n"
                     "Click the **'Verify Howl Account'** button below and enter your "
@@ -508,15 +519,14 @@ class HowlPanelView(LayoutView):
                     "grant your role instantly."
                 )
             )
-        )
-        container.add_item(
-            TextDisplay(
-                "**📋 Before you start**\n"
-                f"{bullet_line}\n"
-                "• Enter your **exact** Howl UID (found in your account settings)\n"
-                "• One Howl account per Discord user"
+            container.add_item(
+                TextDisplay(
+                    "**📋 Before you start**\n"
+                    f"{bullet_line}\n"
+                    "• Enter your **exact** Howl UID (found in your account settings)\n"
+                    "• One Howl account per Discord user"
+                )
             )
-        )
         container.add_item(Separator())
 
         verify_btn = Button(
@@ -640,6 +650,7 @@ class HowlPanel:
                 show_logo=has_logo,
                 campaign_code=campaign_code,
                 embed_cfg=embed_cfg,
+                guild_id=channel.guild.id,
             )
             if not has_logo and not banner_url:
                 logger.warning(f"[Howl] {_LOGO_PATH} not found — posting panel without the logotype banner.")
@@ -660,6 +671,7 @@ class HowlPanel:
                         show_logo=False,
                         campaign_code=campaign_code,
                         embed_cfg=embed_cfg,
+                        guild_id=channel.guild.id,
                     )
                     message = await channel.send(
                         **_build_panel_message_kwargs(view_no_logo, has_logo=False, for_send=True)
@@ -680,6 +692,7 @@ class HowlPanel:
                     show_logo=has_logo,
                     campaign_code=campaign_code,
                     embed_cfg={**embed_cfg, "bannerUrl": ""},
+                    guild_id=channel.guild.id,
                 )
                 message = await channel.send(
                     **_build_panel_message_kwargs(view_no_banner, has_logo=has_logo, for_send=True)
@@ -720,6 +733,7 @@ class HowlPanel:
                 show_logo=has_logo,
                 campaign_code=self._campaign_code(channel.guild.id),
                 embed_cfg=embed_cfg,
+                guild_id=channel.guild.id,
             )
             # clear_attachments drops a previously attached logo when a banner URL
             # took over; otherwise it would linger below the container.
@@ -779,6 +793,7 @@ async def setup_howl_panel_system(bot, engine, settings_getter):
                         show_logo=has_logo,
                         campaign_code=panel._campaign_code(guild_id),
                         embed_cfg=embed_cfg,
+                        guild_id=guild_id,
                     )
                     await message.edit(
                         **_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo)

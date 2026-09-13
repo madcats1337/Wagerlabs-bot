@@ -169,18 +169,20 @@ class CombinedLinkPanelView(LayoutView):
         platforms=None,
         show_logo=True,
         embed_cfg=None,
+        guild_id=None,
     ):
         super().__init__(timeout=None)  # Persistent
         self.bot = bot
         self.engine = engine
         self.kick_url_generator = kick_url_generator
         self.twitch_url_generator = twitch_url_generator
+        self.guild_id = guild_id
         # Brand-logo application emojis (or None → unicode fallback).
         self.kick_emoji = kick_emoji or FALLBACK_EMOJI["kick"]
         self.twitch_emoji = twitch_emoji or FALLBACK_EMOJI["twitch"]
 
         cfg = embed_cfg or {}
-        banner_url = resolve_banner_url(cfg)
+        banner_url = resolve_banner_url(cfg, engine=engine, guild_id=guild_id)
 
         # None → global persistent view: both platforms, generic copy.
         show_kick = platforms is None or "kick" in platforms
@@ -198,10 +200,12 @@ class CombinedLinkPanelView(LayoutView):
             elif show_logo:
                 container.add_item(MediaGallery(MediaGalleryItem(f"attachment://{_LOGO_FILENAME}")))
         container.add_item(TextDisplay(resolve_title(cfg, "## 🔗 Link Your Account")))
-        container.add_item(
-            TextDisplay(
-                resolve_description(cfg)
-                or (
+        custom_desc = resolve_description(cfg)
+        if custom_desc:
+            container.add_item(TextDisplay(custom_desc))
+        else:
+            container.add_item(
+                TextDisplay(
                     f"Link your {names} account with Discord to participate in raffles and track your watchtime!\n\n"
                     "**Benefits:**\n"
                     "• Earn raffle tickets from watchtime\n"
@@ -211,21 +215,20 @@ class CombinedLinkPanelView(LayoutView):
                     "• Track your stats and progress"
                 )
             )
-        )
-        if show_kick and show_twitch:
-            how_to = "**How to Link**\nUse the buttons below — you can link **both** platforms."
-        else:
-            only = "Twitch" if show_twitch and not show_kick else "Kick"
-            how_to = f"**How to Link**\nClick the **'Link {only}'** button below to get started!"
-        container.add_item(TextDisplay(how_to))
-        container.add_item(
-            TextDisplay(
-                "**🔒 Privacy & Security**\n"
-                "• OAuth links are unique and expire after 10 minutes\n"
-                "• Links are sent privately, only you can see them\n"
-                "• Your password is never shared with this bot"
+            if show_kick and show_twitch:
+                how_to = "**How to Link**\nUse the buttons below — you can link **both** platforms."
+            else:
+                only = "Twitch" if show_twitch and not show_kick else "Kick"
+                how_to = f"**How to Link**\nClick the **'Link {only}'** button below to get started!"
+            container.add_item(TextDisplay(how_to))
+            container.add_item(
+                TextDisplay(
+                    "**🔒 Privacy & Security**\n"
+                    "• OAuth links are unique and expire after 10 minutes\n"
+                    "• Links are sent privately, only you can see them\n"
+                    "• Your password is never shared with this bot"
+                )
             )
-        )
         container.add_item(Separator())
 
         # Buttons live in an ActionRow inside the container. Built imperatively
@@ -423,6 +426,7 @@ def _build_view_for_guild(
         platforms=platforms,
         show_logo=show_logo,
         embed_cfg=embed_cfg,
+        guild_id=guild_id,
     )
     return view, platforms
 

@@ -475,15 +475,16 @@ class ShufflePanelView(LayoutView):
     "Verify Shuffle Account" button (stable custom_id, so the message re-binds
     its handler after a restart) opens the verification modal."""
 
-    def __init__(self, bot, engine, settings_getter, shuffle_emoji=None, show_logo=True, embed_cfg=None):
+    def __init__(self, bot, engine, settings_getter, shuffle_emoji=None, show_logo=True, embed_cfg=None, guild_id=None):
         super().__init__(timeout=None)
         self.bot = bot
         self.engine = engine
         self.settings_getter = settings_getter
         self.shuffle_emoji = shuffle_emoji or FALLBACK_EMOJI
+        self.guild_id = guild_id
 
         cfg = embed_cfg or {}
-        banner_url = resolve_banner_url(cfg)
+        banner_url = resolve_banner_url(cfg, engine=engine, guild_id=guild_id)
 
         container = Container(accent_colour=resolve_accent(cfg, ACCENT_COLOR))
         # Shuffle logotype banner at the very top. Normally shown from the message's
@@ -496,10 +497,12 @@ class ShufflePanelView(LayoutView):
             elif show_logo:
                 container.add_item(MediaGallery(MediaGalleryItem(f"attachment://{_LOGO_FILENAME}")))
         container.add_item(TextDisplay(resolve_title(cfg, "## Verify Your Shuffle Account")))
-        container.add_item(
-            TextDisplay(
-                resolve_description(cfg)
-                or (
+        custom_desc = resolve_description(cfg)
+        if custom_desc:
+            container.add_item(TextDisplay(custom_desc))
+        else:
+            container.add_item(
+                TextDisplay(
                     "Verify that you're one of our Shuffle affiliates to unlock your reward role!\n\n"
                     "**How to Verify:**\n"
                     "Click the **'Verify Shuffle Account'** button below and enter your "
@@ -507,15 +510,14 @@ class ShufflePanelView(LayoutView):
                     "grant your role instantly."
                 )
             )
-        )
-        container.add_item(
-            TextDisplay(
-                "**📋 Before you start**\n"
-                "• Make sure you signed up on Shuffle using our affiliate code\n"
-                "• Enter your **exact** Shuffle username\n"
-                "• One Shuffle account per Discord user"
+            container.add_item(
+                TextDisplay(
+                    "**📋 Before you start**\n"
+                    "• Make sure you signed up on Shuffle using our affiliate code\n"
+                    "• Enter your **exact** Shuffle username\n"
+                    "• One Shuffle account per Discord user"
+                )
             )
-        )
         container.add_item(Separator())
 
         verify_btn = Button(
@@ -637,6 +639,7 @@ class ShufflePanel:
                 shuffle_emoji=self.shuffle_emoji,
                 show_logo=has_logo,
                 embed_cfg=embed_cfg,
+                guild_id=channel.guild.id,
             )
             if not has_logo and not banner_url:
                 logger.warning(f"[Shuffle] {_LOGO_PATH} not found — posting panel without the logotype banner.")
@@ -655,6 +658,7 @@ class ShufflePanel:
                     shuffle_emoji=self.shuffle_emoji,
                     show_logo=has_logo,
                     embed_cfg={**embed_cfg, "bannerUrl": ""},
+                    guild_id=channel.guild.id,
                 )
                 message = await channel.send(**_build_panel_message_kwargs(view, has_logo=has_logo, for_send=True))
 
@@ -693,6 +697,7 @@ class ShufflePanel:
                 shuffle_emoji=self.shuffle_emoji,
                 show_logo=has_logo,
                 embed_cfg=embed_cfg,
+                guild_id=channel.guild.id,
             )
             # clear_attachments drops a previously attached logo when a banner URL
             # took over; otherwise it would linger below the container.
@@ -760,6 +765,7 @@ async def setup_shuffle_panel_system(bot, engine, settings_getter):
                         shuffle_emoji=shuffle_emoji,
                         show_logo=has_logo,
                         embed_cfg=embed_cfg,
+                        guild_id=guild_id,
                     )
                     await message.edit(
                         **_build_panel_message_kwargs(view, has_logo=has_logo, clear_attachments=not has_logo)

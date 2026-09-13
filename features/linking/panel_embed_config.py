@@ -51,16 +51,32 @@ def resolve_accent(cfg, default: int) -> int:
         return default
 
 
-def resolve_banner_url(cfg) -> str:
+def resolve_banner_url(cfg, engine=None, guild_id=None) -> str:
     """The configured banner URL, or '' to use the panel's bundled logo file."""
-    return (str((cfg or {}).get("bannerUrl") or "")).strip()
+    raw = (str((cfg or {}).get("bannerUrl") or "")).strip()
+    if not raw or "/branding/" in raw:
+        return ""
+    if raw.startswith("/") and engine is not None and guild_id is not None:
+        try:
+            from utils.server_urls import get_server_base_url
+
+            base = get_server_base_url(engine, guild_id)
+            if base:
+                return f"{base}{raw}"
+        except Exception:
+            pass
+    return raw
 
 
 def resolve_title(cfg, default_heading: str) -> str:
     """Panel heading. Configured titles are stored without markdown, so wrap them
     to match the hardcoded '## ' headings."""
     title = (str((cfg or {}).get("title") or "")).strip()
-    return f"## {title}" if title else default_heading
+    if not title:
+        return default_heading
+    if title.startswith("#"):
+        return title
+    return f"## {title}"
 
 
 def resolve_footer(cfg) -> str:
