@@ -533,11 +533,19 @@ async def _render_banner_for(bot, engine, guild_id, prefix):
     """
     from .cards import BannerTheme
 
+    kind = "competition" if prefix == COMPETITION_PAGE_ID else "community"
     getter = getattr(bot, "get_guild_settings", None)
     theme = BannerTheme()
     if callable(getter):
         try:
-            theme = BannerTheme.from_settings(getter(guild_id))
+            base_url = None
+            try:
+                from utils.server_urls import get_server_base_url
+
+                base_url = get_server_base_url(engine, guild_id)
+            except Exception:
+                pass
+            theme = BannerTheme.from_settings(getter(guild_id), kind=kind, base_url=base_url)
         except Exception:
             pass
 

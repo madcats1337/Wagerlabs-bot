@@ -1281,6 +1281,69 @@ def _banner_background(size, background):
     return _multi_gradient(size, parsed_stops, angle)
 
 
+def _cover_fit(img: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+    """Resize and center-crop `img` to completely fill `target_size` without distortion."""
+    tw, th = target_size
+    iw, ih = img.size
+    if iw <= 0 or ih <= 0:
+        return img
+    scale = max(tw / iw, th / ih)
+    nw, nh = max(1, int(round(iw * scale))), max(1, int(round(ih * scale)))
+    resized = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    left = max(0, (nw - tw) // 2)
+    top = max(0, (nh - th) // 2)
+    return resized.crop((left, top, left + tw, top + th))
+
+
+def _load_custom_background(custom_image: str, target_size: tuple[int, int]) -> Image.Image | None:
+    """Load and cover-fit a custom banner image from a data URI, local path, or URL."""
+    if not custom_image or not isinstance(custom_image, str):
+        return None
+    try:
+        if custom_image.startswith("data:image/"):
+            import base64
+
+            data = custom_image.split(",", 1)[1]
+            raw_bytes = base64.b64decode(data)
+            with Image.open(io.BytesIO(raw_bytes)) as img:
+                return _cover_fit(img.convert("RGBA"), target_size)
+
+        local_candidates = []
+        if os.path.isabs(custom_image) and os.path.exists(custom_image):
+            local_candidates.append(custom_image)
+        elif custom_image.startswith("/"):
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            candidate = os.path.join(base_dir, custom_image.lstrip("/"))
+            if os.path.exists(candidate):
+                local_candidates.append(candidate)
+            parent_candidate = os.path.join(os.path.dirname(base_dir), "Admin-Dashboard", custom_image.lstrip("/"))
+            if os.path.exists(parent_candidate):
+                local_candidates.append(parent_candidate)
+
+        for path in local_candidates:
+            try:
+                with Image.open(path) as img:
+                    return _cover_fit(img.convert("RGBA"), target_size)
+            except Exception as e:
+                logger.warning(f"Failed to open local banner image {path}: {e}")
+
+        if custom_image.startswith(("http://", "https://")):
+            import urllib.request
+
+            req = urllib.request.Request(
+                custom_image,
+                headers={"User-Agent": "Wagerlabs-Banner-Fetcher/1.0"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310
+                if resp.status == 200:
+                    raw_bytes = resp.read()
+                    with Image.open(io.BytesIO(raw_bytes)) as img:
+                        return _cover_fit(img.convert("RGBA"), target_size)
+    except Exception as e:
+        logger.warning(f"Error loading custom banner background {custom_image!r}: {e}")
+    return None
+
+
 class BannerTheme:
     """Dashboard-controlled banner appearance.
 
@@ -1288,22 +1351,60 @@ class BannerTheme:
     exactly what it rendered before theming existed.
     """
 
-    __slots__ = ("font", "title_color", "background")
+    __slots__ = ("font", "title_color", "background", "custom_image", "show_title", "show_subtitle")
 
-    def __init__(self, font=None, title_color=None, background=None):
+    def __init__(
+        self,
+        font=None,
+        title_color=None,
+        background=None,
+        custom_image=None,
+        show_title=True,
+        show_subtitle=True,
+    ):
         self.font = font or DEFAULT_BANNER_FONT
         self.title_color = title_color
         self.background = background
+        self.custom_image = custom_image
+        self.show_title = (
+            True
+            if show_title is None
+            else (show_title if isinstance(show_title, bool) else str(show_title).lower() in ("true", "1"))
+        )
+        self.show_subtitle = (
+            True
+            if show_subtitle is None
+            else (show_subtitle if isinstance(show_subtitle, bool) else str(show_subtitle).lower() in ("true", "1"))
+        )
 
     @classmethod
-    def from_settings(cls, settings):
+    def from_settings(cls, settings, kind: str = "community", base_url: str = None):
         """Read the theme off a BotSettingsManager, tolerating a missing one."""
         if settings is None:
             return cls()
+
+        font = getattr(settings, "levels_banner_font", None)
+        title_color = getattr(settings, "levels_banner_title_color", None)
+        background = getattr(settings, "levels_banner_background", None)
+
+        image_key = f"levels_banner_{kind}_image"
+        show_title_key = f"levels_banner_{kind}_show_title"
+        show_subtitle_key = f"levels_banner_{kind}_show_subtitle"
+
+        custom_image = getattr(settings, image_key, None)
+        if custom_image and base_url and custom_image.startswith("/static/"):
+            custom_image = f"{base_url.rstrip('/')}{custom_image}"
+
+        show_title_val = getattr(settings, show_title_key, None)
+        show_subtitle_val = getattr(settings, show_subtitle_key, None)
+
         return cls(
-            font=getattr(settings, "levels_banner_font", None),
-            title_color=getattr(settings, "levels_banner_title_color", None),
-            background=getattr(settings, "levels_banner_background", None),
+            font=font,
+            title_color=title_color,
+            background=background,
+            custom_image=custom_image,
+            show_title=show_title_val,
+            show_subtitle=show_subtitle_val,
         )
 
     @property
@@ -1413,24 +1514,26 @@ def render_banner_png(title: str, subtitle: str, stats, theme=None) -> bytes:
     # _bs() is for the 820-canvas design units used inside.
     W, H = BANNER_W * BANNER_SCALE, BANNER_H * BANNER_SCALE
 
+    custom_bg = _load_custom_background(theme.custom_image, (W, H)) if theme.custom_image else None
+    bg_image = custom_bg if custom_bg is not None else _banner_background((W, H), theme.background)
+
     # pad=0: the banner is the top element of a Components V2 container, which
     # fits an image edge-to-edge. The usual transparent shadow margin would
     # render as ~16px of dead space on each side and push the banner visibly out
     # of line with the text rows beneath it.
-    canvas, draw, ox, oy, light = _new_card(
-        W, H, background=_banner_background((W, H), theme.background), pad=0, radius=0, shadow=False
-    )
+    canvas, draw, ox, oy, light = _new_card(W, H, background=bg_image, pad=0, radius=0, shadow=False)
 
     title_font = _load_banner_font(theme.font, 40, bold=True)
     subtitle_font = _load_banner_font(theme.font, 21)
 
-    draw.text(
-        (ox + _bs(30), oy + _bs(26)),
-        _truncate(draw, title, title_font, W - _bs(60)),
-        fill=theme.accent,
-        font=title_font,
-    )
-    if subtitle:
+    if theme.show_title and title:
+        draw.text(
+            (ox + _bs(30), oy + _bs(26)),
+            _truncate(draw, title, title_font, W - _bs(60)),
+            fill=theme.accent,
+            font=title_font,
+        )
+    if theme.show_subtitle and subtitle:
         draw.text(
             (ox + _bs(30), oy + _bs(76)),
             _truncate(draw, subtitle, subtitle_font, W - _bs(60)),

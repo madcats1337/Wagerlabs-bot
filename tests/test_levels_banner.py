@@ -130,12 +130,12 @@ def test_chip_text_stays_inside_the_chip(font_key):
 @pytest.mark.parametrize(
     "value,expected",
     [
-        ("#fff", (255, 255, 255)),
-        ("#facc15", (250, 204, 21)),
-        ("#facc15ff", (250, 204, 21)),  # alpha parsed then dropped
-        ("rgb(34, 211, 238)", (34, 211, 238)),
-        ("rgba(34, 211, 238, 0.5)", (34, 211, 238)),
-        ("  #A855F7  ", (168, 85, 247)),
+        ("#fff", (255, 255, 255, 255)),
+        ("#facc15", (250, 204, 21, 255)),
+        ("#facc15ff", (250, 204, 21, 255)),
+        ("rgb(34, 211, 238)", (34, 211, 238, 255)),
+        ("rgba(34, 211, 238, 0.5)", (34, 211, 238, 128)),
+        ("  #A855F7  ", (168, 85, 247, 255)),
     ],
 )
 def test_parse_color_accepts_picker_output(value, expected):
@@ -151,14 +151,14 @@ def test_parse_color_falls_back_on_junk(value):
 def test_parse_gradient_reads_stops_and_angle():
     kind, stops, angle = cards._parse_gradient("linear-gradient(90deg, #082f49 0%, #075985 100%)")
     assert kind == "linear"
-    assert stops == ["#082f49", "#075985"]
+    assert stops == [("#082f49", 0.0), ("#075985", 1.0)]
     assert angle == 90
 
 
 def test_parse_gradient_treats_a_bare_colour_as_solid():
     kind, stops, _ = cards._parse_gradient("#1c1917")
     assert kind == "solid"
-    assert stops == ["#1c1917"]
+    assert stops == [("#1c1917", 0.0)]
 
 
 def test_malformed_theme_still_renders():
@@ -224,7 +224,7 @@ def test_banner_keeps_its_proportions():
 
 def test_unset_theme_uses_the_stock_accent():
     assert cards.BannerTheme().accent == cards.ACCENT
-    assert cards.BannerTheme(title_color="#a855f7").accent == (168, 85, 247)
+    assert cards.BannerTheme(title_color="#a855f7").accent == (168, 85, 247, 255)
 
 
 # ── Dashboard preview parity ────────────────────────────────────────────────
@@ -254,6 +254,28 @@ def test_unset_theme_uses_the_stock_accent():
         ),
         ("Monthly Competition", "Solid", [("#1 Prize", "$250.00")], {"font": "orbitron", "background": "#1c1917"}),
         ("Community Leaderboard", "Serif", COMMUNITY_STATS, {"font": "playfair"}),
+        (
+            "Community Leaderboard",
+            "Hidden Title",
+            COMMUNITY_STATS,
+            {"show_title": False, "show_subtitle": True},
+        ),
+        (
+            "Weekly Competition",
+            "Hidden Subtitle",
+            COMPETITION_STATS,
+            {"show_title": True, "show_subtitle": False},
+        ),
+        (
+            "Weekly Competition",
+            "Custom Image",
+            COMPETITION_STATS,
+            {
+                "custom_image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR42mNk+M9QzwAEjAw/AQBLAgUA5o8+2AAAAABJRU5ErkJggg==",
+                "show_title": False,
+                "show_subtitle": False,
+            },
+        ),
     ],
 )
 def test_dashboard_preview_matches_this_renderer(title, subtitle, stats, theme_kwargs):
@@ -275,3 +297,15 @@ def test_dashboard_preview_matches_this_renderer(title, subtitle, stats, theme_k
         f"dashboard preview diverged from the bot (max channel delta {delta}). "
         "Regenerate Admin-Dashboard/utils/levels_banner_render.py from features/levels/cards.py."
     )
+
+
+def test_banner_theme_toggles_and_custom_image():
+    """Toggling off title or subtitle should avoid rendering text, and custom images should load cleanly."""
+    theme = cards.BannerTheme(
+        custom_image="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        show_title=False,
+        show_subtitle=False,
+    )
+    png = cards.render_banner_png("Some Title", "Some Subtitle", COMMUNITY_STATS, theme=theme)
+    img = _open(png)
+    assert img.size == (cards.BANNER_W * cards.BANNER_SCALE, cards.BANNER_H * cards.BANNER_SCALE)

@@ -107,13 +107,20 @@ class LevelsPanel:
         self.panel_message_id = None
         self._load_panel_info()
 
-    def _banner_theme(self):
+    def _banner_theme(self, kind: str = "community"):
         """The guild's dashboard-configured banner appearance."""
         getter = getattr(self.bot, "get_guild_settings", None)
         if not callable(getter):
             return BannerTheme()
         try:
-            return BannerTheme.from_settings(getter(self.guild_id))
+            base_url = None
+            try:
+                from utils.server_urls import get_server_base_url
+
+                base_url = get_server_base_url(self.engine, self.guild_id)
+            except Exception:
+                pass
+            return BannerTheme.from_settings(getter(self.guild_id), kind=kind, base_url=base_url)
         except Exception:
             return BannerTheme()
 
@@ -146,7 +153,8 @@ class LevelsPanel:
         The standing message always shows page 1; paging is served privately to
         whoever clicks, so a refresh never moves another reader's page.
         """
-        theme = self._banner_theme()
+        is_comp = self.panel_type == COMPETITION_PANEL_TYPE
+        theme = self._banner_theme("competition" if is_comp else "community")
         embed_cfg = self._embed_config()
 
         accent_color = None
@@ -157,7 +165,7 @@ class LevelsPanel:
                 accent_color = None
         custom_buttons = embed_cfg.get("buttons") or []
 
-        if self.panel_type == COMPETITION_PANEL_TYPE:
+        if is_comp:
             competition = get_active_competition(self.engine, self.guild_id)
             if not competition:
                 return None, None
