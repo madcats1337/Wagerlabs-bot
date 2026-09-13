@@ -24,6 +24,7 @@ from sqlalchemy import text
 
 from features.linking.panel_embed_config import (
     SHUFFLE_EMBED_CONFIG_KEY,
+    add_container_body,
     load_panel_embed_config,
     resolve_accent,
     resolve_banner_url,
@@ -499,7 +500,7 @@ class ShufflePanelView(LayoutView):
         container.add_item(TextDisplay(resolve_title(cfg, "## Verify Your Shuffle Account")))
         custom_desc = resolve_description(cfg)
         if custom_desc:
-            container.add_item(TextDisplay(custom_desc))
+            add_container_body(container, custom_desc, TextDisplay, Separator)
         else:
             container.add_item(
                 TextDisplay(

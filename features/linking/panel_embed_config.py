@@ -12,6 +12,7 @@ way HowlPanelView already receives campaign_code.
 
 import json
 import logging
+import re
 
 from sqlalchemy import text
 
@@ -87,3 +88,27 @@ def resolve_footer(cfg) -> str:
 def resolve_description(cfg) -> str:
     """Custom body copy, or '' to keep the panel's computed default."""
     return (str((cfg or {}).get("description") or "")).strip()
+
+
+HR_REGEX = re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
+
+
+def add_container_body(container, text: str, text_display_cls, separator_cls):
+    """Add text to a Components V2 container, converting markdown horizontal rules
+    (e.g. '---', '***') into Discord Separator components."""
+    if not text:
+        return
+    lines = text.split("\n")
+    current_chunk = []
+    for line in lines:
+        if HR_REGEX.match(line):
+            chunk_str = "\n".join(current_chunk).strip()
+            if chunk_str:
+                container.add_item(text_display_cls(chunk_str))
+            container.add_item(separator_cls())
+            current_chunk = []
+        else:
+            current_chunk.append(line)
+    chunk_str = "\n".join(current_chunk).strip()
+    if chunk_str:
+        container.add_item(text_display_cls(chunk_str))

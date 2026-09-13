@@ -26,6 +26,7 @@ import redis
 from sqlalchemy import create_engine, text  # type: ignore
 
 from features.games.guess_the_balance import gtb_rank_marker
+from features.linking.panel_embed_config import HR_REGEX
 from utils.log_context import server_context
 from utils.redis_signing import signing_enabled, verify_payload
 from utils.server_urls import get_server_base_url, get_server_public_page_url
@@ -2059,7 +2060,7 @@ class RedisSubscriber:
                 lines = body.split("\n")
                 current_chunk = []
                 for line in lines:
-                    if line.strip() == "---":
+                    if HR_REGEX.match(line):
                         chunk_str = "\n".join(current_chunk).strip()
                         if chunk_str:
                             container.add_item(discord.ui.TextDisplay(chunk_str))
