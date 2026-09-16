@@ -126,6 +126,9 @@ class ShuffleWagerTracker:
     # Default howl affiliate leaderboard endpoint (overridable per-server).
     HOWL_DEFAULT_LB_URL = "https://howl.gg/api/user/affiliate/lb"
 
+    # Default roobet affiliate stats endpoint (overridable per-server).
+    ROOBET_DEFAULT_STATS_URL = "https://roobetconnect.com/affiliate/v2/stats"
+
     # Shuffle rate-limits per-affiliate HARD: two requests issued back to back
     # get the second rejected with TOO_MANY_REQUEST every time (verified against
     # the live endpoint — it is why the windowed poll silently failed on every
@@ -222,6 +225,8 @@ class ShuffleWagerTracker:
                 # Read fresh + decrypted (never from the settings cache), so a key
                 # rotated on the dashboard applies without a bot restart.
                 self.howl_api_key = (self.bot_settings.get_secret("howl_api_key") or "").strip()
+                self.roobet_api_key = ""
+                self.roobet_user_id = ""
                 # Strip first so a blank-but-not-empty stored value falls back to
                 # the default endpoint instead of fetching a whitespace URL.
                 self.affiliate_url = (
@@ -230,8 +235,22 @@ class ShuffleWagerTracker:
                 self.campaign_code = self.bot_settings.get("howl_campaign_code") or ""
                 # Reuse the shared ticket rate (no separate howl rate setting yet).
                 self.tickets_per_1000 = self.bot_settings.shuffle_tickets_per_1000 or 20
+            elif platform == "roobet":
+                # Same fresh+decrypted read as howl. Roobet additionally needs the
+                # affiliate's user id as a query param — a key alone cannot fetch.
+                self.howl_api_key = ""
+                self.roobet_api_key = (self.bot_settings.get_secret("roobet_api_key") or "").strip()
+                self.roobet_user_id = (self.bot_settings.get("roobet_user_id") or "").strip()
+                self.affiliate_url = (
+                    self.bot_settings.get("roobet_affiliate_url") or ""
+                ).strip() or self.ROOBET_DEFAULT_STATS_URL
+                self.campaign_code = self.bot_settings.get("roobet_campaign_code") or ""
+                # Reuse the shared ticket rate (no separate roobet rate setting).
+                self.tickets_per_1000 = self.bot_settings.shuffle_tickets_per_1000 or 20
             else:
                 self.howl_api_key = ""
+                self.roobet_api_key = ""
+                self.roobet_user_id = ""
                 # Leaderboard "Stats URL" first, else Profile Settings' "Affiliate
                 # URL". Blank/whitespace-only values (a cleared dashboard field)
                 # resolve to "" — the task's empty-URL guard then skips this server
@@ -248,11 +267,22 @@ class ShuffleWagerTracker:
             self.platform_name = os.getenv("WAGER_PLATFORM_NAME", "shuffle").lower()
             if self.platform_name == "howl":
                 self.howl_api_key = os.getenv("HOWL_API_KEY", "").strip()
+                self.roobet_api_key = ""
+                self.roobet_user_id = ""
                 self.affiliate_url = (os.getenv("HOWL_AFFILIATE_URL") or "").strip() or self.HOWL_DEFAULT_LB_URL
                 self.campaign_code = os.getenv("HOWL_CAMPAIGN_CODE", "")
                 self.tickets_per_1000 = int(os.getenv("WAGER_TICKETS_PER_1000_USD", "20"))
+            elif self.platform_name == "roobet":
+                self.howl_api_key = ""
+                self.roobet_api_key = os.getenv("ROOBET_API_KEY", "").strip()
+                self.roobet_user_id = os.getenv("ROOBET_USER_ID", "").strip()
+                self.affiliate_url = (os.getenv("ROOBET_AFFILIATE_URL") or "").strip() or self.ROOBET_DEFAULT_STATS_URL
+                self.campaign_code = os.getenv("ROOBET_CAMPAIGN_CODE", "")
+                self.tickets_per_1000 = int(os.getenv("WAGER_TICKETS_PER_1000_USD", "20"))
             else:
                 self.howl_api_key = ""
+                self.roobet_api_key = ""
+                self.roobet_user_id = ""
                 # Same precedence as the DB path: the leaderboard's Stats URL wins.
                 self.affiliate_url = self._resolve_shuffle_url(
                     os.getenv("WAGER_AFFILIATE_URL") or os.getenv("SHUFFLE_AFFILIATE_URL", "")
@@ -1034,6 +1064,33 @@ class ShuffleWagerTracker:
           Howl has no RTP weighting, so weighted == raw. Howl rows carry no
           per-row campaign code either, so we stamp the configured one (or "*").
         """
+        if self.platform_name == "roobet":
+            # Roobet returns a BARE LIST whose rows use different field names
+            # from Shuffle's: `wagered` / `weightedWagered` (and `uid`/`username`).
+            # weightedWagered is house-edge adjusted; keep the same split as
+            # Shuffle — raw drives tickets, weighted drives leaderboard totals.
+            if not isinstance(raw, list):
+                logger.error(f"Unexpected roobet API response format: {type(raw)}")
+                return None
+            stamp = self.campaign_code.split(",")[0].strip().lower() if self.campaign_code else "*"
+            normalized = []
+            for r in raw:
+                if not isinstance(r, dict):
+                    continue
+                name = r.get("username")
+                if not name:
+                    continue
+                wagered = r.get("wagered", 0)
+                normalized.append(
+                    {
+                        "username": name,
+                        "wagerAmount": wagered,
+                        "weightedWagerAmount": r.get("weightedWagered", wagered),
+                        "campaignCode": stamp,
+                    }
+                )
+            return normalized
+
         if self.platform_name == "howl":
             if not isinstance(raw, dict) or not raw.get("success"):
                 logger.error(f"Unexpected howl API response: {str(raw)[:200]}")
@@ -1120,6 +1177,30 @@ class ShuffleWagerTracker:
                 "to": now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                 "limit": "1000",
             }
+        elif self.platform_name == "roobet":
+            if not self.roobet_api_key:
+                logger.error("Roobet selected but no roobet_api_key configured")
+                return None
+            if not self.roobet_user_id:
+                logger.error("Roobet selected but no roobet_user_id configured")
+                return None
+            # Roobet needs "Bearer <key>" (unlike howl's raw key) plus the
+            # AFFILIATE's user id as a query param. Like howl it is windowed, so
+            # we query the current calendar month for exactly the same reason:
+            # the total grows monotonically within a month, making
+            # `current - last_known` behave like Shuffle's lifetime total, and a
+            # month rollover drops it so the delta is <= 0 → row skipped, no
+            # negative tickets.
+            headers["Authorization"] = f"Bearer {self.roobet_api_key}"
+            headers["Accept"] = "application/json"
+            headers["User-Agent"] = "Mozilla/5.0 (compatible; WagerlabsBot/1.0; +https://wagerlabs.app)"
+            now = datetime.utcnow()
+            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            params = {
+                "userId": self.roobet_user_id,
+                "startDate": month_start.strftime("%Y-%m-%dT%H:%M:%S"),
+                "endDate": now.strftime("%Y-%m-%dT%H:%M:%S"),
+            }
         else:
             # Shuffle: use the newer /wager/<id> endpoint (derived from the stored
             # /stats/<id> URL). It returns both raw `wagerAmount` (drives tickets)
@@ -1182,14 +1263,23 @@ class ShuffleWagerTracker:
                     # ({"success": true, "data": [...]}), so we must NOT treat a
                     # Howl dict as an error — _normalize_rows validates Howl's shape
                     # (and logs if `success` is false). Only apply the array check
-                    # to Shuffle-style (bare-list) platforms.
+                    # to Shuffle-style (bare-list) platforms — which includes
+                    # Roobet, whose success body is also a bare list.
                     if self.platform_name != "howl" and not isinstance(data, list):
                         msg = "unknown error"
                         code = None
                         if isinstance(data, dict):
                             msg = data.get("message") or data.get("error") or "unknown error"
                             code = data.get("statusCode")
-                        is_rate_limit = (
+                        # Roobet reports CREDENTIAL problems as HTTP 400 with a
+                        # {"code","message"} body ("Invalid Bearer token",
+                        # "Invalid userId"). Those are misconfiguration, not a
+                        # rate limit — they never self-recover, so they must not
+                        # be demoted to DEBUG like a transient 400 from Shuffle.
+                        is_config_error = self.platform_name == "roobet" and str(msg).lower().startswith(
+                            ("invalid ", "missing ")
+                        )
+                        is_rate_limit = not is_config_error and (
                             str(msg).upper() == "TOO_MANY_REQUEST"
                             or code in (400, 429)
                             or response.status in (400, 429)

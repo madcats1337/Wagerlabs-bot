@@ -23,3 +23,15 @@ If `shuffle_logo.png` is missing, the panel still posts — just without the ban
 > Note: the small **square** Shuffle logo used on the *Verify* button is a
 > separate file — `assets/emojis/shuffle.png` (128 × 128, uploaded as the bot's
 > application emoji). See `assets/emojis/README.md`.
+
+## roobet_logo.png — Roobet verify panel logotype
+
+Same rules as `shuffle_logo.png` above: wide transparent PNG, max **1246 x 200 px**.
+Shipped at **774 x 200** (the full 2000x517 logotype scaled to the 200 px height cap).
+
+Generated from `Admin-Dashboard/frontend/public/roobet-logo.svg` (the same artwork
+the landing page's casino strip uses), so the brand mark stays consistent across
+surfaces. Brand yellow is `#EEAF0E` — that is also the panel's accent colour.
+
+> The small **square** Roobet chip mark used on the *Verify* button is a separate
+> file — `assets/emojis/roobet.png` (128 x 128). See `assets/emojis/README.md`.

@@ -9,11 +9,12 @@ application-emoji size limit):
 - `kick.png`    — Kick logo   → combined link panel "Link Kick" button (else 🟢)
 - `twitch.png`  — Twitch logo → combined link panel "Link Twitch" button (else 🟣)
 - `shuffle.png` — Shuffle logo → Shuffle verify panel "Verify" button (else 🎰)
+- `roobet.png`  — Roobet chip mark → Roobet verify panel "Verify" button (else 🦘)
 
 On startup the bot uploads each as an application emoji the first time
 (`ensure_link_emojis()` in `combined_link_panel.py` for kick/twitch;
-`ensure_shuffle_emoji()` in `shuffle_panel.py` for shuffle), then reuses them by
-name on later boots.
+`ensure_shuffle_emoji()` in `shuffle_panel.py` for shuffle, `ensure_roobet_emoji()`
+in `roobet_panel.py` for roobet), then reuses them by name on later boots.
 
 These same application emojis are also selectable on **Discord live-alert
 buttons** (dashboard → Discord live alerts). A button stores the emoji as an

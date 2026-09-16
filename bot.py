@@ -75,6 +75,7 @@ from features.linking.combined_link_panel import setup_combined_link_panel_syste
 
 # Shuffle verify panel import
 from features.linking.howl_panel import setup_howl_panel_system
+from features.linking.roobet_panel import setup_roobet_panel_system
 from features.linking.shuffle_panel import setup_shuffle_panel_system
 
 # Timed messages import
@@ -107,6 +108,7 @@ from raffle_system.database import (
 from raffle_system.gifted_sub_tracker import setup_gifted_sub_handler
 from raffle_system.migrations.add_commit_reveal_to_periods import migrate_add_commit_reveal_to_periods
 from raffle_system.migrations.add_platform_to_links import migrate_add_platform_to_links
+from raffle_system.migrations.add_platform_uid_to_links import migrate_add_platform_uid_to_links
 from raffle_system.migrations.add_platform_user_id_to_links import migrate_add_platform_user_id_to_links
 from raffle_system.migrations.add_provably_fair_to_draws import migrate_add_provably_fair_to_draws
 from raffle_system.migrations.platform_scope_raffle_constraints import migrate_platform_scope_raffle_constraints
@@ -9860,6 +9862,10 @@ async def on_ready():
             # Immutable per-platform viewer id (Kick user_id / Twitch id). Must run
             # AFTER add_platform_to_links — its unique index includes `platform`.
             migrate_add_platform_user_id_to_links(engine)
+            # Generic casino UID on raffle_shuffle_links (replaces howl_uid for new
+            # UID-verified platforms, e.g. roobet). Backfills from howl_uid, so it
+            # must run AFTER the platform column exists.
+            migrate_add_platform_uid_to_links(engine)
             migrate_add_provably_fair_to_draws(engine)
             # Commit-reveal columns (raffle_periods seed/commitment + draw commitment).
             # After add_provably_fair_to_draws so raffle_draws already has its base PF columns.
@@ -10222,6 +10228,13 @@ async def on_ready():
             # Setup Howl verify panel with per-guild instances
             bot.howl_panels = await setup_howl_panel_system(bot, engine, get_guild_settings)
             logger.debug(f"✅ Howl verify panel system initialized ({len(bot.howl_panels)} guilds)")
+
+            # Setup Roobet verify panel with per-guild instances. The registry
+            # attribute name here MUST match redis_subscriber's _post_panel map
+            # ("roobet_verify" -> "roobet_panels") or dashboard-triggered posts
+            # are dropped with only a warning.
+            bot.roobet_panels = await setup_roobet_panel_system(bot, engine, get_guild_settings)
+            logger.debug(f"✅ Roobet verify panel system initialized ({len(bot.roobet_panels)} guilds)")
 
             # Setup global super-admin panels for the official guild. These are
             # posted/moved from the dashboard super-admin console via the existing

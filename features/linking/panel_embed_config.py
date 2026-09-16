@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 LINK_EMBED_CONFIG_KEY = "link_panel_embed_config"
 SHUFFLE_EMBED_CONFIG_KEY = "shuffle_panel_embed_config"
 HOWL_EMBED_CONFIG_KEY = "howl_panel_embed_config"
+ROOBET_EMBED_CONFIG_KEY = "roobet_panel_embed_config"
 
 
 def load_panel_embed_config(engine, guild_id, key) -> dict:

@@ -1864,7 +1864,8 @@ class RedisSubscriber:
     async def _post_panel(self, data):
         """Post or move a link/verify panel into the channel chosen on the dashboard.
 
-        data: {panel_type: 'kick_link' | 'twitch_link' | 'shuffle_verify' | 'howl_verify', channel_id, discord_server_id}
+        data: {panel_type: 'kick_link' | 'twitch_link' | 'shuffle_verify' | 'howl_verify'
+               | 'roobet_verify', channel_id, discord_server_id}
         Reuses the panel's existing create_panel(channel) (which rewrites the
         link_panels DB row); we additionally delete the previous Discord message
         so the panel "moves" rather than leaving a stale copy behind.
@@ -1892,6 +1893,7 @@ class RedisSubscriber:
             "link": "link_panels",
             "shuffle_verify": "shuffle_panels",
             "howl_verify": "howl_panels",
+            "roobet_verify": "roobet_panels",
             "levels_leaderboard": "levels_panels",
             "levels_competition": "levels_competition_panels",
             # Global super-admin panels for the official guild.

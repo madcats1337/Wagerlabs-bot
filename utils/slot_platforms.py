@@ -21,7 +21,10 @@ SLOT_TABLE_BY_PLATFORM = {
 }
 
 SLOT_PLATFORMS = tuple(SLOT_TABLE_BY_PLATFORM)
-WAGER_PLATFORMS = ("shuffle", "howl")
+# Wager/affiliate tracking. MIRRORS Admin-Dashboard/utils/database.py's
+# WAGER_PLATFORMS — keep the two in sync (nothing enforces it, and the two
+# Railway services deploy independently).
+WAGER_PLATFORMS = ("shuffle", "howl", "roobet")
 
 
 def slot_table_for_platform(platform):
