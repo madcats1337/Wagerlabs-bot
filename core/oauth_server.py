@@ -275,121 +275,52 @@ if HAS_KICK_OFFICIAL and register_webhook_routes:
                 logger.info(f"[Webhook] ⚠️ No server_id, cannot send notification")
                 return
 
-            # Get notification settings from database
-            import aiohttp
-            from sqlalchemy import text
+            # Hand the alert off to the bot and return — do NOT post to Discord
+            # from here. This handler runs inline inside Kick's webhook request,
+            # in a gunicorn process configured with a SINGLE worker, so any
+            # Discord work here blocks the only worker serving this service
+            # (Kick webhooks, Twitch EventSub, and the whole OAuth flow).
+            # The old inline path could hold that worker for ~60s (30s alert POST
+            # + 30s footer POST), which queued every other request behind it until
+            # the edge proxy gave up and returned its own HTML 504 — which then got
+            # logged as a "Discord API error" because we read the edge's error page
+            # as if it were Discord's response.
+            #
+            # The bot has a real running event loop and no ingress to starve, so it
+            # owns the retry/latency budget. Same bridge the chat path already uses.
+            try:
+                import json as _json
 
-            db_url = os.getenv("DATABASE_URL")
-            if not db_url:
-                logger.info(f"[Webhook] ⚠️ DATABASE_URL not set")
-                return
+                import redis as _redis
 
-            # Kick webhook → read the Kick live-alert settings (legacy fallback).
-            from core.stream_notifications import _alert_columns, _build_live_message, alert_setting
-
-            cols = _alert_columns("kick") + ["kick_channel"]
-            ph = ", ".join(f":k{i}" for i in range(len(cols)))
-            params = {"guild_id": discord_server_id}
-            params.update({f"k{i}": c for i, c in enumerate(cols)})
-            # Reuse the shared module engine (was create_engine per webhook - leaked a pool).
-            with engine.connect() as conn:
-                settings_result = conn.execute(
-                    text(
-                        f"SELECT key, value FROM bot_settings " f"WHERE discord_server_id = :guild_id AND key IN ({ph})"
-                    ),
-                    params,
-                ).fetchall()
-
-                settings = {key: value for key, value in settings_result}
-
-                if alert_setting(settings, "kick", "enabled") != "true":
-                    logger.info(f"[Webhook] ℹ️ Kick live alert disabled for server {discord_server_id}")
+                redis_url = os.getenv("REDIS_URL")
+                if not redis_url:
+                    logger.info("[Webhook] ⚠️ REDIS_URL not set, cannot dispatch go-live alert")
                     return
+                if "://" not in redis_url:
+                    redis_url = f"redis://{redis_url}"
 
-                notification_channel_id = alert_setting(settings, "kick", "channel_id")
-                if not notification_channel_id:
-                    logger.info(f"[Webhook] ⚠️ No Kick live-alert channel configured for server {discord_server_id}")
-                    return
-
-                # Use configured kick_channel or broadcaster from webhook
-                streamer = settings.get("kick_channel") or broadcaster
-                stream_url = f"https://kick.com/{streamer}"
-
-                message_content, footer_text = _build_live_message(settings, "kick", streamer, title, category)
-
-                # Discord button component for "Watch Stream"
-                components = [
-                    {
-                        "type": 1,
-                        "components": [
-                            {"type": 2, "style": 5, "label": "Watch Stream", "url": stream_url, "emoji": {"name": "🔴"}}
-                        ],
-                    }
-                ]
-
-                # Send to Discord via API
-                bot_token = os.getenv("DISCORD_TOKEN")
-                if not bot_token:
-                    logger.info(f"[Webhook] ⚠️ DISCORD_TOKEN not set")
-                    return
-
-                import asyncio
-
-                # Discord's message-create endpoint can be slow during
-                # their bad windows; 10s was tight enough that the response
-                # read timed out *after* Discord had already created the
-                # message, which made us skip the footer follow-up. Bump to
-                # 30s and post the footer independently of the main POST's
-                # outcome — the two messages are unrelated Discord objects,
-                # the footer doesn't need the main message's ID.
-                headers = {"Authorization": f"Bot {bot_token}", "Content-Type": "application/json"}
-                channel_url = f"https://discord.com/api/v10/channels/{notification_channel_id}/messages"
-                timeout = aiohttp.ClientTimeout(total=30)
-
-                async with aiohttp.ClientSession() as session:
-                    try:
-                        async with session.post(
-                            channel_url,
-                            headers=headers,
-                            json={"content": message_content, "components": components},
-                            timeout=timeout,
-                        ) as resp:
-                            if resp.status in (200, 201):
-                                logger.info(
-                                    f"[Webhook] ✅ Stream notification sent to channel {notification_channel_id}"
-                                )
-                            else:
-                                error_text = await resp.text()
-                                logger.info(f"[Webhook] ❌ Discord API error {resp.status}: {error_text[:200]}")
-                    except asyncio.TimeoutError:
-                        # Discord likely accepted the POST but the response
-                        # read timed out — proceed to the footer anyway so
-                        # we don't drop it on the floor when the embed is
-                        # actually visible in the channel.
-                        logger.info(
-                            f"[Webhook] ⚠️ Timed out reading Discord response for main embed (message may have posted)"
+                client = _redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
+                client.publish(
+                    "bot_events",
+                    _json.dumps(
+                        sign_payload(
+                            {
+                                "type": "stream_live_alert",
+                                "data": {
+                                    "platform": "kick",
+                                    "streamer": broadcaster,
+                                    "title": title,
+                                    "category": category,
+                                    "_server_id": discord_server_id,
+                                },
+                            }
                         )
-
-                    if footer_text:
-                        await asyncio.sleep(0.5)
-                        try:
-                            async with session.post(
-                                channel_url,
-                                headers=headers,
-                                json={"content": f"-# {footer_text}"},
-                                timeout=timeout,
-                            ) as footer_resp:
-                                if footer_resp.status in (200, 201):
-                                    logger.info(f"[Webhook] ✅ Footer sent")
-                                else:
-                                    error_text = await footer_resp.text()
-                                    logger.info(
-                                        f"[Webhook] ⚠️ Failed to send footer: {footer_resp.status} {error_text[:200]}"
-                                    )
-                        except asyncio.TimeoutError:
-                            logger.info(
-                                f"[Webhook] ⚠️ Timed out reading Discord response for footer (message may have posted)"
-                            )
+                    ),
+                )
+                logger.info(f"[Webhook] ✅ Dispatched go-live alert to bot for server {discord_server_id}")
+            except Exception as e:
+                logger.warning(f"[Webhook] ⚠️ Failed to dispatch go-live alert: {e}")
 
         except Exception as e:
             logger.info(f"[Webhook] ❌ Error handling livestream status: {type(e).__name__}: {e}")

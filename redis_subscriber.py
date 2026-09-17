@@ -3667,6 +3667,39 @@ Congratulations! Please contact an admin to claim your prize! 🎊
                 logger.warning(f"⚠️ Failed to process oauth notification event: {e}")
             return
 
+        if event_type == "stream_live_alert":
+            # Go-live alerts are dispatched here by the gunicorn webhook process
+            # rather than posted from it. That process runs a SINGLE worker and the
+            # handler ran inline inside the inbound webhook request, so posting to
+            # Discord there blocked the only worker serving Kick webhooks, Twitch
+            # EventSub and OAuth for as long as Discord took to answer (up to ~60s
+            # for alert + footer). Requests queued behind it until the edge proxy
+            # returned its own 504 HTML page, which the handler then logged as a
+            # bogus "Discord API error". Here there is no ingress to starve.
+            #
+            # create_task so a slow Discord call can't stall this shared subscriber
+            # (same reasoning as the oauth_notification branch above).
+            try:
+                from core.stream_notifications import _post_discord_notification
+
+                server_id = data.get("_server_id")
+                if server_id is None:
+                    logger.info("[StreamNotify] ⚠️ go-live alert missing _server_id, dropping")
+                    return
+
+                asyncio.create_task(
+                    _post_discord_notification(
+                        server_id,
+                        data.get("streamer", ""),
+                        data.get("title", ""),
+                        data.get("category", ""),
+                        data.get("platform", "kick"),
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to handle go-live alert event: {e}")
+            return
+
         if event_type != "twitch_chat_message":
             logger.debug(f"[bot_events] Ignoring unknown type: {event_type}")
             return

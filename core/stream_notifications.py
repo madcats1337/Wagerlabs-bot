@@ -357,29 +357,55 @@ async def _post_discord_notification(discord_server_id, streamer, title, categor
             # Built inside the session so app:<name> emoji tokens can be resolved
             # against the bot's application emojis over the same connection.
             components = await build_alert_components(settings, platform, stream_url, session, bot_token)
-            try:
-                async with session.post(
-                    channel_url,
-                    headers=headers,
-                    json={"content": message_content, "components": components},
-                    timeout=timeout,
-                ) as resp:
-                    if resp.status in (200, 201):
-                        logger.info(f"[StreamNotify] ✅ Notification sent to channel {notification_channel_id}")
-                    else:
-                        error_text = await resp.text()
-                        logger.info(f"[StreamNotify] ⚠️ Failed to send notification: {resp.status} - {error_text[:200]}")
-            except asyncio.TimeoutError:
-                # Discord likely accepted the POST but the response read timed out —
-                # proceed to the footer anyway so we don't drop it when the alert is
-                # actually visible in the channel.
-                logger.info("[StreamNotify] ⚠️ Timed out reading Discord response for alert (may have posted)")
+
+            # A go-live alert is one-shot and time-sensitive: if it fails there is
+            # no second chance until the next stream, so retry the transient cases.
+            # 5xx here is usually Discord's EDGE (a Cloudflare HTML error page),
+            # not the API — the API answers with JSON. Retrying a 4xx would just
+            # repeat a rejected payload, so those fail fast.
+            posted = False
+            for attempt in range(3):
+                if attempt:
+                    await asyncio.sleep(2**attempt)  # 2s, 4s
+                try:
+                    async with session.post(
+                        channel_url,
+                        headers=headers,
+                        json={"content": message_content, "components": components},
+                        timeout=timeout,
+                    ) as resp:
+                        if resp.status in (200, 201):
+                            logger.info(f"[StreamNotify] ✅ Notification sent to channel {notification_channel_id}")
+                            posted = True
+                            break
+                        error_text = (await resp.text())[:200]
+                        if resp.status == 429 or resp.status >= 500:
+                            logger.info(
+                                f"[StreamNotify] ⚠️ Transient {resp.status} posting alert "
+                                f"(attempt {attempt + 1}/3): {error_text}"
+                            )
+                            continue
+                        # 4xx: a bad channel id, missing permission, or invalid
+                        # payload. Retrying cannot help.
+                        logger.info(f"[StreamNotify] ⚠️ Failed to send notification: {resp.status} - {error_text}")
+                        break
+                except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                    # The read timed out, but Discord may well have created the
+                    # message before we gave up. Treat it as posted so the footer
+                    # still follows a visible alert, and don't retry — a retry
+                    # risks double-posting the go-live.
+                    logger.info(f"[StreamNotify] ⚠️ Alert POST did not complete cleanly (may have posted): {e}")
+                    posted = True
+                    break
+            else:
+                logger.warning("[StreamNotify] ❌ Gave up posting go-live alert after 3 attempts")
 
             # Footer goes as a separate follow-up message: a classic content +
             # components message can't place text below the buttons, and the video
-            # unfurl needs the link in the main content. Sent regardless of the
-            # main POST's read outcome (see above).
-            if footer_text:
+            # unfurl needs the link in the main content. Skipped when the alert
+            # definitively failed — a lone footer with no alert above it is worse
+            # than nothing.
+            if footer_text and posted:
                 await asyncio.sleep(0.5)
                 try:
                     async with session.post(
