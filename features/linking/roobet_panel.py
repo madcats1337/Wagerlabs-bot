@@ -1,12 +1,12 @@
 """
 Roobet Verify Panel - Interactive Discord panel for Roobet affiliate auto-verification.
 
-A user clicks the "Verify Roobet Account" button, enters their Roobet UID in a
-modal, and the bot asks Roobet whether that UID is referred by this guild's
-affiliate. If it is, the user is auto-verified (raffle_shuffle_links,
+A user clicks the "Verify Roobet Account" button, enters their Roobet USERNAME
+in a modal, and the bot asks Roobet whether that account is referred by this
+guild's affiliate. If it is, the user is auto-verified (raffle_shuffle_links,
 platform='roobet', verified=TRUE) and granted `roobet_verified_role_id`.
 
-Modeled on howl_panel.py (the other UID-verified casino). Roobet-specific facts,
+Modeled on howl_panel.py (the other API-verified casino). Roobet-specific facts,
 all verified against the live endpoints:
 
 - Auth is "Bearer <jwt>" — NOT the raw key Howl uses. The same JWT works on both
@@ -14,12 +14,15 @@ all verified against the live endpoints:
 - Referral status comes from the Affiliate User Validation API
   (ROOBET_VALIDATE_USER_URL) and is INDEPENDENT OF WAGERING. This is the
   endpoint behind Roobet's own /Check Discord command. It answers
-  {"isAffiliate": bool}; an unknown uid is a 400, not isAffiliate:false.
+  {"isAffiliate": bool}; an unknown account is a 400, not isAffiliate:false.
+  It accepts a username OR a uid — username lookups are case-insensitive. Send
+  only ONE: given both, Roobet honours `userId` and ignores `username`.
 - The affiliate STATS API is a separate host and is only consulted afterwards,
-  to put a username on the link. It lists only players with wager activity in
-  the window, so a just-signed-up user is legitimately absent — the username is
-  then left blank rather than the verification failing. Verifying against the
-  roster (as this used to) made wagering a precondition for verifying at all.
+  to recover the player's uid and Roobet's own casing of the name. It lists only
+  players with wager activity in the window, so a just-signed-up user is
+  legitimately absent — the uid is then left NULL rather than the verification
+  failing. Verifying against the roster (as this used to) made wagering a
+  precondition for verifying at all.
 - Stats: `userId` is the AFFILIATE's uuid and is REQUIRED, distinct from the
   per-player `uid` values in the response. Success is a BARE LIST; errors are
   HTTP 400 with {"code","message"}. There is NO server-side filtering —
@@ -253,8 +256,10 @@ async def _fetch_roobet_affiliate_data(affiliate_url: str, api_key: str, affilia
         return None
 
 
-async def _validate_roobet_referral(api_key: str, affiliate_user_id: str, player_uid: str):
-    """Is `player_uid` referred by this affiliate? -> True / False / None (error).
+async def _validate_roobet_referral(api_key: str, affiliate_user_id: str, player: str, *, by_username=False):
+    """Is `player` referred by this affiliate? -> True / False / None (error).
+
+    `player` is a Roobet username when `by_username`, else a player uid.
 
     Uses Roobet's Affiliate User Validation API, which answers referral status
     DIRECTLY and is independent of wagering. This matters: the stats roster only
@@ -268,12 +273,17 @@ async def _validate_roobet_referral(api_key: str, affiliate_user_id: str, player
 
     Observed contract (verified live):
       200 {"isAffiliate": true|false}       - authoritative answer
-      400 {"code","message"}                - unknown/malformed uid, missing
-                                              params, or a uid that isn't a real
-                                              Roobet user ("Requesting User
-                                              Unknown")
+      400 {"code","message"}                - unknown/malformed identifier,
+                                              missing params, or an identifier
+                                              that isn't a real Roobet user
+                                              ("Requesting User Unknown")
+
+    Username lookups are case-insensitive and tolerate surrounding whitespace.
+    EXACTLY ONE identifier is sent: when both `userId` and `username` are
+    supplied Roobet honours `userId` and silently IGNORES `username`, so mixing
+    them would let a wrong-but-referred uid validate someone else's name.
     """
-    if not api_key or not affiliate_user_id or not player_uid:
+    if not api_key or not affiliate_user_id or not player:
         return None
 
     headers = {
@@ -281,14 +291,15 @@ async def _validate_roobet_referral(api_key: str, affiliate_user_id: str, player
         "Accept": "application/json",
         "User-Agent": "Mozilla/5.0 (compatible; WagerlabsBot/1.0; +https://wagerlabs.app)",
     }
-    params = {"userId": player_uid, "affiliateId": affiliate_user_id}
+    params = {"affiliateId": affiliate_user_id}
+    params["username" if by_username else "userId"] = player
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(ROOBET_VALIDATE_USER_URL, headers=headers, params=params, timeout=30) as response:
                 if response.status == 400:
-                    # An unrecognised uid is reported this way rather than as
-                    # isAffiliate:false, so it IS a definitive "not ours".
+                    # An unrecognised identifier (username or uid) is reported this way
+                    # rather than as isAffiliate:false, so it IS a definitive "not ours".
                     detail = ""
                     try:
                         body = await response.json(content_type=None)
@@ -296,7 +307,7 @@ async def _validate_roobet_referral(api_key: str, affiliate_user_id: str, player
                             detail = body.get("message") or body.get("code") or ""
                     except Exception:
                         pass
-                    logger.info(f"[Roobet] validateUser rejected uid {player_uid}: {detail}")
+                    logger.info(f"[Roobet] validateUser rejected account '{player}': {detail}")
                     return False
                 if response.status != 200:
                     logger.error(f"[Roobet] validateUser returned status {response.status}")
@@ -324,14 +335,14 @@ def _describe_link(username, platform_uid):
     return f"UID {uid}" if uid else "a Roobet account"
 
 
-async def verify_and_grant(interaction: discord.Interaction, engine, settings_getter, entered_uid: str):
+async def verify_and_grant(interaction: discord.Interaction, engine, settings_getter, entered_username: str):
     discord_id = interaction.user.id
     guild = interaction.guild
     guild_id = guild.id if guild else None
-    entered = (entered_uid or "").strip()
+    entered = (entered_username or "").strip()
 
     if not entered:
-        await interaction.response.send_message("❌ Please enter your Roobet UID.", ephemeral=True)
+        await interaction.response.send_message("❌ Please enter your Roobet username.", ephemeral=True)
         return
 
     try:
@@ -343,7 +354,7 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
                 ),
                 {"d": discord_id},
             ).fetchone()
-        if existing:
+        if existing and (existing[0] or "").strip():
             await interaction.response.send_message(
                 f"✅ You're already verified as **{_describe_link(existing[0], existing[1])}**!", ephemeral=True
             )
@@ -397,7 +408,7 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
     # Referral status comes from validateUser, NOT the stats roster: the roster
     # only contains players who have wagered inside the window, so checking it
     # would refuse anyone who signed up correctly but hasn't played yet.
-    is_referred = await _validate_roobet_referral(api_key, str(affiliate_user_id).strip(), entered)
+    is_referred = await _validate_roobet_referral(api_key, str(affiliate_user_id).strip(), entered, by_username=True)
     if is_referred is None:
         await interaction.followup.send(
             "❌ Couldn't reach Roobet to check your account right now. Please try again later.",
@@ -410,23 +421,26 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
         campaign_code = next((c.strip() for c in raw_code.split(",") if c.strip()), "")
         signup_hint = f"on code **{campaign_code}**" if campaign_code else "on our code"
         await interaction.followup.send(
-            f"❌ UID **{entered}** isn't registered under our Roobet affiliate. Make sure you signed up "
-            f"{signup_hint} on Roobet, then try again.",
+            f"❌ **{entered}** isn't registered under our Roobet affiliate. Check the spelling, make sure "
+            f"you signed up {signup_hint} on Roobet, then try again.",
             ephemeral=True,
         )
         return
 
-    # Referral confirmed. The roster is consulted only for a display username —
-    # validateUser returns a bare boolean. A user who hasn't wagered won't be
-    # there, so a miss is expected and must not fail the verification. The name
-    # is left EMPTY rather than filled with the uid (the column is a username,
-    # and _describe_link already renders "UID <x>" for a blank one).
-    matched_uid = entered
-    matched_username = ""
+    # Referral confirmed. The roster is consulted only to recover the player's
+    # uid and Roobet's own casing of the name — validateUser returns a bare
+    # boolean. A user who hasn't wagered won't be in the roster, so a miss is
+    # expected and must not fail the verification; the uid is then left NULL
+    # (never "", which would collide with other uid-less rows in the duplicate
+    # check) and the name is stored as the user typed it.
+    matched_username = entered
+    matched_uid = None
     data = await _fetch_roobet_affiliate_data(affiliate_url, api_key, str(affiliate_user_id).strip())
     for row in data or []:
-        if str(row.get("userId")) == entered and row.get("username"):
-            matched_username = str(row.get("username"))
+        name = row.get("username")
+        if name and str(name).strip().lower() == entered.lower():
+            matched_username = str(name)
+            matched_uid = str(row.get("userId")) or None
             break
 
     kick_name = None
@@ -449,7 +463,7 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
 
     if status == "already_linked":
         await interaction.followup.send(
-            f"❌ UID **{matched_uid}** is already verified by another Discord account.", ephemeral=True
+            f"❌ Roobet account **{matched_username}** is already verified by another Discord account.", ephemeral=True
         )
         return
     if status == "discord_already_linked":
@@ -477,14 +491,19 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
 def _insert_verified_link(engine, roobet_username, kick_name, discord_id, platform_uid, guild_id):
     try:
         with engine.begin() as conn:
-            existing = conn.execute(
-                text(
-                    "SELECT discord_id FROM raffle_shuffle_links " "WHERE platform_uid = :uid AND platform = 'roobet'"
-                ),
-                {"uid": platform_uid},
-            ).fetchone()
-            if existing:
-                return {"status": "already_linked", "existing_discord_id": existing[0]}
+            # Only meaningful when we actually resolved a uid. A user who hasn't
+            # wagered isn't in the roster, so platform_uid is NULL for them and
+            # the username check below is what catches a duplicate.
+            if platform_uid:
+                existing = conn.execute(
+                    text(
+                        "SELECT discord_id FROM raffle_shuffle_links "
+                        "WHERE platform_uid = :uid AND platform = 'roobet'"
+                    ),
+                    {"uid": platform_uid},
+                ).fetchone()
+                if existing and existing[0] != discord_id:
+                    return {"status": "already_linked", "existing_discord_id": existing[0]}
 
             discord_existing = conn.execute(
                 text(
@@ -494,16 +513,43 @@ def _insert_verified_link(engine, roobet_username, kick_name, discord_id, platfo
                 {"d": discord_id},
             ).fetchone()
             if discord_existing:
+                if not (discord_existing[0] or "").strip():
+                    # Legacy row created when UID was the modal input and username
+                    # was omitted for unwagered users. Backfill the verified username.
+                    conn.execute(
+                        text(
+                            """
+                            UPDATE raffle_shuffle_links
+                            SET shuffle_username = :roobet_username,
+                                platform_uid = COALESCE(:platform_uid, platform_uid),
+                                verified_at = CURRENT_TIMESTAMP
+                            WHERE discord_id = :d AND platform = 'roobet'
+                            """
+                        ),
+                        {
+                            "roobet_username": roobet_username,
+                            "platform_uid": platform_uid,
+                            "d": discord_id,
+                        },
+                    )
+                    logger.info(
+                        f"🔗 Backfilled Roobet username for existing link: {roobet_username} "
+                        f"(UID {platform_uid or 'unwagered'}) → (Discord: {discord_id})"
+                    )
+                    return {"status": "success"}
                 return {
                     "status": "discord_already_linked",
                     "existing_username": discord_existing[0],
                     "existing_uid": discord_existing[1],
                 }
 
-            # Fallback: a row for this username with no uid recorded.
+            # Primary guard when no uid was resolved (and a backstop otherwise).
+            # Case-insensitive: Roobet treats usernames that way, so "Player" and
+            # "player" are the same account and must not both link.
             existing_user = conn.execute(
                 text(
-                    "SELECT discord_id FROM raffle_shuffle_links " "WHERE shuffle_username = :u AND platform = 'roobet'"
+                    "SELECT discord_id FROM raffle_shuffle_links "
+                    "WHERE LOWER(shuffle_username) = LOWER(:u) AND platform = 'roobet'"
                 ),
                 {"u": roobet_username},
             ).fetchone()
@@ -533,7 +579,7 @@ def _insert_verified_link(engine, roobet_username, kick_name, discord_id, platfo
                 },
             )
         logger.info(
-            f"🔗 Auto-verified Roobet link: {roobet_username} (UID {platform_uid}) → "
+            f"🔗 Auto-verified Roobet link: {roobet_username} (UID {platform_uid or 'unwagered'}) → "
             f"{kick_name or '(no Kick link)'} (Discord: {discord_id})"
         )
         return {"status": "success"}
@@ -586,9 +632,11 @@ async def _grant_role(interaction, engine, guild, discord_id, guild_id, matched_
 
 
 class RoobetVerifyModal(Modal, title="Verify Your Roobet Account"):
-    roobet_uid = TextInput(
-        label="Roobet UID",
-        placeholder="Your Roobet user ID",
+    # Username, not UID: validateUser accepts either, and a username is
+    # something a viewer knows without digging through Roobet's settings.
+    roobet_username = TextInput(
+        label="Roobet Username",
+        placeholder="Your Roobet username",
         required=True,
         min_length=1,
         max_length=64,
@@ -601,7 +649,7 @@ class RoobetVerifyModal(Modal, title="Verify Your Roobet Account"):
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            await verify_and_grant(interaction, self.engine, self.settings_getter, self.roobet_uid.value)
+            await verify_and_grant(interaction, self.engine, self.settings_getter, self.roobet_username.value)
         except Exception as e:
             logger.error(f"Error handling Roobet verify modal: {e}")
             if not interaction.response.is_done():
@@ -662,7 +710,7 @@ class RoobetPanelView(LayoutView):
                     f"{signup_line}\n\n"
                     "**How to Verify:**\n"
                     "Click the **'Verify Roobet Account'** button below and enter your "
-                    "Roobet UID. We'll check it against our affiliate stats and "
+                    "Roobet username. We'll check it against our affiliate and "
                     "grant your role instantly."
                 )
             )
@@ -670,7 +718,7 @@ class RoobetPanelView(LayoutView):
                 TextDisplay(
                     "**📋 Before you start**\n"
                     f"{bullet_line}\n"
-                    "• Enter your **exact** Roobet UID (found in your account settings)\n"
+                    "• Enter your Roobet username (the name shown on your account)\n"
                     "• One Roobet account per Discord user"
                 )
             )
