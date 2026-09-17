@@ -41,6 +41,8 @@ import logging
 import discord
 from sqlalchemy import text
 
+from features.linking.panel_embed_config import create_action_row_button
+
 from .cards import BannerTheme, render_banner_png
 from .competition import PERIOD_LABELS, get_active_competition
 from .curve import RANK_LABELS
@@ -496,17 +498,9 @@ def build_board_view(
     if custom_buttons:
         action_buttons = []
         for btn in custom_buttons[:5]:
-            url = btn.get("url") or ""
-            label = btn.get("label") or "Link"
-            if url:
-                action_buttons.append(
-                    discord.ui.Button(
-                        style=discord.ButtonStyle.link,
-                        label=label,
-                        url=url,
-                        emoji=btn.get("emoji") or None,
-                    )
-                )
+            btn_obj = create_action_row_button(btn)
+            if btn_obj is not None:
+                action_buttons.append(btn_obj)
         if action_buttons:
             container.add_item(discord.ui.Separator())
             container.add_item(discord.ui.ActionRow(*action_buttons))

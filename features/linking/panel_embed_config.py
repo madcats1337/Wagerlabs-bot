@@ -14,7 +14,7 @@ import io
 import json
 import logging
 import re
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import aiohttp
 import discord
@@ -177,3 +177,111 @@ def add_container_body(container, text: str, text_display_cls, separator_cls):
     chunk_str = "\n".join(current_chunk).strip()
     if chunk_str:
         container.add_item(text_display_cls(chunk_str))
+
+
+CUSTOM_EMOJI_REGEX = re.compile(r"<(a)?:([a-zA-Z0-9_]{2,32}):(\d{17,21})>")
+
+
+def resolve_button_emoji(raw_emoji) -> Optional[Union[discord.PartialEmoji, str]]:
+    """Parse and normalize an emoji representation for a discord.ui.Button.
+
+    Accepts:
+    - Discord custom emoji string: '<:name:id>' or '<a:name:id>'
+    - Unicode emoji string: '🔥'
+    - Dict format: {'id': '...', 'name': '...', 'animated': bool}
+    - discord.PartialEmoji / discord.Emoji object
+
+    Returns a discord.PartialEmoji or clean unicode string, or None if invalid/absent.
+    """
+    if not raw_emoji:
+        return None
+    if isinstance(raw_emoji, (discord.PartialEmoji, discord.Emoji)):
+        return raw_emoji
+    if isinstance(raw_emoji, dict):
+        eid = raw_emoji.get("id")
+        name = raw_emoji.get("name")
+        anim = bool(raw_emoji.get("animated", False))
+        if eid and name:
+            try:
+                return discord.PartialEmoji(name=str(name), id=int(eid), animated=anim)
+            except Exception:
+                pass
+        if name:
+            return str(name).strip() or None
+        return None
+    if isinstance(raw_emoji, str):
+        s = raw_emoji.strip()
+        if not s:
+            return None
+        match = CUSTOM_EMOJI_REGEX.search(s)
+        if match:
+            anim = bool(match.group(1))
+            name = match.group(2)
+            try:
+                eid = int(match.group(3))
+                return discord.PartialEmoji(name=name, id=eid, animated=anim)
+            except Exception:
+                return None
+        return s
+    return None
+
+
+def create_action_row_button(btn_data: dict) -> Optional[discord.ui.Button]:
+    """Create a discord.ui.Button (link style) from a dashboard button config dict.
+
+    Handles:
+    - Normalizing emoji (custom <:name:id>, <a:name:id>, unicode, or dict)
+    - Extracting custom emoji from label if emoji field is empty
+    - Ensuring button has at least label or emoji (Discord requirement)
+    - Safe fallback if emoji instantiation fails
+    """
+    if not isinstance(btn_data, dict):
+        return None
+    url = (btn_data.get("url") or "").strip()
+    if not url:
+        return None
+    raw_label = (btn_data.get("label") or "").strip()
+    raw_emoji = btn_data.get("emoji")
+
+    # Fallback: if emoji is not set, but label contains a custom emoji tag, extract it
+    if not raw_emoji and raw_label:
+        match = CUSTOM_EMOJI_REGEX.search(raw_label)
+        if match:
+            raw_emoji = match.group(0)
+            raw_label = CUSTOM_EMOJI_REGEX.sub("", raw_label).strip()
+
+    parsed_emoji = resolve_button_emoji(raw_emoji)
+    if not raw_label and not parsed_emoji:
+        raw_label = "Link"
+
+    try:
+        return discord.ui.Button(
+            style=discord.ButtonStyle.link,
+            label=raw_label or None,
+            url=url,
+            emoji=parsed_emoji,
+        )
+    except Exception as e:
+        logger.warning(f"[button] Failed to create button with emoji {parsed_emoji!r}: {e}, falling back to text-only")
+        return discord.ui.Button(
+            style=discord.ButtonStyle.link,
+            label=raw_label or "Link",
+            url=url,
+            emoji=None,
+        )
+
+
+def strip_button_emojis_from_view(view) -> None:
+    """Recursively traverse a view/container to clear button emojis and ensure labels exist."""
+
+    def _strip_items(items):
+        for item in items:
+            if isinstance(item, discord.ui.Button):
+                item.emoji = None
+                if not item.label:
+                    item.label = "Link"
+            if hasattr(item, "children"):
+                _strip_items(item.children)
+
+    if hasattr(view, "children"):
+        _strip_items(view.children)

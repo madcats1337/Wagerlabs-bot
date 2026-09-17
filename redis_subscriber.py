@@ -2031,11 +2031,15 @@ class RedisSubscriber:
 
         # Resolve banner into a direct discord.File attachment to bypass proxy compression
         banner_media_url = banner_url
+        from features.linking.panel_embed_config import (
+            create_action_row_button,
+            resolve_banner_attachment,
+            strip_button_emojis_from_view,
+        )
+
         banner_file = None
         if banner_url:
             try:
-                from features.linking.panel_embed_config import resolve_banner_attachment
-
                 banner_media_url, banner_file = await resolve_banner_attachment(banner_url, engine=eng)
             except Exception as e:
                 logger.debug(f"[embed] resolve_banner_attachment failed: {e}")
@@ -2091,17 +2095,9 @@ class RedisSubscriber:
             buttons_data = c_data.get("buttons") or []
             action_buttons = []
             for btn in buttons_data[:5]:
-                b_url = btn.get("url") or ""
-                b_lbl = btn.get("label") or "Link"
-                if b_url:
-                    action_buttons.append(
-                        discord.ui.Button(
-                            style=discord.ButtonStyle.link,
-                            label=b_lbl,
-                            url=b_url,
-                            emoji=btn.get("emoji") or None,
-                        )
-                    )
+                btn_obj = create_action_row_button(btn)
+                if btn_obj is not None:
+                    action_buttons.append(btn_obj)
             if action_buttons:
                 container.add_item(discord.ui.Separator())
                 container.add_item(discord.ui.ActionRow(*action_buttons))
@@ -2128,8 +2124,18 @@ class RedisSubscriber:
                 sent_message = msg
                 logger.info(f"✅ Updated custom embed message {message_id} in channel {channel_id}")
             except (discord.NotFound, discord.HTTPException) as err:
-                logger.info(f"ℹ️ Message {message_id} not found/editable ({err}); posting fresh")
-                sent_message = None
+                err_str = str(err).lower()
+                if "emoji" in err_str or getattr(err, "code", None) in (50035, 40062):
+                    logger.warning(f"⚠️ Failed to edit with button emojis ({err}), retrying edit without emojis...")
+                    try:
+                        strip_button_emojis_from_view(view)
+                        await msg.edit(**edit_kwargs)
+                        sent_message = msg
+                    except Exception:
+                        sent_message = None
+                else:
+                    logger.info(f"ℹ️ Message {message_id} not found/editable ({err}); posting fresh")
+                    sent_message = None
 
         if sent_message is None:
             try:
@@ -2139,8 +2145,28 @@ class RedisSubscriber:
                 sent_message = await channel.send(**send_kwargs)
                 logger.info(f"✅ Posted fresh custom embed message {sent_message.id} in channel {channel_id}")
             except Exception as e:
-                logger.error(f"❌ Failed to send custom embed message in channel {channel_id}: {e}")
-                return
+                err_str = str(e).lower()
+                if "emoji" in err_str or getattr(e, "code", None) in (50035, 40062):
+                    logger.warning(f"⚠️ Failed to send with button emojis ({e}), retrying without emojis...")
+                    try:
+                        strip_button_emojis_from_view(view)
+                        send_kwargs = {"view": view}
+                        if banner_file:
+                            try:
+                                banner_file.fp.seek(0)
+                            except Exception:
+                                pass
+                            send_kwargs["files"] = [banner_file]
+                        sent_message = await channel.send(**send_kwargs)
+                        logger.info(
+                            f"✅ Posted custom embed without button emojis ({sent_message.id}) in channel {channel_id}"
+                        )
+                    except Exception as retry_err:
+                        logger.error(f"❌ Retry without emojis also failed in channel {channel_id}: {retry_err}")
+                        return
+                else:
+                    logger.error(f"❌ Failed to send custom embed message in channel {channel_id}: {e}")
+                    return
 
         # Record new message_id in discord_embed_configs in DB if it changed
         new_mid = str(sent_message.id)
