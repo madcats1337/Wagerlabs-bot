@@ -2,26 +2,31 @@
 Roobet Verify Panel - Interactive Discord panel for Roobet affiliate auto-verification.
 
 A user clicks the "Verify Roobet Account" button, enters their Roobet UID in a
-modal, and the bot checks that UID against the live affiliate stats
-(GET {roobet_affiliate_url} with the guild's roobet_api_key + roobet_user_id).
-If the UID appears, the user is auto-verified (raffle_shuffle_links,
+modal, and the bot asks Roobet whether that UID is referred by this guild's
+affiliate. If it is, the user is auto-verified (raffle_shuffle_links,
 platform='roobet', verified=TRUE) and granted `roobet_verified_role_id`.
 
 Modeled on howl_panel.py (the other UID-verified casino). Roobet-specific facts,
-all verified against the live endpoint:
+all verified against the live endpoints:
 
-- Auth is "Bearer <jwt>" — NOT the raw key Howl uses.
-- `userId` is the AFFILIATE's uuid and is a REQUIRED query param, distinct from
-  the per-player `uid` values in the response. A key alone cannot fetch.
-- Success is a BARE LIST; errors are HTTP 400 with {"code","message"}.
-- There is NO server-side filtering: `username`/`uid`/`limit` are silently
-  ignored and every call returns the full affiliate roster. So the UID match
-  happens here, and the roster is cached briefly to keep a burst of Verify
-  clicks from repeatedly pulling the whole list.
-- The lookup window is DELIBERATELY WIDE (not the current month like Howl's).
-  Roobet returns per-window totals, so a month-scoped query would make anyone
-  who hasn't wagered this month unverifiable — including a brand-new signup,
-  who is exactly the person most likely to be verifying.
+- Auth is "Bearer <jwt>" — NOT the raw key Howl uses. The same JWT works on both
+  hosts below.
+- Referral status comes from the Affiliate User Validation API
+  (ROOBET_VALIDATE_USER_URL) and is INDEPENDENT OF WAGERING. This is the
+  endpoint behind Roobet's own /Check Discord command. It answers
+  {"isAffiliate": bool}; an unknown uid is a 400, not isAffiliate:false.
+- The affiliate STATS API is a separate host and is only consulted afterwards,
+  to put a username on the link. It lists only players with wager activity in
+  the window, so a just-signed-up user is legitimately absent — the username is
+  then left blank rather than the verification failing. Verifying against the
+  roster (as this used to) made wagering a precondition for verifying at all.
+- Stats: `userId` is the AFFILIATE's uuid and is REQUIRED, distinct from the
+  per-player `uid` values in the response. Success is a BARE LIST; errors are
+  HTTP 400 with {"code","message"}. There is NO server-side filtering —
+  `username`/`uid`/`limit` are ignored and every call returns the full roster,
+  so it is cached briefly to absorb a burst of Verify clicks.
+- The stats lookup window is DELIBERATELY WIDE (not the current month like
+  Howl's), so the username lookup reaches players who wagered long ago.
 """
 
 import asyncio
@@ -109,6 +114,9 @@ logger = logging.getLogger(__name__)
 
 ACCENT_COLOR = 0xEEAF0E  # Roobet brand yellow (sampled from roobet-logo.svg)
 ROOBET_DEFAULT_STATS_URL = "https://roobetconnect.com/affiliate/v2/stats"
+# Referral check. A DIFFERENT host to the stats API above (roobet.com/_api, not
+# roobetconnect.com) — the same affiliate JWT authenticates both.
+ROOBET_VALIDATE_USER_URL = "https://roobet.com/_api/affiliate/validateUser"
 FALLBACK_EMOJI = "🦘"
 
 # Start of the lookup window. Roobet is windowed, so this has to reach back far
@@ -245,6 +253,68 @@ async def _fetch_roobet_affiliate_data(affiliate_url: str, api_key: str, affilia
         return None
 
 
+async def _validate_roobet_referral(api_key: str, affiliate_user_id: str, player_uid: str):
+    """Is `player_uid` referred by this affiliate? -> True / False / None (error).
+
+    Uses Roobet's Affiliate User Validation API, which answers referral status
+    DIRECTLY and is independent of wagering. This matters: the stats roster only
+    lists players with wager activity in the window, so a newly-referred viewer
+    who hasn't wagered yet is absent from it and could not verify. It is the same
+    endpoint Roobet's own Discord bot exposes as /Check.
+
+    Returns None (not False) on any transport or API error, so callers can tell
+    "definitely not referred" from "couldn't check" and avoid telling a
+    legitimate user they aren't referred because the API was down.
+
+    Observed contract (verified live):
+      200 {"isAffiliate": true|false}       - authoritative answer
+      400 {"code","message"}                - unknown/malformed uid, missing
+                                              params, or a uid that isn't a real
+                                              Roobet user ("Requesting User
+                                              Unknown")
+    """
+    if not api_key or not affiliate_user_id or not player_uid:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; WagerlabsBot/1.0; +https://wagerlabs.app)",
+    }
+    params = {"userId": player_uid, "affiliateId": affiliate_user_id}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(ROOBET_VALIDATE_USER_URL, headers=headers, params=params, timeout=30) as response:
+                if response.status == 400:
+                    # An unrecognised uid is reported this way rather than as
+                    # isAffiliate:false, so it IS a definitive "not ours".
+                    detail = ""
+                    try:
+                        body = await response.json(content_type=None)
+                        if isinstance(body, dict):
+                            detail = body.get("message") or body.get("code") or ""
+                    except Exception:
+                        pass
+                    logger.info(f"[Roobet] validateUser rejected uid {player_uid}: {detail}")
+                    return False
+                if response.status != 200:
+                    logger.error(f"[Roobet] validateUser returned status {response.status}")
+                    return None
+
+                body = await response.json(content_type=None)
+                if not isinstance(body, dict) or "isAffiliate" not in body:
+                    logger.error(f"[Roobet] Unexpected validateUser response: {str(body)[:200]}")
+                    return None
+                return bool(body.get("isAffiliate"))
+    except asyncio.TimeoutError:
+        logger.error("[Roobet] Timeout calling validateUser")
+        return None
+    except Exception as e:
+        logger.error(f"[Roobet] validateUser request failed: {e}")
+        return None
+
+
 def _describe_link(username, platform_uid):
     """Describe an existing Roobet link for the user."""
     name = (username or "").strip()
@@ -324,33 +394,40 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
 
     await interaction.response.defer(ephemeral=True, thinking=True)
 
-    data = await _fetch_roobet_affiliate_data(affiliate_url, api_key, str(affiliate_user_id).strip())
-    if data is None:
+    # Referral status comes from validateUser, NOT the stats roster: the roster
+    # only contains players who have wagered inside the window, so checking it
+    # would refuse anyone who signed up correctly but hasn't played yet.
+    is_referred = await _validate_roobet_referral(api_key, str(affiliate_user_id).strip(), entered)
+    if is_referred is None:
         await interaction.followup.send(
-            "❌ Couldn't reach the Roobet affiliate stats right now. Please try again later.",
+            "❌ Couldn't reach Roobet to check your account right now. Please try again later.",
             ephemeral=True,
         )
         return
 
-    matched = None
-    for row in data:
-        if str(row.get("userId")) == entered:
-            matched = row
-            break
-
-    if not matched:
+    if not is_referred:
         raw_code = (settings.get("roobet_campaign_code") if settings else "") or ""
         campaign_code = next((c.strip() for c in raw_code.split(",") if c.strip()), "")
         signup_hint = f"on code **{campaign_code}**" if campaign_code else "on our code"
         await interaction.followup.send(
-            f"❌ UID **{entered}** wasn't found in our Roobet affiliate stats. Make sure you signed up "
+            f"❌ UID **{entered}** isn't registered under our Roobet affiliate. Make sure you signed up "
             f"{signup_hint} on Roobet, then try again.",
             ephemeral=True,
         )
         return
 
-    matched_username = str(matched.get("username"))
-    matched_uid = str(matched.get("userId"))
+    # Referral confirmed. The roster is consulted only for a display username —
+    # validateUser returns a bare boolean. A user who hasn't wagered won't be
+    # there, so a miss is expected and must not fail the verification. The name
+    # is left EMPTY rather than filled with the uid (the column is a username,
+    # and _describe_link already renders "UID <x>" for a blank one).
+    matched_uid = entered
+    matched_username = ""
+    data = await _fetch_roobet_affiliate_data(affiliate_url, api_key, str(affiliate_user_id).strip())
+    for row in data or []:
+        if str(row.get("userId")) == entered and row.get("username"):
+            matched_username = str(row.get("username"))
+            break
 
     kick_name = None
     try:
@@ -391,7 +468,8 @@ async def verify_and_grant(interaction: discord.Interaction, engine, settings_ge
         role_note = await _grant_role(interaction, engine, guild, discord_id, guild_id, matched_username)
 
     await interaction.followup.send(
-        f"🎉 Verified! Your Roobet account **{matched_username}** is now linked.{role_note}",
+        f"🎉 Verified! Your Roobet account **{_describe_link(matched_username, matched_uid)}** "
+        f"is now linked.{role_note}",
         ephemeral=True,
     )
 
