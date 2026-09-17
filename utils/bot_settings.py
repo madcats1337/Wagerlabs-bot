@@ -23,6 +23,7 @@ _NEVER_CACHE_KEYS = frozenset(
     {
         "bot_api_key",
         "howl_api_key",
+        "roobet_api_key",
         "kick_oauth_token",
         "kick_access_token",
         "kick_refresh_token",
