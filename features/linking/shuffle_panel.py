@@ -33,6 +33,7 @@ from features.linking.panel_embed_config import (
     resolve_footer,
     resolve_title,
 )
+from raffle_system.reward_settings import is_active_wager_platform
 
 try:
     from discord import MediaGalleryItem
@@ -786,6 +787,17 @@ async def setup_shuffle_panel_system(bot, engine, settings_getter):
                         # The stored panel message was deleted in Discord; the DB row
                         # is a ghost. Re-post the panel (create_panel overwrites the
                         # stale message_id) so verification keeps working after a restart.
+                        #
+                        # ...unless the server has since switched wager platforms. The
+                        # panel row survives that switch, so re-posting blindly would
+                        # resurrect a panel the operator deliberately deleted, into a
+                        # channel they may have repurposed for the new platform.
+                        if not is_active_wager_platform(engine, guild_id, "shuffle", logger=logger):
+                            logger.info(
+                                f"[Shuffle] Stored panel message for guild {guild_id} is gone (404) but "
+                                f"Shuffle is no longer the selected wager platform; not re-posting."
+                            )
+                            continue
                         logger.warning(
                             f"[Shuffle] Stored panel message for guild {guild_id} is gone (404); re-posting."
                         )

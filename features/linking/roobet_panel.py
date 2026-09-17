@@ -48,6 +48,7 @@ from features.linking.panel_embed_config import (
     resolve_footer,
     resolve_title,
 )
+from raffle_system.reward_settings import is_active_wager_platform
 
 try:
     from discord import MediaGalleryItem
@@ -867,6 +868,15 @@ async def setup_roobet_panel_system(bot, engine, settings_getter):
                     try:
                         message = await channel.fetch_message(panel.panel_message_id)
                     except discord.NotFound:
+                        # Don't resurrect a panel the operator deleted after switching
+                        # the server to a different wager platform (the panel row
+                        # survives that switch).
+                        if not is_active_wager_platform(engine, guild_id, "roobet", logger=logger):
+                            logger.info(
+                                f"[Roobet] Stored panel message for guild {guild_id} is gone (404) but "
+                                f"Roobet is no longer the selected wager platform; not re-posting."
+                            )
+                            continue
                         logger.warning(f"[Roobet] Stored panel message for guild {guild_id} is gone (404); re-posting.")
                         if await panel.create_panel(channel):
                             logger.info(f"[Roobet] Re-posted missing panel for guild {guild_id}")

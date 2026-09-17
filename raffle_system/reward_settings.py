@@ -93,6 +93,37 @@ def platform_display_name_for_server(engine, server_id, default="Shuffle", logge
     return _PLATFORM_DISPLAY_NAMES.get(raw, raw.title())
 
 
+def is_active_wager_platform(engine, server_id, platform, default="shuffle", logger=None):
+    """True when `platform` is the server's selected `wager_platform_name`.
+
+    Used by the verify-panel setups to decide whether a panel for a given
+    affiliate still belongs to this server. A stale `panel_message_id` row
+    survives switching platforms, and the 404 recovery path in each panel
+    module would otherwise re-post a panel for a platform the server no longer
+    uses (a deleted Shuffle panel reappearing on a Roobet server, in the
+    channel the operator had repurposed for Roobet).
+
+    Fails OPEN (returns True) when the setting is unreadable or unset: the
+    pre-existing behaviour is to keep the panel working, and a transient DB
+    error must not silently strip a server's verification panel. Only an
+    explicit, successfully-read mismatch suppresses a re-post.
+    """
+    if engine is None:
+        return True
+    try:
+        with engine.connect() as conn:
+            raw = _get_setting_value(conn, "wager_platform_name", server_id)
+    except Exception as e:
+        if logger:
+            logger.warning(
+                f"Failed to read wager_platform_name for server {server_id}; "
+                f"assuming {platform} panel is still active: {e}"
+            )
+        return True
+    active = (raw or "").strip().lower() or default
+    return active == str(platform).strip().lower()
+
+
 def platform_campaign_code(settings):
     """Return the campaign/affiliate code for the server's ACTIVE wager platform.
 
