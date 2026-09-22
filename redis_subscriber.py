@@ -2294,10 +2294,12 @@ class RedisSubscriber:
                     # only then the guild's raffle channel.
                     channel = None
                     if policy["discord"]:
-                        # The giveaway's own channel is only consulted directly
-                        # when no channel is configured for started
-                        # announcements; resolve_announce_channel applies the
-                        # same order itself and covers every other case.
+                        # Only reached by chat giveaways — Discord-hosted ones
+                        # returned above after posting their panel. The
+                        # giveaway's own channel is consulted directly only when
+                        # nothing is configured for started announcements;
+                        # resolve_announce_channel applies the same order itself
+                        # and covers every other case.
                         if not policy["channel_id"] and discord_channel_id:
                             channel = self.bot.get_channel(int(discord_channel_id))
                         if channel is None:
@@ -2510,10 +2512,12 @@ class RedisSubscriber:
 
                 policy = announce_settings(engine, guild_id, "winner")
 
-                # The channel configured for winner announcements wins. Failing
-                # that, the payload's channel, then the giveaway's OWN channel
-                # (where the panel and the entrants are), and only then the
-                # guild's raffle channel.
+                # resolve_announce_channel owns the ordering (configured channel,
+                # the giveaway's own channel, then the raffle channel) AND the
+                # Discord-hosted override, so it is asked first whenever this
+                # server has configured a channel. The payload's channel is only
+                # consulted when there is no configured one, as a hint that saves
+                # a lookup.
                 channel = None
                 if policy["discord"]:
                     if not policy["channel_id"] and discord_channel_id:

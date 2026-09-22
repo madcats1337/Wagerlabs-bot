@@ -417,18 +417,29 @@ async def resolve_announce_channel(bot, engine, guild_id, giveaway_id=None, kind
     The raffle channel is a LAST resort rather than the default it used to be:
     operators keep that channel for raffles, and giveaway announcements landing
     there was the complaint this configuration exists to answer.
+
+    ONE EXCEPTION, and it is the important one: a DISCORD-HOSTED giveaway always
+    announces in its own channel, overriding the configured one. That channel is
+    not an announcement preference — it is where the join panel was posted, so it
+    is where the entrants are and where the panel is edited to show the winners.
+    Sending the announcement elsewhere would split the two halves of the same
+    giveaway across channels and leave the people who actually entered watching a
+    panel that never names a winner. Chat giveaways (keyword/active_chatter) have
+    no such anchor, so the configured channel applies to them normally.
     """
     channel_id = announce_settings(engine, guild_id, kind)["channel_id"]
 
-    if not channel_id and giveaway_id is not None:
+    if giveaway_id is not None:
         try:
             with engine.connect() as conn:
                 row = conn.execute(
-                    text("SELECT discord_channel_id FROM giveaways WHERE id = :gid"),
+                    text("SELECT discord_channel_id, entry_method FROM giveaways WHERE id = :gid"),
                     {"gid": giveaway_id},
                 ).fetchone()
-            if row and row[0]:
-                channel_id = int(row[0])
+            own_channel, entry_method = (row[0], row[1]) if row else (None, None)
+            # Discord-hosted wins outright; otherwise it is only the fallback.
+            if own_channel and ((entry_method or "") == "discord" or not channel_id):
+                channel_id = int(own_channel)
         except Exception as e:
             logger.debug(f"[giveaway] could not read giveaway channel: {e}")
 
