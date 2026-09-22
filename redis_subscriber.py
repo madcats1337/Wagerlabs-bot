@@ -2283,59 +2283,66 @@ class RedisSubscriber:
                         logger.info(f"✅ Giveaway {giveaway_id} started (Discord-hosted): {giveaway_title}")
                         return
 
-                    # Announce in Discord.
-                    announcement_channel_id = discord_channel_id
+                    # What this server wants announced, and where. Read fresh so
+                    # a dashboard toggle applies to the very next giveaway.
+                    from features.giveaway.giveaway_panel import announce_settings, resolve_announce_channel
 
-                    if not announcement_channel_id:
-                        # Fallback to guild settings if no specific channel is set
-                        guild_settings = None
-                        if hasattr(self.bot, "get_guild_settings"):
-                            try:
-                                guild_settings = self.bot.get_guild_settings(guild_id)
-                            except Exception:
-                                guild_settings = None
-                        if guild_settings is None:
-                            guild_settings = getattr(self.bot, "settings_manager", None)
-                        if guild_settings is not None:
-                            announcement_channel_id = getattr(guild_settings, "raffle_announcement_channel_id", None)
+                    policy = announce_settings(engine, guild_id, "started")
 
-                    if announcement_channel_id:
-                        channel = self.bot.get_channel(announcement_channel_id)
-                        if channel:
-                            import discord
+                    # Announce in Discord — the channel configured for started
+                    # announcements first, then this giveaway's own channel, and
+                    # only then the guild's raffle channel.
+                    channel = None
+                    if policy["discord"]:
+                        # The giveaway's own channel is only consulted directly
+                        # when no channel is configured for started
+                        # announcements; resolve_announce_channel applies the
+                        # same order itself and covers every other case.
+                        if not policy["channel_id"] and discord_channel_id:
+                            channel = self.bot.get_channel(int(discord_channel_id))
+                        if channel is None:
+                            channel = await resolve_announce_channel(
+                                self.bot, engine, guild_id, giveaway_id, kind="started"
+                            )
+                    else:
+                        logger.info(f"[giveaway] start Discord announcement disabled for guild {guild_id}")
 
-                            embed = discord.Embed(
-                                title="🎁 New Giveaway Started!", description=giveaway_title, color=0x00FF00
+                    if channel:
+                        import discord
+
+                        embed = discord.Embed(
+                            title="🎁 New Giveaway Started!", description=giveaway_title, color=0x00FF00
+                        )
+
+                        if entry_method == "keyword":
+                            keyword = started_giveaway.get("keyword", "")
+                            embed.add_field(name="How to Enter", value=f"Type `{keyword}` in Kick chat!", inline=False)
+                        elif entry_method == "active_chatter":
+                            messages_required = started_giveaway.get("messages_required", 10)
+                            time_window = started_giveaway.get("time_window_minutes", 10)
+                            embed.add_field(
+                                name="How to Enter",
+                                value=f"Send {messages_required} unique messages in {time_window} minutes in Kick chat!",
+                                inline=False,
                             )
 
-                            if entry_method == "keyword":
-                                keyword = started_giveaway.get("keyword", "")
-                                embed.add_field(
-                                    name="How to Enter", value=f"Type `{keyword}` in Kick chat!", inline=False
-                                )
-                            elif entry_method == "active_chatter":
-                                messages_required = started_giveaway.get("messages_required", 10)
-                                time_window = started_giveaway.get("time_window_minutes", 10)
-                                embed.add_field(
-                                    name="How to Enter",
-                                    value=f"Send {messages_required} unique messages in {time_window} minutes in Kick chat!",
-                                    inline=False,
-                                )
+                        allow_multiple = started_giveaway.get("allow_multiple_entries", False)
+                        if allow_multiple:
+                            max_entries = started_giveaway.get("max_entries_per_user", 5)
+                            embed.add_field(
+                                name="Multiple Entries",
+                                value=f"You can enter up to {max_entries} times!",
+                                inline=False,
+                            )
 
-                            allow_multiple = started_giveaway.get("allow_multiple_entries", False)
-                            if allow_multiple:
-                                max_entries = started_giveaway.get("max_entries_per_user", 5)
-                                embed.add_field(
-                                    name="Multiple Entries",
-                                    value=f"You can enter up to {max_entries} times!",
-                                    inline=False,
-                                )
+                        await channel.send(embed=embed)
+                        logger.info(f"✅ Announced giveaway start in Discord")
 
-                            await channel.send(embed=embed)
-                            logger.info(f"✅ Announced giveaway start in Discord")
-
-                    # Announce in Kick chat
-                    if self.send_message_callback:
+                    # Announce in stream chat (Kick/Twitch), unless the server
+                    # turned started announcements off for chat.
+                    if not policy["chat"]:
+                        logger.info(f"[giveaway] start chat announcement disabled for guild {guild_id}")
+                    elif self.send_message_callback:
                         if entry_method == "keyword":
                             keyword = started_giveaway.get("keyword", "")
                             message = f"🎁 GIVEAWAY STARTED: {giveaway_title} | Type {keyword} to enter!"
@@ -2403,11 +2410,17 @@ class RedisSubscriber:
                     logger.debug(f"[giveaway] panel close-out skipped: {panel_error}")
 
                 # Post whoever was drawn, since the held announcement never fired.
-                if drawn_winners:
+                # Same winner-announcement policy as a normal draw — stopping a
+                # giveaway must not route around a disabled announcement.
+                from features.giveaway.giveaway_panel import announce_settings as _announce_settings
+
+                stop_policy = _announce_settings(engine, guild_id, "winner")
+
+                if drawn_winners and stop_policy["discord"]:
                     try:
                         from features.giveaway.giveaway_panel import resolve_announce_channel, winner_label
 
-                        channel = await resolve_announce_channel(self.bot, engine, guild_id, giveaway_id)
+                        channel = await resolve_announce_channel(self.bot, engine, guild_id, giveaway_id, kind="winner")
                         if channel:
                             import discord
 
@@ -2434,10 +2447,14 @@ class RedisSubscriber:
                 logger.info(f"✅ Giveaway {giveaway_id} stopped")
 
                 # Announce in stream chat — skipped for Discord-hosted giveaways
-                # (their entrants are Discord members, not stream chatters).
+                # (their entrants are Discord members, not stream chatters), and
+                # skipped when the server turned giveaway chat announcements off:
+                # this notice rides along with the held winner announcement above.
                 from features.giveaway.giveaway_panel import is_discord_hosted as _is_dh
 
-                if self.send_message_callback and not _is_dh(engine, giveaway_id):
+                if not stop_policy["chat"]:
+                    logger.info(f"[giveaway] stop chat announcement disabled for guild {guild_id}")
+                elif self.send_message_callback and not _is_dh(engine, giveaway_id):
                     await self.announce_in_chat("Giveaway has been stopped by moderators.", guild_id=guild_id)
 
             elif action == "giveaway_winner":
@@ -2487,18 +2504,24 @@ class RedisSubscriber:
                 except Exception as panel_error:
                     logger.debug(f"[giveaway] panel winner update skipped: {panel_error}")
 
-                # Announce in the giveaway's OWN channel — the one chosen when it
-                # was created — so the announcement lands where the panel and the
-                # entrants are. The payload's channel wins when present;
-                # otherwise resolve_announce_channel reads it off the giveaway
-                # row and only then falls back to the guild's raffle channel.
-                from features.giveaway.giveaway_panel import resolve_announce_channel
+                # Where this server wants winners announced, read fresh so a
+                # dashboard change applies to the very next draw.
+                from features.giveaway.giveaway_panel import announce_settings, resolve_announce_channel
 
+                policy = announce_settings(engine, guild_id, "winner")
+
+                # The channel configured for winner announcements wins. Failing
+                # that, the payload's channel, then the giveaway's OWN channel
+                # (where the panel and the entrants are), and only then the
+                # guild's raffle channel.
                 channel = None
-                if discord_channel_id:
-                    channel = self.bot.get_channel(int(discord_channel_id))
-                if channel is None:
-                    channel = await resolve_announce_channel(self.bot, engine, guild_id, giveaway_id)
+                if policy["discord"]:
+                    if not policy["channel_id"] and discord_channel_id:
+                        channel = self.bot.get_channel(int(discord_channel_id))
+                    if channel is None:
+                        channel = await resolve_announce_channel(self.bot, engine, guild_id, giveaway_id, kind="winner")
+                else:
+                    logger.info(f"[giveaway] winner Discord announcement disabled for guild {guild_id}")
 
                 # Every winner drawn for this giveaway, oldest first. Falls back
                 # to the single winner from the payload when the dashboard did
@@ -2570,7 +2593,9 @@ class RedisSubscriber:
                 # noise to an audience that could not have entered.
                 from features.giveaway.giveaway_panel import is_discord_hosted
 
-                if self.send_message_callback and not is_discord_hosted(engine, giveaway_id):
+                if not policy["chat"]:
+                    logger.info(f"[giveaway] winner chat announcement disabled for guild {guild_id}")
+                elif self.send_message_callback and not is_discord_hosted(engine, giveaway_id):
                     # Plain names: a <@id> mention renders as raw text in chat.
                     plain = ", ".join(str(w.get("name") or "") for w in all_winners)
                     message = f"GIVEAWAY WINNER{'S' if plural else ''}: {plain} won {giveaway_title}!"

@@ -323,16 +323,104 @@ def is_discord_hosted(engine, giveaway_id) -> bool:
         return False
 
 
-async def resolve_announce_channel(bot, engine, guild_id, giveaway_id=None):
-    """Where a giveaway's winners should be announced.
+# The announcement settings, keyed by which announcement is being sent. Both
+# kinds have the same shape — a Discord toggle, a stream-chat toggle and a
+# Discord channel — so one reader serves both.
+_ANNOUNCE_KEYS = {
+    "winner": {
+        "discord": "giveaway_winner_announce_discord_enabled",
+        "chat": "giveaway_winner_announce_chat_enabled",
+        "channel": "giveaway_winner_announce_channel_id",
+    },
+    "started": {
+        "discord": "giveaway_started_announce_discord_enabled",
+        "chat": "giveaway_started_announce_chat_enabled",
+        "channel": "giveaway_started_announce_channel_id",
+    },
+}
 
-    The giveaway's OWN channel first — the one chosen when it was created — so
-    the announcement lands where the panel and the entrants are. Falls back to
-    the guild's raffle announcement channel only when the giveaway has none
-    (chat-only giveaways never set one).
+# Last successfully-read announcement settings per (guild, kind). Read FRESH on
+# every announcement so a dashboard toggle takes effect on the next draw rather
+# than after a bot restart; this cache is the DB-FAILURE fallback only.
+_announce_cache: dict[tuple, dict] = {}
+
+
+def announce_settings(engine, guild_id, kind):
+    """This server's announcement policy for `kind` ("winner" or "started").
+
+    Returns {discord: bool, chat: bool, channel_id: int|None}.
+
+    Both toggles default to ON when unset, so a server that never opens the
+    Announcements tab keeps announcing exactly as it did before the toggles
+    existed. `channel_id` defaults to None, which leaves the caller on its
+    existing per-giveaway channel resolution.
+
+    On a DB error the last known policy is replayed, and only a guild whose
+    settings were never read falls back to the defaults — the same
+    fail-to-last-known shape as `_entry_rules`, for the same reason: a blip
+    must not silently start posting where the operator turned announcements
+    off.
     """
-    channel_id = None
-    if giveaway_id is not None:
+    keys = _ANNOUNCE_KEYS[kind]
+    result = {"discord": True, "chat": True, "channel_id": None}
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT key, value FROM bot_settings
+                    WHERE discord_server_id = :sid AND key IN (:k_discord, :k_chat, :k_channel)
+                    """
+                ),
+                # bot_settings.discord_server_id is BIGINT — bind an int, the
+                # same way the dashboard writes it.
+                {
+                    "sid": int(guild_id),
+                    "k_discord": keys["discord"],
+                    "k_chat": keys["chat"],
+                    "k_channel": keys["channel"],
+                },
+            ).fetchall()
+    except Exception as e:
+        cached = _announce_cache.get((int(guild_id), kind))
+        logger.error(
+            f"[giveaway] announce-settings lookup failed for {guild_id}/{kind}: {e} — "
+            f"{'replaying last known settings' if cached else 'no cached settings, announcing'}"
+        )
+        return dict(cached) if cached else result
+
+    for key, value in rows:
+        raw = (value or "").strip()
+        if not raw:
+            continue  # blank = unset = keep the default
+        if key == keys["channel"]:
+            try:
+                result["channel_id"] = int(raw)
+            except (TypeError, ValueError):
+                pass  # malformed id: fall back to the giveaway's own channel
+        else:
+            field = "discord" if key == keys["discord"] else "chat"
+            result[field] = raw.lower() in ("true", "1", "yes", "on")
+
+    _announce_cache[(int(guild_id), kind)] = dict(result)
+    return result
+
+
+async def resolve_announce_channel(bot, engine, guild_id, giveaway_id=None, kind="winner"):
+    """Where a giveaway announcement of `kind` should be posted.
+
+    Order: the channel configured for this announcement type on the dashboard,
+    then the giveaway's OWN channel (the one chosen when it was created, so the
+    announcement lands where the panel and the entrants are), and only then the
+    guild's raffle announcement channel.
+
+    The raffle channel is a LAST resort rather than the default it used to be:
+    operators keep that channel for raffles, and giveaway announcements landing
+    there was the complaint this configuration exists to answer.
+    """
+    channel_id = announce_settings(engine, guild_id, kind)["channel_id"]
+
+    if not channel_id and giveaway_id is not None:
         try:
             with engine.connect() as conn:
                 row = conn.execute(

@@ -3101,7 +3101,15 @@ def _start_giveaway_expiry_loop(bot, engine):
                         continue
 
                     # Mentions ping the winners; the fallback is their name.
-                    from features.giveaway.giveaway_panel import resolve_announce_channel, winner_label
+                    from features.giveaway.giveaway_panel import (
+                        announce_settings,
+                        resolve_announce_channel,
+                        winner_label,
+                    )
+
+                    # An expiring timer draws the same winners a manual draw
+                    # would, so it announces under the same per-server policy.
+                    policy = announce_settings(engine, guild_id, "winner")
 
                     # Terminal panel listing every winner.
                     try:
@@ -3122,8 +3130,13 @@ def _start_giveaway_expiry_loop(bot, engine):
                     # ONE announcement listing all winners, not N messages.
                     names = ", ".join(winner_label(w) for w in winners)
                     try:
-                        # The giveaway's OWN channel, not the shared raffle one.
-                        channel = await resolve_announce_channel(bot, engine, guild_id, giveaway_id)
+                        # The channel configured for winner announcements, then
+                        # the giveaway's OWN channel — not the shared raffle one.
+                        channel = (
+                            await resolve_announce_channel(bot, engine, guild_id, giveaway_id, kind="winner")
+                            if policy["discord"]
+                            else None
+                        )
                         if channel:
                             embed = discord.Embed(
                                 title="Giveaway Winner" if len(winners) == 1 else "Giveaway Winners",
@@ -3144,7 +3157,7 @@ def _start_giveaway_expiry_loop(bot, engine):
                     try:
                         from features.giveaway.giveaway_panel import is_discord_hosted
 
-                        if not is_discord_hosted(engine, giveaway_id):
+                        if policy["chat"] and not is_discord_hosted(engine, giveaway_id):
                             plain = ", ".join(
                                 (w.get("display") or w.get("winner") or "") if isinstance(w, dict) else str(w)
                                 for w in winners
