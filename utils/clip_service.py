@@ -165,6 +165,9 @@ class StreamBuffer:
         self.buffer_minutes = buffer_minutes
         self.segment_duration = 10  # seconds per segment
         self.max_segments = (buffer_minutes * 60) // self.segment_duration
+        # The longest clip plus the one segment of slack _create_clip trims
+        # from. Anything older can never end up in a clip, so it is deleted.
+        self.retained_segments = self.max_segments + 1
 
         self.ffmpeg_process: Optional[asyncio.subprocess.Process] = None
         self.is_recording = False
@@ -521,6 +524,7 @@ class StreamBuffer:
 
                     traceback.print_exc()
 
+                self._prune_segments()
                 await asyncio.sleep(10)
 
         except asyncio.CancelledError:
@@ -532,6 +536,42 @@ class StreamBuffer:
             traceback.print_exc()
         finally:
             logger.info(f"[Buffer] Monitor task exiting for {self.channel_name}")
+
+    def _prune_segments(self):
+        """Delete segments older than the longest clip the buffer can serve.
+
+        FFmpeg never removes segments itself, so without this the buffer holds
+        the whole stream on disk. The list stays append-only (it is read by the
+        cutter and the status report); only the .ts files are removed.
+        """
+        if self._clip_create_lock.locked():
+            # A cut in progress may still open segments it listed earlier.
+            return
+        try:
+            with open(self.segment_list_file, "r") as f:
+                listed = [line.strip() for line in f if line.strip()]
+        except OSError:
+            return
+        if len(listed) <= self.retained_segments:
+            return
+
+        prefix = f"seg_{self.channel_name}_"
+
+        def index_of(name: str) -> Optional[int]:
+            # Exact-prefix match: channel "foo" must not touch "foo_bar"'s files.
+            number = name[len(prefix) : -len(".ts")] if name.startswith(prefix) and name.endswith(".ts") else ""
+            return int(number) if number.isdigit() else None
+
+        oldest_kept = index_of(listed[-self.retained_segments])
+        if oldest_kept is None:
+            return
+        for path in BUFFER_DIR.glob(f"{prefix}*.ts"):
+            index = index_of(path.name)
+            if index is not None and index < oldest_kept:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as e:
+                    logger.warning(f"[Buffer] Could not prune {path.name}: {e}")
 
     async def _cleanup_buffer(self):
         """Remove old buffer files for this channel."""
@@ -564,8 +604,10 @@ class StreamBuffer:
         except Exception:
             return []
 
-        # Calculate how many segments we need
-        num_segments = (duration_seconds // self.segment_duration) + 1
+        # Enough whole segments to cover the request plus one of slack, since
+        # stream-copied segments split on keyframes and can run slightly short.
+        # _create_clip trims the surplus so the clip is exactly duration_seconds.
+        num_segments = -(-duration_seconds // self.segment_duration) + 1
         num_segments = min(num_segments, len(segments))
 
         # Get the last N segments
@@ -621,7 +663,23 @@ class StreamBuffer:
             logger.info(f"[Buffer] No segments available for clip")
             return {"error": "no_segments", "message": "No buffer data available yet - try again in 30 seconds"}
 
-        logger.info(f"[Buffer] Creating clip from {len(segments)} segments ({duration}s requested)")
+        # Keep only the newest segments that cover the request, then seek past
+        # the surplus at the start so the clip is the last `duration` seconds.
+        lengths = await asyncio.gather(*(self._segment_length(seg) for seg in segments))
+        covered = 0.0
+        keep = 0
+        for length in reversed(lengths):
+            if covered >= duration:
+                break
+            covered += length
+            keep += 1
+        segments = segments[-keep:]
+        trim_start = max(0.0, covered - duration)
+
+        logger.info(
+            f"[Buffer] Creating clip from {len(segments)} segments "
+            f"({duration}s requested, trimming {trim_start:.2f}s from start)"
+        )
 
         # Generate clip filename with sanitized title
         # Include microseconds because the remux path can finish multiple saves
@@ -655,6 +713,8 @@ class StreamBuffer:
             cmd = [
                 "ffmpeg",
                 "-y",
+                "-ss",
+                f"{trim_start:.3f}",
                 "-f",
                 "concat",
                 "-safe",
@@ -716,7 +776,7 @@ class StreamBuffer:
                 return {"error": "file_error", "message": "Clip file was not created"}
 
             file_size = output_path.stat().st_size
-            actual_duration = len(segments) * self.segment_duration
+            actual_duration = round(min(covered, duration))
             media_details = await self._probe_clip_details(
                 output_path,
                 file_size=file_size,
@@ -754,6 +814,34 @@ class StreamBuffer:
             return {"error": "exception", "message": str(e)}
         finally:
             concat_file.unlink(missing_ok=True)
+
+    async def _segment_length(self, path: Path) -> float:
+        """A buffer segment's real length in seconds, or the nominal length if ffprobe fails."""
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                str(path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                raise
+            length = float(stdout.decode().strip())
+            if process.returncode == 0 and length > 0:
+                return length
+        except (asyncio.TimeoutError, FileNotFoundError, ValueError, OSError):
+            pass
+        return float(self.segment_duration)
 
     async def _probe_clip_details(self, path: Path, *, file_size: int, duration: int) -> Dict[str, Any]:
         """Read display metadata without delaying the save if ffprobe is unavailable."""
@@ -812,26 +900,21 @@ class StreamBuffer:
         try:
             with open(self.segment_list_file, "r") as f:
                 segments = [line.strip() for line in f if line.strip()]
-            return len(segments)
+            # Older list entries point at pruned files.
+            return min(len(segments), self.retained_segments)
         except Exception:
             return 0
 
     def get_status(self) -> Dict[str, Any]:
         """Get current buffer status."""
-        segments = []
-        if self.segment_list_file.exists():
-            try:
-                with open(self.segment_list_file, "r") as f:
-                    segments = [line.strip() for line in f if line.strip()]
-            except:
-                pass
+        segment_count = self.get_segment_count()
 
         return {
             "channel": self.channel_name,
             "is_recording": self.is_recording,
             "buffer_minutes": self.buffer_minutes,
-            "segments_count": len(segments),
-            "buffer_seconds": len(segments) * self.segment_duration,
+            "segments_count": segment_count,
+            "buffer_seconds": segment_count * self.segment_duration,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "input_width": self.input_width,
             "input_height": self.input_height,
