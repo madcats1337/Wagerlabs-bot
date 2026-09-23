@@ -16,6 +16,16 @@ from utils.log_context import set_server
 
 logger = logging.getLogger(__name__)
 
+# Minimum minutes between any two timed messages for a server (dashboard:
+# Bot Commands -> Timed Messages). Default + bounds mirrored in the dashboard's
+# routes/api_timed_messages.py.
+MIN_GAP_SETTING_KEY = "timed_messages_min_gap_minutes"
+DEFAULT_MIN_GAP_MINUTES = 2
+MIN_GAP_BOUNDS = (1, 60)
+# The check loop ticks every ~60s; without slack a tick landing a hair early
+# would push a message back a whole extra minute.
+_TICK_SLACK = timedelta(seconds=5)
+
 
 class TimedMessage:
     """Represents a timed message"""
@@ -357,6 +367,28 @@ class TimedMessagesManager:
         self._load_messages()
         logger.info(f"Reloaded {len(self.messages)} timed messages from database")
 
+    def _get_min_gap(self) -> timedelta:
+        """Read the per-server minimum gap fresh from bot_settings (dashboard edits apply next tick)."""
+        gap = DEFAULT_MIN_GAP_MINUTES
+        if self.engine and self.guild_id is not None:
+            try:
+                with self.engine.connect() as conn:
+                    row = conn.execute(
+                        text(
+                            """
+                        SELECT value FROM bot_settings
+                        WHERE key = :key AND discord_server_id = :guild_id
+                    """
+                        ),
+                        {"key": MIN_GAP_SETTING_KEY, "guild_id": int(self.guild_id)},
+                    ).fetchone()
+                if row and row[0] is not None:
+                    gap = int(row[0])
+            except Exception as e:
+                logger.debug(f"[Timed Messages] min gap read failed, using default: {e}")
+        lo, hi = MIN_GAP_BOUNDS
+        return timedelta(minutes=max(lo, min(hi, gap)))
+
     def list_messages(self) -> List[TimedMessage]:
         """Get all timed messages"""
         return list(self.messages.values())
@@ -404,57 +436,73 @@ class TimedMessagesManager:
 
         now = datetime.utcnow()
 
+        # Collect every enabled message whose interval has elapsed.
+        due = []
         for msg in self.messages.values():
             if not msg.enabled:
                 continue
-
-            # Check if it's time to send
             if msg.last_sent is None:
-                should_send = True
-            else:
-                time_since_last = now - msg.last_sent
-                should_send = time_since_last >= timedelta(minutes=msg.interval_minutes)
+                due.append((datetime.min, msg.message_id, msg))
+            elif now - msg.last_sent >= timedelta(minutes=msg.interval_minutes):
+                due.append((msg.last_sent + timedelta(minutes=msg.interval_minutes), msg.message_id, msg))
+        if not due:
+            return
 
-            if should_send:
-                try:
-                    # Send the message with guild_id for proper routing
-                    await self.kick_send_callback(msg.message, guild_id=self.guild_id)
-                    logger.info(
-                        f"[Guild {self.guild_id}] Sent timed message #{msg.message_id}: {msg.message[:50]}... ({active_chatters_count} active chatters)"
-                    )
+        # Send at most ONE timed message per tick, and only once the server's
+        # minimum gap has passed since the last one. Timers whose intervals line
+        # up (or that all came due while chat was quiet) would otherwise post in
+        # the same minute. Whatever isn't sent stays due and goes out on a later
+        # tick, most overdue first, so every timer still gets its turn.
+        last_any = max((m.last_sent for m in self.messages.values() if m.last_sent), default=None)
+        if last_any is not None and now - last_any < self._get_min_gap() - _TICK_SLACK:
+            return
 
-                    # Update last_sent timestamp
-                    if self.engine:
-                        with self.engine.begin() as conn:
-                            # Update with discord_server_id filter for multiserver isolation
-                            if self.guild_id is not None:
-                                conn.execute(
-                                    text(
-                                        """
-                                    UPDATE timed_messages
-                                    SET last_sent = CURRENT_TIMESTAMP
-                                    WHERE id = :id AND (discord_server_id = :guild_id OR discord_server_id IS NULL)
+        _, _, msg = min(due, key=lambda d: (d[0], d[1]))
+        try:
+            # Send the message with guild_id for proper routing
+            await self.kick_send_callback(msg.message, guild_id=self.guild_id)
+            logger.info(
+                f"[Guild {self.guild_id}] Sent timed message #{msg.message_id}: {msg.message[:50]}... ({active_chatters_count} active chatters, {len(due) - 1} more due)"
+            )
+
+            # Update last_sent timestamp. Written from the same clock the
+            # interval/gap checks read (utcnow at tick start), not the DB's
+            # CURRENT_TIMESTAMP, so the math stays consistent across reloads.
+            if self.engine:
+                with self.engine.begin() as conn:
+                    # Update with discord_server_id filter for multiserver isolation
+                    if self.guild_id is not None:
+                        conn.execute(
+                            text(
                                 """
-                                    ),
-                                    {"id": msg.message_id, "guild_id": str(self.guild_id)},
-                                )
-                            else:
-                                conn.execute(
-                                    text(
-                                        """
-                                    UPDATE timed_messages
-                                    SET last_sent = CURRENT_TIMESTAMP
-                                    WHERE id = :id
+                            UPDATE timed_messages
+                            SET last_sent = :now
+                            WHERE id = :id AND (discord_server_id = :guild_id OR discord_server_id IS NULL)
+                        """
+                            ),
+                            {"now": now, "id": msg.message_id, "guild_id": str(self.guild_id)},
+                        )
+                    else:
+                        conn.execute(
+                            text(
                                 """
-                                    ),
-                                    {"id": msg.message_id},
-                                )
+                            UPDATE timed_messages
+                            SET last_sent = :now
+                            WHERE id = :id
+                        """
+                            ),
+                            {"now": now, "id": msg.message_id},
+                        )
 
-                        # Update in memory
-                        msg.last_sent = now
+                # Update in memory
+                msg.last_sent = now
 
-                except Exception as e:
-                    logger.error(f"Failed to send timed message #{msg.message_id}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to send timed message #{msg.message_id}: {e}")
+            # Count the attempt in memory only (retried after its interval, or
+            # sooner on restart). Otherwise a message that always fails stays the
+            # most overdue and blocks every other timer behind it.
+            msg.last_sent = now
 
 
 class TimedMessagesCommands(commands.Cog):
