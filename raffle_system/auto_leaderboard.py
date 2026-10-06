@@ -12,7 +12,7 @@ from discord.ext import tasks
 from sqlalchemy import text
 
 from .config import AUTO_LEADERBOARD_UPDATE_INTERVAL
-from .reward_settings import platform_display_name, platform_display_name_for_server
+from .reward_settings import get_ticket_source_switches, platform_display_name, platform_display_name_for_server
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +155,10 @@ class AutoLeaderboard:
                 except Exception:
                     pass
 
+            # Which sources earn tickets (Raffle Management switches), so the
+            # embed never advertises one that's switched off.
+            switches = get_ticket_source_switches(self.engine, self.server_id, logger)
+
             # Embed heading: prefix the configured raffle title when present.
             embed_title = f"🎟️ {raffle_title}" if raffle_title else "🎟️ Raffle Ticket Leaderboard"
 
@@ -177,6 +181,20 @@ class AutoLeaderboard:
                 time_msg = f"{days_until_start} days" if days_until_start > 0 else f"{hours_until_start} hours"
 
                 prize_line = f"🏆 **Prize:** {raffle_prize}\n" if raffle_prize else ""
+                ways = [
+                    way
+                    for way, on in (
+                        ("watching streams", switches["watchtime"]),
+                        ("gifting subs", switches["gifted_sub"]),
+                        (f"wagering on {platform}", switches["shuffle_wager"]),
+                    )
+                    if on
+                ]
+                if len(ways) > 2:
+                    phrase = f"{', '.join(ways[:-1])}, and {ways[-1]}"
+                else:
+                    phrase = " and ".join(ways)
+                get_ready = f"Get ready to earn tickets by {phrase}!" if ways else "Get ready for the raffle!"
                 not_started = discord.Embed(
                     title=embed_title,
                     description=(
@@ -185,7 +203,7 @@ class AutoLeaderboard:
                         f"📅 **Starts:** {start_date.strftime('%b %d, %Y at %I:%M %p')}\n"
                         f"📅 **Ends:** {end_date.strftime('%b %d, %Y at %I:%M %p')}\n\n"
                         f"⏳ **Time until start:** {time_msg}\n\n"
-                        f"Get ready to earn tickets by watching streams, gifting subs, and wagering on {platform}!"
+                        f"{get_ready}"
                     ),
                     color=discord.Color.blue(),
                 )
@@ -282,16 +300,19 @@ class AutoLeaderboard:
                     f"[Auto-Leaderboard] Using defaults: {watchtime_tickets}, {gifted_sub_tickets}, {wager_tickets}"
                 )
 
-            # Add how to earn tickets section with dynamic values from settings
+            # Add how to earn tickets section with dynamic values from settings,
+            # listing only the sources that are switched on.
+            earn_lines = []
+            if switches["watchtime"]:
+                earn_lines.append(f"⏱️ **Watch Streams** - {watchtime_tickets} tickets per hour")
+            if switches["gifted_sub"]:
+                earn_lines.append(f"🎁 **Gift Subs** - {gifted_sub_tickets} tickets per sub")
+            if switches["shuffle_wager"]:
+                earn_lines.append(f"🎲 **{platform} Wagers** - {wager_tickets} tickets per $1000 wagered")
+            earn_lines.append("⭐ **Bonus** - Admin awarded for events")
             embed.add_field(
                 name="📋 How to Earn Tickets",
-                value=(
-                    f"⏱️ **Watch Streams** - {watchtime_tickets} tickets per hour\n"
-                    f"🎁 **Gift Subs** - {gifted_sub_tickets} tickets per sub\n"
-                    f"🎲 **{platform} Wagers** - {wager_tickets} tickets per $1000 wagered\n"
-                    "⭐ **Bonus** - Admin awarded for events\n\n"
-                    "Use `!tickets` to check your balance!"
-                ),
+                value="\n".join(earn_lines) + "\n\nUse `!tickets` to check your balance!",
                 inline=False,
             )
 

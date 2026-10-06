@@ -13,7 +13,12 @@ from utils.log_context import set_server
 
 from .database import create_new_period, get_current_period
 from .draw import RaffleDraw
-from .reward_settings import get_ticket_reward_settings, platform_campaign_code, platform_display_name
+from .reward_settings import (
+    get_ticket_reward_settings,
+    get_ticket_source_switches,
+    platform_campaign_code,
+    platform_display_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -695,16 +700,28 @@ Please contact an admin to claim your prize! 🎊
             except Exception:
                 pass
 
+            # Only the sources switched on in Raffle Management.
+            switches = get_ticket_source_switches(self.engine, self.discord_server_id, logger)
+            earn_lines = []
+            if switches["watchtime"]:
+                earn_lines.append(f"• Watch streams: {watchtime_tickets} tickets per hour")
+            if switches["gifted_sub"]:
+                earn_lines.append(f"• Gift subs: {gifted_sub_tickets} tickets per sub")
+            if switches["shuffle_wager"]:
+                earn_lines.append(f"• Wager on {platform}{code_suffix}: {wager_tickets} tickets per $1000")
+            how_to_earn = (
+                "**How to Earn Tickets**:\n" + "\n".join(earn_lines)
+                if earn_lines
+                else "Tickets this period are awarded by the team."
+            )
+
             message = f"""
 🎰 **NEW RAFFLE PERIOD STARTED!** 🎰
 
 **Period**: #{period_display}
 **Duration**: {start_date.strftime('%B %d')} - {end_date.strftime('%B %d, %Y')}
 
-**How to Earn Tickets**:
-• Watch streams: {watchtime_tickets} tickets per hour
-• Gift subs: {gifted_sub_tickets} tickets per sub
-• Wager on {platform}{code_suffix}: {wager_tickets} tickets per $1000
+{how_to_earn}
 
 Use `!tickets` to check your balance!
 Good luck! 🍀

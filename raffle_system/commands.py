@@ -17,7 +17,12 @@ from utils.log_context import set_server
 from utils.server_urls import get_server_public_page_url
 
 from .draw import RaffleDraw
-from .reward_settings import get_ticket_reward_settings, platform_campaign_code, platform_display_name
+from .reward_settings import (
+    get_ticket_reward_settings,
+    get_ticket_source_switches,
+    platform_campaign_code,
+    platform_display_name,
+)
 from .shuffle_tracker import ShuffleWagerTracker
 from .tickets import TicketManager
 
@@ -89,6 +94,7 @@ class RaffleCommands(commands.Cog):
             watchtime_tickets, gifted_sub_tickets, wager_tickets = get_ticket_reward_settings(
                 self.engine, ctx.guild.id if ctx.guild else None, logger
             )
+            switches = get_ticket_source_switches(self.engine, ctx.guild.id if ctx.guild else None, logger)
             settings = self._get_guild_settings(ctx)
             platform = platform_display_name(settings)
             code = platform_campaign_code(settings)
@@ -98,12 +104,18 @@ class RaffleCommands(commands.Cog):
                 if code:
                     wager_hint += f" with code '{code}'"
                 wager_hint += f" ({wager_tickets} tickets per $1000)"
-                await ctx.send(
-                    f"❌ {ctx.author.mention} You don't have any raffle tickets yet!\n"
-                    f"Earn tickets by:\n"
-                    f"• Watching streams ({watchtime_tickets} tickets per hour)\n"
-                    f"• Gifting subs ({gifted_sub_tickets} tickets per sub)\n" + wager_hint
-                )
+                # Only the sources switched on in Raffle Management.
+                ways = []
+                if switches["watchtime"]:
+                    ways.append(f"• Watching streams ({watchtime_tickets} tickets per hour)")
+                if switches["gifted_sub"]:
+                    ways.append(f"• Gifting subs ({gifted_sub_tickets} tickets per sub)")
+                if switches["shuffle_wager"]:
+                    ways.append(wager_hint)
+                message = f"❌ {ctx.author.mention} You don't have any raffle tickets yet!"
+                if ways:
+                    message += "\nEarn tickets by:\n" + "\n".join(ways)
+                await ctx.send(message)
                 return
 
             # Get user's rank
@@ -174,6 +186,7 @@ Use `/leaderboard` to see top participants!
             watchtime_tickets, gifted_sub_tickets, wager_tickets = get_ticket_reward_settings(
                 self.engine, guild_id, logger
             )
+            switches = get_ticket_source_switches(self.engine, guild_id, logger)
             settings = self._get_guild_settings(ctx)
             platform = platform_display_name(settings)
             # Per-platform key: Howl servers usually have no code at all, so the
@@ -184,23 +197,32 @@ Use `/leaderboard` to see top participants!
                 wager_line += f" using code `{code}`"
             fair_url = get_server_public_page_url(self.engine, guild_id, "/provably-fair")
 
+            # Only the sources switched on in Raffle Management.
+            earning = []
+            if switches["watchtime"]:
+                earning.append(f"**Watch time** — {watchtime_tickets} tickets per hour watched")
+            if switches["gifted_sub"]:
+                earning.append(f"**Gifted subs** — {gifted_sub_tickets} tickets per sub gifted")
+            if switches["shuffle_wager"]:
+                earning.append(wager_line)
+            earning.append("**Bonus** — awarded by the team for events and giveaways")
+
             embed = discord.Embed(
                 title="How the Raffle Works",
                 description=(
-                    "Tickets are earned automatically while you support the stream. "
-                    "Every ticket is a separate entry in the draw, so the more you "
+                    (
+                        "Tickets are earned automatically while you support the stream. "
+                        if any(switches.values())
+                        else "Tickets are awarded by the team. "
+                    )
+                    + "Every ticket is a separate entry in the draw, so the more you "
                     "collect, the better your chances."
                 ),
                 color=discord.Color.blurple(),
             )
             embed.add_field(
                 name="Earning Tickets",
-                value=(
-                    f"**Watch time** — {watchtime_tickets} tickets per hour watched\n"
-                    f"**Gifted subs** — {gifted_sub_tickets} tickets per sub gifted\n"
-                    f"{wager_line}\n"
-                    "**Bonus** — awarded by the team for events and giveaways"
-                ),
+                value="\n".join(earning),
                 inline=False,
             )
             embed.add_field(
@@ -321,6 +343,18 @@ Use `/leaderboard` to see top participants!
             # suffix entirely rather than printing a wrong/borrowed one.
             code_suffix = f" (code '{code}')" if code else ""
 
+            # Only the sources switched on in Raffle Management.
+            switches = get_ticket_source_switches(self.engine, ctx.guild.id if ctx.guild else None, logger)
+            earn_lines = []
+            if switches["watchtime"]:
+                earn_lines.append(f"⏱️ **Watch Streams** - {watchtime_tickets} tickets per hour")
+            if switches["gifted_sub"]:
+                earn_lines.append(f"🎁 **Gift Subs** - {gifted_sub_tickets} tickets per sub")
+            if switches["shuffle_wager"]:
+                earn_lines.append(f"🎲 **{platform} Wagers** - {wager_tickets} tickets per $1000 wagered{code_suffix}")
+            earn_lines.append("⭐ **Bonus** - Admin awarded for events")
+            how_to_earn = "\n".join(earn_lines)
+
             # Debug logging
             logger.info(f"[raffleinfo] guild_id={ctx.guild.id}, server_id={managers['ticket_manager'].server_id}")
             logger.info(f"[raffleinfo] stats={stats}")
@@ -351,10 +385,7 @@ Use `/leaderboard` to see top participants!
 ⏳ **The raffle period has not started yet.**
 
 **How to Earn Tickets** (once period starts):
-⏱️ **Watch Streams** - {watchtime_tickets} tickets per hour
-🎁 **Gift Subs** - {gifted_sub_tickets} tickets per sub
-🎲 **{platform} Wagers** - {wager_tickets} tickets per $1000 wagered{code_suffix}
-⭐ **Bonus** - Admin awarded for events
+{how_to_earn}
 
 **Commands**:
 • `/tickets` - Check your ticket balance
@@ -397,10 +428,7 @@ Get ready to participate when the period starts!
 • Total Participants: {stats['total_participants']}{leaderboard_note}
 
 **How to Earn Tickets**:
-⏱️ **Watch Streams** - {watchtime_tickets} tickets per hour
-🎁 **Gift Subs** - {gifted_sub_tickets} tickets per sub
-🎲 **{platform} Wagers** - {wager_tickets} tickets per $1000 wagered{code_suffix}
-⭐ **Bonus** - Admin awarded for events
+{how_to_earn}
 
 **Commands**:
 • `/tickets` - Check your ticket balance
@@ -1506,7 +1534,9 @@ Use `/rafflestats @user` to see individual stats
                 total_tickets = 0
 
                 for kick_name, discord_id, sub_count, tickets in subs:
-                    if discord_id:
+                    # Zero-ticket rows paid nothing (e.g. subs gifted while the
+                    # "Gifted subs" switch was off), so there's nothing to restore.
+                    if discord_id and tickets:
                         # Re-award the tickets
                         success = ticket_manager.award_tickets(
                             discord_id=discord_id,

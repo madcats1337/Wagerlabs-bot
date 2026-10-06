@@ -9,6 +9,7 @@ from datetime import datetime
 from sqlalchemy import text
 
 from .config import WATCHTIME_TICKETS_PER_HOUR
+from .reward_settings import ticket_source_enabled
 from .tickets import TicketManager
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,42 @@ class WatchtimeConverter:
         else:
             # Fall back to config default
             self.watchtime_tickets_per_hour = WATCHTIME_TICKETS_PER_HOUR
+        # Raffle Management's "Watch time" switch.
+        self.tickets_enabled = ticket_source_enabled(self.bot_settings, "watchtime")
+
+    def _consume_while_off(self, conn, period_id):
+        """Mark every viewer's whole new hours as converted, for zero tickets.
+
+        Runs instead of the conversion while the "Watch time" switch is off. The
+        award is `total - converted this period`, so skipping the hours would
+        pay them all out the moment the switch went back on. Covers unlinked
+        viewers too: they'd otherwise be paid for the off hours once they link.
+        """
+        result = conn.execute(
+            text(
+                """
+            INSERT INTO raffle_watchtime_converted
+                (period_id, discord_server_id, kick_name, minutes_converted, tickets_awarded)
+            SELECT :period_id,
+                   -- discord_server_id is NOT NULL; derive the owner from the period.
+                   (SELECT discord_server_id FROM raffle_periods WHERE id = :period_id),
+                   w.username,
+                   ((w.minutes - COALESCE(c.converted, 0)) / 60) * 60,
+                   0
+            FROM watchtime w
+            LEFT JOIN (
+                SELECT kick_name, SUM(minutes_converted) AS converted
+                FROM raffle_watchtime_converted
+                WHERE period_id = :period_id
+                GROUP BY kick_name
+            ) c ON c.kick_name = w.username
+            WHERE w.discord_server_id = :server_id
+              AND w.minutes - COALESCE(c.converted, 0) >= 60
+        """
+            ),
+            {"period_id": period_id, "server_id": self.server_id},
+        )
+        return result.rowcount or 0
 
     async def convert_watchtime_to_tickets(self):
         """
@@ -66,6 +103,13 @@ class WatchtimeConverter:
                 return {"status": "no_active_period", "conversions": 0}
 
             conversions = []
+
+            if not self.tickets_enabled:
+                with self.engine.begin() as conn:
+                    consumed = self._consume_while_off(conn, period_id)
+                if consumed:
+                    logger.debug(f"[WATCHTIME] Watch-time tickets are off; used up new hours for {consumed} viewers")
+                return {"status": "source_disabled", "conversions": 0}
 
             with self.engine.begin() as conn:
                 # Get period start date to filter conversions

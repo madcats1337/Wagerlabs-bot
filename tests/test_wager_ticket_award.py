@@ -15,19 +15,21 @@ RATE = 5  # tickets per $1,000 -> $200 per ticket
 POLL = 33.62  # average per-poll wager delta observed in production
 
 
-def _replay(deltas, rate=RATE):
+def _replay(deltas, rate=RATE, paying=None):
     """Feed a sequence of per-poll wager increments through the award rules.
 
     Mirrors what the tracker does across polls: `paid_through` only advances by
     what was converted, while `prev_total` tracks the platform's reported figure.
+    `paying`, when given, is the Wagering switch's state for each poll.
     Returns (total_tickets, paid_through, reported_total).
     """
     paid_through = 0.0
     reported = 0.0
     tickets = 0
-    for d in deltas:
+    for i, d in enumerate(deltas):
         reported = round(reported + d, 2)
-        award = compute_wager_award(paid_through, reported - d, reported, rate)
+        on = True if paying is None else paying[i]
+        award = compute_wager_award(paid_through, reported - d, reported, rate, paying=on)
         if award.action == "rollover":
             paid_through = award.paid_through
             continue
@@ -164,3 +166,49 @@ def test_shuffle_small_polls_still_pay_at_the_higher_rate():
 
     # The old rule floored each poll independently: 222 x int(12.43/50) == 0.
     assert sum(int(d / 1000.0 * 20) for d in polls) == 0
+
+
+# The Wagering switch in Raffle Management (paying=False while it's off).
+
+
+def test_switched_off_wagering_pays_nothing_and_settles_up_to_the_total():
+    award = compute_wager_award(0.0, 0.0, 600.0, RATE, paying=False)
+    assert award.action == "update"
+    assert award.tickets == 0
+    assert award.paid_through == 600.0
+    # Still observed, so the wager leaderboard keeps counting it.
+    assert award.observed_delta == 600.0
+
+
+def test_switching_off_settles_a_pending_remainder_even_without_new_wagering():
+    """$150 pending from before the switch went off must not pay later."""
+    award = compute_wager_award(200.0, 350.0, 350.0, RATE, paying=False)
+    assert award.action == "update"
+    assert award.tickets == 0
+    assert award.paid_through == 350.0
+
+
+def test_switched_off_with_nothing_moved_or_pending_is_skipped():
+    award = compute_wager_award(350.0, 350.0, 350.0, RATE, paying=False)
+    assert award.action == "skip"
+
+
+def test_switched_off_ignores_sub_cent_storage_residue():
+    award = compute_wager_award(87696.87, 87696.87, 87696.8654, RATE, paying=False)
+    assert award.action == "skip"
+
+
+def test_a_rollover_while_switched_off_still_reanchors():
+    award = compute_wager_award(96377.08, 96377.08, 0.0, RATE, paying=False)
+    assert award.action == "rollover"
+    assert award.paid_through == 0.0
+
+
+def test_switching_back_on_pays_only_what_was_wagered_after():
+    """$1,000 on, $2,000 off, $600 on again: 5 + 0 + 3 tickets, not 18."""
+    deltas = [500.0, 500.0, 1000.0, 1000.0, 300.0, 300.0]
+    paying = [True, True, False, False, True, True]
+    tickets, paid_through, reported = _replay(deltas, paying=paying)
+    assert reported == 3600.0
+    assert tickets == 8
+    assert paid_through == 3600.0

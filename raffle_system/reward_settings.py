@@ -152,6 +152,55 @@ def platform_campaign_code(settings):
         return ""
 
 
+# The on/off switch for each automatic ticket source (Raffle Management →
+# Settings → Earning). A missing row means ON: every server earned from all
+# three before the switches existed. Bonus tickets are added by hand, so they
+# have no switch.
+TICKET_SOURCE_SWITCHES = {
+    "watchtime": "raffle_watchtime_enabled",
+    "gifted_sub": "raffle_gifted_sub_enabled",
+    "shuffle_wager": "raffle_wager_enabled",
+}
+
+
+def _switch_is_on(raw):
+    """A stored switch value: blank or absent is on; the usual false strings are off."""
+    value = str(raw or "").strip().lower()
+    return value not in ("false", "0", "no", "off")
+
+
+def ticket_source_enabled(settings, source):
+    """Whether `source` earns tickets, read from a (refreshed) BotSettingsManager.
+
+    Unreadable settings read as on, which is how every source behaved before
+    the switches existed.
+    """
+    if settings is None:
+        return True
+    try:
+        return _switch_is_on(settings.get(TICKET_SOURCE_SWITCHES[source]))
+    except Exception:
+        return True
+
+
+def get_ticket_source_switches(engine, server_id=None, logger=None):
+    """{source: on} for the three automatic sources, for callers holding an engine.
+
+    Used by the messages that tell viewers how to earn, so a switched-off
+    source isn't advertised. A DB failure reads as all on, matching the rate
+    defaults get_ticket_reward_settings falls back to.
+    """
+    switches = {source: True for source in TICKET_SOURCE_SWITCHES}
+    try:
+        with engine.begin() as conn:
+            for source, key in TICKET_SOURCE_SWITCHES.items():
+                switches[source] = _switch_is_on(_get_setting_value(conn, key, server_id))
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to read ticket source switches for server {server_id}: {e}")
+    return switches
+
+
 def get_ticket_reward_settings(engine, server_id=None, logger=None):
     """Return (watchtime_tickets, gifted_sub_tickets, wager_tickets) as display-safe strings."""
     watchtime_tickets = "10"
