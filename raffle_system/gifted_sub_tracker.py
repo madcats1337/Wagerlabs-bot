@@ -10,6 +10,7 @@ from datetime import datetime
 from sqlalchemy import text
 
 from .config import GIFTED_SUB_TICKETS
+from .reward_settings import ticket_source_enabled
 from .tickets import TicketManager
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,8 @@ class GiftedSubTracker:
         else:
             # Fall back to config default
             self.gifted_sub_tickets = GIFTED_SUB_TICKETS
+        # Raffle Management's "Gifted subs" switch.
+        self.tickets_enabled = ticket_source_enabled(self.bot_settings, "gifted_sub")
 
     async def handle_gifted_sub_event(self, event_data):
         """
@@ -188,23 +191,25 @@ class GiftedSubTracker:
                     )
                     return {"status": "not_linked", "kick_name": gifter_kick_name}
 
-                # Calculate tickets
-                tickets_to_award = gift_count * self.gifted_sub_tickets
+                # Calculate tickets. With the "Gifted subs" switch off the sub is
+                # still logged below, for zero tickets, so a re-delivered event
+                # can't pay out once the switch is back on.
+                tickets_to_award = gift_count * self.gifted_sub_tickets if self.tickets_enabled else 0
 
-                # Award the tickets
-                sub_description = "Subscribed" if gift_count == 1 else f"Gifted {gift_count} subs"
-                success = self.ticket_manager.award_tickets(
-                    discord_id=discord_id,
-                    kick_name=gifter_kick_name,
-                    tickets=tickets_to_award,
-                    source="gifted_sub",
-                    description=f"{sub_description} in chat",
-                    period_id=period_id,
-                )
+                if tickets_to_award > 0:
+                    sub_description = "Subscribed" if gift_count == 1 else f"Gifted {gift_count} subs"
+                    success = self.ticket_manager.award_tickets(
+                        discord_id=discord_id,
+                        kick_name=gifter_kick_name,
+                        tickets=tickets_to_award,
+                        source="gifted_sub",
+                        description=f"{sub_description} in chat",
+                        period_id=period_id,
+                    )
 
-                if not success:
-                    logger.error(f"Failed to award tickets to {gifter_kick_name}")
-                    return {"status": "award_failed"}
+                    if not success:
+                        logger.error(f"Failed to award tickets to {gifter_kick_name}")
+                        return {"status": "award_failed"}
 
                 # Log the gifted sub event
                 conn.execute(
@@ -230,6 +235,10 @@ class GiftedSubTracker:
                         "event_id": event_id,
                     },
                 )
+
+            if not self.tickets_enabled:
+                logger.info(f"🎁 {gifter_kick_name} gifted {gift_count} sub(s); gifted-sub tickets are off")
+                return {"status": "source_disabled", "gifter": gifter_kick_name, "gift_count": gift_count}
 
             logger.info(f"🎁 {gifter_kick_name} gifted {gift_count} sub(s) → {tickets_to_award} tickets")
 

@@ -4479,6 +4479,9 @@ async def kick_chat_loop(channel_name: str, guild_id: int):
                                         )
                                     elif result["status"] == "not_linked":
                                         logger.info(f"🎁 {result['kick_name']} subscribed but account not linked")
+                                    elif result["status"] == "source_disabled":
+                                        # Logged by the tracker; gifted-sub tickets are switched off.
+                                        pass
                                     elif result["status"] == "duplicate":
                                         # Already processed, silent skip
                                         pass
@@ -8194,6 +8197,11 @@ async def test_subscription(ctx, kick_username: str = None, sub_count: int = 1):
         embed.add_field(name="Note", value="Sub was logged but no tickets awarded", inline=False)
     elif result["status"] == "duplicate":
         embed.description = f"⚠️ This event was already processed (duplicate)"
+    elif result["status"] == "source_disabled":
+        embed.description = (
+            "ℹ️ Gifted-sub tickets are switched off in Raffle Management, so the sub was logged "
+            "but no tickets were awarded."
+        )
     elif result["status"] == "no_active_period":
         embed.description = f"❌ No active raffle period found.\nUse raffle commands to create a new period."
     else:

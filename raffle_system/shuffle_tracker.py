@@ -19,6 +19,7 @@ from sqlalchemy import text
 
 from utils.wager_leaderboard import is_http_url, resolve_shuffle_stats_url
 
+from .reward_settings import ticket_source_enabled
 from .tickets import TicketManager
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 WagerAward = namedtuple("WagerAward", "action tickets converted paid_through observed_delta")
 
 
-def compute_wager_award(paid_through, prev_total, current_wager, tickets_per_1000):
+def compute_wager_award(paid_through, prev_total, current_wager, tickets_per_1000, paying=True):
     """Decide what a single poll owes, from the two watermarks and the new figure.
 
     Pure arithmetic, extracted so the rules below are directly testable — this is
@@ -55,6 +56,11 @@ def compute_wager_award(paid_through, prev_total, current_wager, tickets_per_100
     kill every award for the rest of the raffle period. Raffle-period durations
     are operator-chosen, so a period spanning a rollover is routine, not an edge
     case.
+
+    Rule 3 (switched off is never paid): with `paying` False (the "Wagering"
+    switch in Raffle Management is off) nothing is awarded and `paid_through`
+    moves up to the reported figure, so wagering done while the switch was off
+    isn't paid out when it goes back on.
     """
     rate = tickets_per_1000 if tickets_per_1000 and tickets_per_1000 > 0 else 20
     dollars_per_ticket = 1000.0 / rate
@@ -74,6 +80,11 @@ def compute_wager_award(paid_through, prev_total, current_wager, tickets_per_100
     # reporting window moved (Howl serves a date-windowed total). Re-anchor.
     if observed_delta < 0:
         return WagerAward("rollover", 0, 0.0, round(current_wager, 2), observed_delta)
+
+    if not paying:
+        if observed_delta <= 0 and unpaid <= 0:
+            return WagerAward("skip", 0, 0.0, round(paid_through, 2), observed_delta)
+        return WagerAward("update", 0, 0.0, round(current_wager, 2), observed_delta)
 
     tickets = int(unpaid / dollars_per_ticket) if unpaid > 0 else 0
     converted = round(tickets * dollars_per_ticket, 2)
@@ -290,6 +301,10 @@ class ShuffleWagerTracker:
                 # No hardcoded default (was "lele" — one tenant's code).
                 self.campaign_code = os.getenv("WAGER_CAMPAIGN_CODE") or os.getenv("SHUFFLE_CAMPAIGN_CODE", "")
                 self.tickets_per_1000 = int(os.getenv("WAGER_TICKETS_PER_1000_USD", "20"))
+
+        # Raffle Management's "Wagering" switch. Off still polls: the wager
+        # leaderboard doesn't depend on the raffle.
+        self.tickets_enabled = ticket_source_enabled(self.bot_settings, "shuffle_wager")
 
     def refresh_settings(self):
         """Reload settings from database"""
@@ -815,7 +830,9 @@ class ShuffleWagerTracker:
                             discord_id = discord_id or linked[0]
                             kick_name = kick_name or linked[1]
 
-                        award = compute_wager_award(paid_through, prev_total, current_wager, self.tickets_per_1000)
+                        award = compute_wager_award(
+                            paid_through, prev_total, current_wager, self.tickets_per_1000, paying=self.tickets_enabled
+                        )
 
                         if award.action == "rollover":
                             logger.info(
