@@ -30,8 +30,8 @@ def pusher_answer(creds, provider="pusher"):
 
 
 def test_the_pusher_app_is_read_from_kicks_realtime_answer():
-    assert kcs.parse_realtime_answer(pusher_answer({"app_key": "34bf7a0ff419a2a775b9", "cluster": "us2"})) == (
-        "34bf7a0ff419a2a775b9",
+    assert kcs.parse_realtime_answer(pusher_answer({"app_key": "testpusherkey001", "cluster": "us2"})) == (
+        "testpusherkey001",
         "us2",
     )
     # Its own realtime service is no Pusher app; nor is anything malformed.
@@ -40,12 +40,8 @@ def test_the_pusher_app_is_read_from_kicks_realtime_answer():
     assert kcs.parse_realtime_answer("not json") is None
     # The key becomes part of a URL and the cluster a host name: nothing else gets through.
     assert kcs.parse_realtime_answer(pusher_answer({"app_key": "34bf/../x", "cluster": "us2"})) is None
-    assert (
-        kcs.parse_realtime_answer(pusher_answer({"app_key": "34bf7a0ff419a2a775b9", "cluster": "evil.com/x"})) is None
-    )
-    assert kcs.socket_url(("34bf7a0ff419a2a775b9", "mt1")).startswith(
-        "wss://ws-mt1.pusher.com/app/34bf7a0ff419a2a775b9?"
-    )
+    assert kcs.parse_realtime_answer(pusher_answer({"app_key": "testpusherkey001", "cluster": "evil.com/x"})) is None
+    assert kcs.socket_url(("testpusherkey001", "mt1")).startswith("wss://ws-mt1.pusher.com/app/testpusherkey001?")
 
 
 def test_only_pushers_dont_come_back_unchanged_errors_count_as_refusals():
@@ -130,7 +126,7 @@ def test_a_refused_key_is_replaced_and_chat_reaches_kickpythons_handler(monkeypa
     """A Pusher stand-in that knows only the new key: the old one is refused
     with 4001, the next connection uses the app Kick names, subscribes to the
     chatroom, has its ping answered, and passes chat to kickpython's handler."""
-    retired, current = ("32cbd69e4b950bf97679", "us2"), ("34bf7a0ff419a2a775b9", "us2")
+    retired, current = ("retiredkey000001", "us2"), ("testpusherkey001", "us2")
     seen = {"paths": [], "sent": []}
 
     async def pusher(conn):
