@@ -23,6 +23,10 @@ except Exception as e:
     print(f"kickpython not installed or import failed: {e}")
     sys.exit(1)
 
+# kickpython's own connect_to_chatroom builds in the Pusher key Kick retired; this one asks Kick for its current app.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.kick_chat_socket import connect_to_chatroom  # noqa: E402
+
 
 async def main():
     parser = argparse.ArgumentParser()
@@ -60,7 +64,7 @@ async def main():
 
     print(f"Connecting to channel chat: {args.channel} ...")
     # Start connection in background
-    connect_task = asyncio.create_task(api.connect_to_chatroom(args.channel))
+    connect_task = asyncio.create_task(connect_to_chatroom(api, args.channel))
 
     # Give it a moment to connect
     await asyncio.sleep(2)
