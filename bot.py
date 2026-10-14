@@ -52,6 +52,11 @@ setup_logging("kick_bot", log_level=os.getenv("LOG_LEVEL", "INFO"), source_tag="
 
 from core.kick_api import USER_AGENTS, KickAPI, check_stream_live, fetch_chatroom_id  # Consolidated Kick API module
 
+# Kick's chat socket, on the Pusher app Kick names (core/kick_chat_socket.py's header says why).
+from core.kick_chat_socket import connect_to_chatroom as connect_kick_chatroom
+from core.kick_chat_socket import pusher_app as kick_pusher_app
+from core.kick_chat_socket import socket_url as kick_socket_url
+
 # Custom commands import
 from features.custom_commands import CustomCommandsManager
 from features.discord_app_commands import (
@@ -319,15 +324,9 @@ BROWSER_CONFIG = {
     }
 }
 
-PUSHER_CONFIG = {
-    "key": "32cbd69e4b950bf97679",  # Updated Pusher key
-    "cluster": "us2",
-    "version": "8.4.0",  # Updated version
-    "protocol": 7,
-}
-KICK_CHAT_WS = (
-    f"wss://ws-{PUSHER_CONFIG['cluster']}.pusher.com/app/{PUSHER_CONFIG['key']}"  # Standard Pusher WebSocket endpoint
-)
+# Kick's chat socket is Pusher's, under an app key Kick changes without notice: it
+# retired the one that was built in here (32cbd69e4b950bf97679) in October 2026.
+# Both chat readers ask Kick for the current app instead (kick_pusher_app).
 
 # Role thresholds in minutes
 WATCHTIME_ROLES = [
@@ -515,9 +514,10 @@ class KickWebSocketManager:
 
             while True:
                 try:
-                    # Now connect to chatroom (this will block until disconnected)
+                    # Now connect to chatroom (this will block until disconnected). Not kickpython's own
+                    # connect_to_chatroom: it builds in the Pusher key Kick retired (core/kick_chat_socket.py).
                     logger.debug(f"🔌 Connecting to websocket...")
-                    await api.connect_to_chatroom(kick_username)
+                    await connect_kick_chatroom(api, kick_username)
 
                     # Save chatroom_id to database after successful connection
                     if hasattr(api, "chatroom_id") and api.chatroom_id:
@@ -2762,7 +2762,7 @@ async def kick_chat_loop(channel_slug: str, guild_id: int):
 
     while True:
         try:
-            async with websockets.connect(KICK_CHAT_WS) as ws:
+            async with websockets.connect(kick_socket_url(await kick_pusher_app())) as ws:
                 # Subscribe to chatroom
                 subscribe_msg = json.dumps({"event": "pusher:subscribe", "data": {"channel": channel_name}})
                 await ws.send(subscribe_msg)
@@ -3822,15 +3822,9 @@ async def kick_chat_loop(channel_name: str, guild_id: int):
 
             logger.info(f"Pusher: Connecting to chatroom {chatroom_id} for channel {channel_to_use}...")
 
-            # Build WebSocket URL matching successful connection pattern
-            ws_url = (
-                f"{KICK_CHAT_WS}"
-                f"?protocol={PUSHER_CONFIG['protocol']}"
-                f"&client=js"
-                f"&version={PUSHER_CONFIG['version']}"
-                f"&flash=false"
-                f"&cluster={PUSHER_CONFIG['cluster']}"
-            )
+            # The socket of the Pusher app Kick names now (its key changes: core/kick_chat_socket.py).
+            pusher = await kick_pusher_app()
+            ws_url = kick_socket_url(pusher)
             logger.info(f"[Kick] Connecting to WebSocket: {ws_url}")
 
             # Verify TLS certificates. Pusher/Kick present valid public certs, and this
@@ -3857,11 +3851,14 @@ async def kick_chat_loop(channel_name: str, guild_id: int):
                 logger.info(f"[Kick] Initial response: {response}")
                 response_data = json.loads(response)
 
-                # Handle connection errors
+                # Handle connection errors. 4000-4099 says not to come back unchanged (a key Kick has retired
+                # among them), so Kick is asked for its current app before the retry.
                 if response_data.get("event") == "pusher:error":
                     error_data = response_data.get("data", {})
                     error_code = error_data.get("code")
                     error_message = error_data.get("message")
+                    if isinstance(error_code, int) and 4000 <= error_code < 4100:
+                        await kick_pusher_app(refused=pusher[0])
                     raise Exception(f"WebSocket error code {error_code}: {error_message}")
 
                 # Handle successful connection
