@@ -9613,6 +9613,7 @@ async def on_ready():
                     text(
                         """
                     ALTER TABLE giveaways
+                    ADD COLUMN IF NOT EXISTS prize TEXT,
                     ADD COLUMN IF NOT EXISTS discord_channel_id BIGINT,
                     ADD COLUMN IF NOT EXISTS discord_message_id BIGINT,
                     ADD COLUMN IF NOT EXISTS duration_minutes INTEGER,
