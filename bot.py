@@ -4850,6 +4850,10 @@ async def run_points_drop_for_guild(guild_id, amount=None, *, source, triggered_
     the exclusions always come from the dashboard. Chatters are collapsed to one
     per person (the watchtime dedupe) so a dual-platform viewer can't win twice.
     """
+    # Chat and the dashboard both validate, but the dashboard's request arrives
+    # over Redis, so check again before minting anything.
+    if amount is not None and parse_positive_int(amount, MAX_DROP_AMOUNT) is None:
+        return f"Drop amount must be between 1 and {MAX_DROP_AMOUNT:,}."
     snapshot = chatters_since(guild_id, MAX_DROP_WINDOW_MINUTES)
 
     def _drop():
@@ -13148,7 +13152,17 @@ async def cmd_give_points(ctx, user: str, amount: int):
     try:
         with engine.begin() as conn:
             if member is None:
-                resolved = resolve_points_target(conn, guild_id, typed, "kick")
+                # Kick and Twitch names are separate namespaces. If the name is
+                # two different viewers, don't guess.
+                on_kick = resolve_points_target(conn, guild_id, typed, "kick")
+                on_twitch = resolve_points_target(conn, guild_id, typed, "twitch")
+                if on_kick and on_twitch and on_kick[0] != on_twitch[0]:
+                    await ctx.send(
+                        f"❌ **{discord.utils.escape_markdown(typed.lstrip('@'))}** is a different viewer on Kick "
+                        "and on Twitch. Use their Discord @mention instead."
+                    )
+                    return
+                resolved = on_kick or on_twitch
                 if resolved is None:
                     member = guild.get_member_named(typed.lstrip("@"))
             if member is not None:

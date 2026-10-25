@@ -184,3 +184,20 @@ def test_give_points_unknown_viewer(monkeypatch):
     mgr, sent, _ = _manager("{give_points}", monkeypatch, granted=None)
     asyncio.run(mgr.handle_message("!gift nobody 5", "mod1", is_moderator=True))
     assert sent == ["@mod1 couldn't find a viewer named nobody."]
+
+
+def test_names_resolve_only_through_their_own_platform(engine):
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO links VALUES (8, 'bob', 'twitch', :s, NULL)"), {"s": SERVER})
+        conn.execute(text("INSERT INTO watchtime VALUES ('bob', 30, :s)"), {"s": SERVER})
+        # Typed in Kick chat, "bob" is not the Twitch-linked person, and the
+        # bare-username fallback would land on that person's row, so it's refused.
+        assert resolve_points_target(conn, SERVER, "bob", "kick") is None
+        assert resolve_points_target(conn, SERVER, "bob", "twitch") == ("bob", 8)
+
+
+def test_drop_rejects_out_of_range_amounts():
+    with pytest.raises(ValueError):
+        points_grants.run_points_drop(None, SERVER, ["a"], -5, 1, "dashboard")
+    with pytest.raises(ValueError):
+        points_grants.run_points_drop(None, SERVER, ["a"], points_grants.MAX_DROP_AMOUNT + 1, 1, "dashboard")

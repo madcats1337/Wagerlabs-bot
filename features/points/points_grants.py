@@ -146,27 +146,35 @@ def resolve_points_target(conn, server_id, raw_name, platform="kick", recent_nam
     """Resolve a chat name to ``(points_username, discord_id)``, or None.
 
     A linked viewer resolves to their canonical row (lowest linked handle), so a
-    grant to either of their handles lands on the one shared balance. An
-    unlinked viewer must already be known — a points row, watchtime, or a recent
-    chat message — so a typo can't mint points onto a name nobody uses.
+    grant to either of their handles lands on the one shared balance. Links are
+    matched on ``platform`` only: the same name on Kick and on Twitch can be two
+    different people, so a name typed in Kick chat never resolves through
+    someone's Twitch link. A name linked only on another platform resolves to
+    nothing, since the unlinked lookups below are keyed by bare username and
+    would land on that other person's row.
+
+    An unlinked viewer must already be known — a points row, watchtime, or a
+    recent chat message — so a typo can't mint points onto a name nobody uses.
     """
     name = normalize_chat_name(raw_name)
     if not name:
         return None
 
-    link = conn.execute(
+    links = conn.execute(
         text(
             """
-            SELECT discord_id FROM links
+            SELECT discord_id, COALESCE(platform, 'kick') = :p AS same_platform FROM links
             WHERE discord_server_id = :sid
               AND LOWER(kick_name) = :n
               AND discord_id IS NOT NULL
-            ORDER BY (COALESCE(platform, 'kick') = :p) DESC, linked_at ASC NULLS LAST
-            LIMIT 1
+            ORDER BY linked_at ASC NULLS LAST
             """
         ),
         {"sid": server_id, "n": name, "p": (platform or "kick").lower()},
-    ).fetchone()
+    ).fetchall()
+    link = next((row for row in links if row[1]), None)
+    if link is None and links:
+        return None
 
     if link:
         discord_id = link[0]
@@ -341,6 +349,8 @@ def run_points_drop(conn, server_id, candidates, amount, winners, source, trigge
     viewer can't win twice. Records the drop in ``points_drops`` and returns the
     winners in draw order.
     """
+    if not 1 <= int(amount) <= MAX_DROP_AMOUNT:
+        raise ValueError(f"drop amount {amount} is outside 1..{MAX_DROP_AMOUNT}")
     pool = sorted(set(candidates))
     if not pool:
         return []
