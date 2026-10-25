@@ -157,10 +157,22 @@ def test_a_handle_claimed_by_someone_else_is_not_them(engine):
     assert resolve_chatter_discord_id(engine, SERVER, "kick", "viewer", "999") is None
 
 
-def test_a_legacy_row_without_an_id_still_matches_by_handle(engine):
+def test_without_an_id_the_handle_resolves(engine):
+    # Kick today: kickpython hands the bot only the sender's username.
     link(engine, "viewer")
-    assert resolve_chatter_discord_id(engine, SERVER, "kick", "Viewer", "555") == DISCORD_ID
-    assert resolve_chatter_discord_id(engine, SERVER, "kick", "viewer", None) == DISCORD_ID
+    assert resolve_chatter_discord_id(engine, SERVER, "kick", "Viewer", None) == DISCORD_ID
+
+
+def test_with_an_id_only_a_row_carrying_it_counts(engine):
+    # A legacy row (no id) could be a handle someone renamed away from. The
+    # chat handler's backfill stamps the id onto the chatter's own row first,
+    # and from then on it matches.
+    link(engine, "viewer")
+    assert resolve_chatter_discord_id(engine, SERVER, "twitch", "viewer", "555") is None
+    assert resolve_chatter_discord_id(engine, SERVER, "kick", "viewer", "555") is None
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE links SET platform_user_id = '555'"))
+    assert resolve_chatter_discord_id(engine, SERVER, "kick", "viewer", "555") == DISCORD_ID
 
 
 def test_a_link_counts_only_on_its_own_platform(engine):

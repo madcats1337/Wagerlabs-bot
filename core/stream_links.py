@@ -113,12 +113,16 @@ def resolve_discord_id(engine, username: str, guild_id: int, platform: str):
 def resolve_chatter_discord_id(engine, guild_id: int, platform: str, handle: str, platform_user_id=None):
     """The Discord account a chatter linked on THIS platform, or None.
 
-    For gates (a giveaway's role requirement) rather than crediting, so it
-    prefers the chatter's IMMUTABLE platform id when the chat event carries one,
-    and falls back to the handle only for rows that predate the id column. A
-    handle row stamped with a DIFFERENT id is refused: that handle was renamed
-    away and claimed by someone else, and matching it would let a stranger
-    through on another viewer's roles.
+    For gates (a giveaway's role requirement) rather than crediting. When the
+    chat event carries the chatter's IMMUTABLE platform id, only a row with
+    that id counts: a handle can be renamed away and claimed by someone else,
+    and matching it would let a stranger through on another viewer's roles. A
+    legacy row (no id yet) is no loss there, since the chat handler's backfill
+    stamps the id onto it, by the same handle, before any gate runs.
+
+    Without an id the handle is all there is. That is Kick today: kickpython
+    hands the bot only the sender's username, so Kick chat resolves by handle
+    as every other chat feature does.
 
     `handle` is the chatter's own name on `platform` — on Twitch that is the
     display name, not the canonical username identity crediting remaps to.
@@ -138,14 +142,13 @@ def resolve_chatter_discord_id(engine, guild_id: int, platform: str, handle: str
                 ),
                 {"gid": guild_id, "p": platform, "puid": puid},
             ).fetchone()
-            if row:
-                return row[0]
+            return row[0] if row else None
         if not handle:
             return None
         row = conn.execute(
             text(
                 """
-                SELECT discord_id, platform_user_id FROM links
+                SELECT discord_id FROM links
                 WHERE discord_server_id = :gid AND COALESCE(platform, 'kick') = :p
                   AND LOWER(kick_name) = :u
                 LIMIT 1
@@ -153,11 +156,7 @@ def resolve_chatter_discord_id(engine, guild_id: int, platform: str, handle: str
             ),
             {"gid": guild_id, "p": platform, "u": handle.lower()},
         ).fetchone()
-    if not row:
-        return None
-    if puid and row[1] and str(row[1]) != puid:
-        return None
-    return row[0]
+    return row[0] if row else None
 
 
 def resolve_canonical_identity(engine, username: str, guild_id: int, platform: str):

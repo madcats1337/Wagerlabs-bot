@@ -901,12 +901,18 @@ class KickWebSocketManager:
             # links row if it predates the platform_user_id column. Costs at most one
             # UPDATE per viewer per process (see backfill_platform_user_id), never a
             # write per message, and can never raise into chat handling.
+            #
+            # Keyed by the chatter's own handle on this platform, not `username`: on
+            # Twitch a dual-linked viewer's `username` is remapped to their canonical
+            # (Kick) name, which as a Twitch handle can belong to someone else, and
+            # their id would be stamped onto that person's link. Giveaway role gates
+            # trust these ids.
             chat_user_id = None
             try:
                 from core.stream_links import backfill_platform_user_id, extract_chat_platform_user_id
 
                 chat_user_id = extract_chat_platform_user_id(msg)
-                backfill_platform_user_id(engine, guild_id, platform, username, chat_user_id)
+                backfill_platform_user_id(engine, guild_id, platform, display_username, chat_user_id)
             except Exception:
                 pass
 
