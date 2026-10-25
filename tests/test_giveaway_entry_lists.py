@@ -13,8 +13,9 @@ import discord
 import pytest
 from sqlalchemy import create_engine, text
 
+from features.giveaway import entry_lists
 from features.giveaway import giveaway_manager as gm
-from features.giveaway.entry_lists import chat_requirement, on_entry_list
+from features.giveaway.entry_lists import chat_requirement, on_entry_list, refresh_list_names
 from features.giveaway.giveaway_manager import GiveawayManager
 
 SERVER = 42
@@ -76,6 +77,17 @@ def engine():
                 CREATE TABLE giveaway_list_members (
                     list_id INTEGER, member_no INTEGER, platform TEXT, platform_user_id TEXT,
                     username_key TEXT, display_name TEXT
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE giveaway_list_discord_names (
+                    discord_server_id BIGINT, discord_id TEXT, display_name TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (discord_server_id, discord_id)
                 )
                 """
             )
@@ -271,3 +283,101 @@ def test_the_requirement_reads_as_either_one(engine):
     assert who == f"Verified affiliates or members with <@&{ROLE}>"
     assert chat_requirement(engine, guild, SERVER, None, None) == (None, None)
     assert chat_requirement(engine, guild, SERVER, None, "missing") == ("the giveaway's entry list", None)
+
+
+# ---------------------------------------------------------------------------
+# Names for the Discord ids on a list (the dashboard's Entry lists tab)
+# ---------------------------------------------------------------------------
+class NamesBot:
+    """The bot's user cache, and Discord's API behind fetch_user."""
+
+    def __init__(self, users=None, api=None):
+        self.users = users or {}
+        self.api = api or {}
+        self.fetched = []
+
+    def get_user(self, discord_id):
+        return self.users.get(discord_id)
+
+    async def fetch_user(self, discord_id):
+        self.fetched.append(discord_id)
+        if discord_id not in self.api:
+            raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "Unknown User")
+        return self.api[discord_id]
+
+
+def person(global_name, name):
+    return SimpleNamespace(global_name=global_name, name=name)
+
+
+def guild_with(members=None, server=SERVER):
+    guild = FakeGuild(members=members)
+    guild.id = server
+    return guild
+
+
+def names(engine, server=SERVER):
+    with engine.connect() as conn:
+        return dict(
+            conn.execute(
+                text("SELECT discord_id, display_name FROM giveaway_list_discord_names WHERE discord_server_id = :s"),
+                {"s": server},
+            ).fetchall()
+        )
+
+
+def refresh(engine, guild, bot):
+    return asyncio.run(refresh_list_names(bot, engine, guild))
+
+
+def test_a_discord_member_on_a_list_is_named_from_the_member_cache(engine):
+    make_list(engine, members=[("discord", "111", None), ("discord", "222", None), ("kick", "5", "kickguy")])
+    guild = guild_with({111: person("Nick Fan", "nickfan")})
+    bot = NamesBot(users={222: person(None, "plain_name")})
+
+    assert refresh(engine, guild, bot) == 2
+    # Display name = global_name, else the account username.
+    assert names(engine) == {"111": "Nick Fan", "222": "plain_name"}
+    assert bot.fetched == []
+
+
+def test_someone_no_cache_holds_is_fetched_once(engine):
+    make_list(engine, members=[("discord", "333", None), ("discord", "444", None)])
+    bot = NamesBot(api={333: person("Fetched", "fetched")})
+
+    refresh(engine, guild_with(), bot)
+    assert names(engine) == {"333": "Fetched"} and sorted(bot.fetched) == [333, 444]
+    # 333 has a name now: only the unknown one is asked about again.
+    refresh(engine, guild_with(), bot)
+    assert sorted(bot.fetched) == [333, 444, 444]
+
+
+def test_lookups_through_the_api_are_capped_per_refresh(engine, monkeypatch):
+    monkeypatch.setattr(entry_lists, "NAME_FETCHES_PER_REFRESH", 2)
+    make_list(engine, members=[("discord", str(500 + i), None) for i in range(5)])
+    bot = NamesBot()
+    refresh(engine, guild_with(), bot)
+    assert len(bot.fetched) == 2
+
+
+def test_a_rename_is_picked_up_and_someone_off_every_list_is_forgotten(engine):
+    make_list(engine, members=[("discord", "111", None), ("discord", "222", None)])
+    make_list(engine, key="theirs", server=OTHER_SERVER, members=[("discord", "111", None)])
+    guild = guild_with({111: person("Old", "x"), 222: person("Stays", "y")})
+    refresh(engine, guild, NamesBot())
+    refresh(engine, guild_with({111: person("Theirs", "x")}, server=OTHER_SERVER), NamesBot())
+
+    guild.members[111] = person("New", "x")
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM giveaway_list_members WHERE platform_user_id = '222'"))
+    assert refresh(engine, guild, NamesBot()) == 1
+    assert names(engine) == {"111": "New"}
+    # Another server's names are its own.
+    assert names(engine, OTHER_SERVER) == {"111": "Theirs"}
+
+
+def test_an_unchanged_name_is_not_written_again(engine):
+    make_list(engine, members=[("discord", "111", None)])
+    guild = guild_with({111: person("Same", "s")})
+    assert refresh(engine, guild, NamesBot()) == 1
+    assert refresh(engine, guild, NamesBot()) == 0

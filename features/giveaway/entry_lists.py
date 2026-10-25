@@ -6,10 +6,17 @@ utils/giveaway_lists.py), and a chat giveaway names it in `entry_list`. The
 bot only reads the two tables, on every entry to a giveaway that names one.
 
 One row per identity a member has: their Kick or Twitch account (id and/or
-username) or their Discord account id.
+username) or their Discord account id. A Discord id alone means nothing to a
+streamer, so the bot also keeps giveaway_list_discord_names, the display name
+behind each one, for the owner's Entry lists tab (refresh_list_names).
 """
 
+import discord
 from sqlalchemy import text
+
+#: Discord users looked up through the API per guild per refresh: people on a
+#: list whom no member cache holds and who have no stored name yet.
+NAME_FETCHES_PER_REFRESH = 25
 
 
 def on_entry_list(engine, guild_id, list_key, platform, handle, platform_user_id=None, discord_id=None):
@@ -92,3 +99,75 @@ def chat_requirement(engine, guild, guild_id, role_id, list_key, mention_role=Fa
             role = guild.get_role(int(role_id)) if guild else None
             parts.append(f"members with the {role.name + ' role' if role else 'required role'} in Discord")
     return (" or ".join(parts) or None), hint
+
+
+async def refresh_list_names(bot, engine, guild):
+    """Store the Discord display name behind every Discord id on this guild's lists.
+
+    The dashboard's Entry lists tab (the owner's) shows each Discord member by
+    name, which only Discord knows. As with links.discord_username, the name is
+    resolved here from the member cache and stored, so the dashboard never
+    calls Discord per row. Someone no cache holds is fetched once, a few per
+    refresh. Names of people no longer on any of the guild's lists are
+    dropped. Display name = global_name, else the account username. Returns
+    how many names were written.
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT DISTINCT m.platform_user_id, n.display_name
+                FROM giveaway_list_members m
+                JOIN giveaway_lists l ON l.id = m.list_id
+                LEFT JOIN giveaway_list_discord_names n
+                       ON n.discord_server_id = l.discord_server_id AND n.discord_id = m.platform_user_id
+                WHERE l.discord_server_id = :sid AND m.platform = 'discord'
+                """
+            ),
+            {"sid": guild.id},
+        ).fetchall()
+
+    updates, fetched = [], 0
+    for discord_id, stored in rows:
+        user = guild.get_member(int(discord_id)) or bot.get_user(int(discord_id))
+        if user is None and stored is None and fetched < NAME_FETCHES_PER_REFRESH:
+            fetched += 1
+            try:
+                user = await bot.fetch_user(int(discord_id))
+            except discord.HTTPException:
+                user = None
+        if user is None:
+            continue
+        name = (getattr(user, "global_name", None) or user.name or "")[:100]
+        if name and name != stored:
+            updates.append({"sid": guild.id, "d": discord_id, "n": name})
+
+    with engine.begin() as conn:
+        if updates:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO giveaway_list_discord_names (discord_server_id, discord_id, display_name, updated_at)
+                    VALUES (:sid, :d, :n, CURRENT_TIMESTAMP)
+                    ON CONFLICT (discord_server_id, discord_id)
+                    DO UPDATE SET display_name = EXCLUDED.display_name, updated_at = CURRENT_TIMESTAMP
+                    """
+                ),
+                updates,
+            )
+        conn.execute(
+            text(
+                """
+                DELETE FROM giveaway_list_discord_names
+                WHERE discord_server_id = :sid
+                  AND discord_id NOT IN (
+                      SELECT m.platform_user_id
+                      FROM giveaway_list_members m
+                      JOIN giveaway_lists l ON l.id = m.list_id
+                      WHERE l.discord_server_id = :sid AND m.platform = 'discord'
+                  )
+                """
+            ),
+            {"sid": guild.id},
+        )
+    return len(updates)

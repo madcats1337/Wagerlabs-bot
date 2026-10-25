@@ -5399,7 +5399,9 @@ async def update_discord_usernames_task():
     name changes are picked up; only writes when the value actually changed.
 
     Piggybacks the same per-guild loop to persist the guild owner so the
-    dashboard can gate owner-only extension writes (current-slot push).
+    dashboard can gate owner-only extension writes (current-slot push), and to
+    name the Discord ids on the guild's giveaway entry lists
+    (features/giveaway/entry_lists.refresh_list_names).
     """
     if not engine:
         return
@@ -5461,6 +5463,17 @@ async def update_discord_usernames_task():
                             updates,
                         )
                     logger.debug(f"[DiscordNames] Refreshed {len(updates)} name(s) for guild {guild.id}")
+
+                # The names behind the Discord ids on this guild's giveaway entry
+                # lists, which the dashboard's Entry lists tab shows.
+                try:
+                    from features.giveaway.entry_lists import refresh_list_names
+
+                    named = await refresh_list_names(bot, engine, guild)
+                    if named:
+                        logger.debug(f"[DiscordNames] Named {named} entry-list member(s) for guild {guild.id}")
+                except Exception as el_err:
+                    logger.warning(f"⚠️ entry-list names refresh error for {guild.id}: {el_err}")
 
                 # Materialize the list of members who currently have dashboard
                 # access, so the Access Control page can show it without live
@@ -10069,6 +10082,16 @@ async def on_ready():
                         WHERE username_key IS NOT NULL;
                     ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS entry_list VARCHAR(64);
                     ALTER TABLE giveaway_templates ADD COLUMN IF NOT EXISTS entry_list VARCHAR(64);
+                    -- Display names for the Discord ids on a guild's lists,
+                    -- filled by _refresh_entry_list_names for the dashboard's
+                    -- Entry lists tab.
+                    CREATE TABLE IF NOT EXISTS giveaway_list_discord_names (
+                        discord_server_id BIGINT NOT NULL,
+                        discord_id VARCHAR(32) NOT NULL,
+                        display_name VARCHAR(100),
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (discord_server_id, discord_id)
+                    );
                 """
                     )
                 )
