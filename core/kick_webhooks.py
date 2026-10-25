@@ -26,6 +26,8 @@ import json
 import logging
 import os
 import secrets
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import wraps
@@ -50,6 +52,7 @@ def _test_endpoints_enabled() -> bool:
 
 # RSA verification imports
 try:
+    from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.backends import default_backend
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
@@ -78,27 +81,109 @@ except ImportError:
 
 WEBHOOK_SECRET = os.getenv("KICK_WEBHOOK_SECRET", "")
 
-# Kick's Public Key for webhook signature verification
+# Kick's public key for webhook signature verification.
+#
+# Kick rotates it and publishes the current one at KICK_PUBLIC_KEY_URL. The
+# copy that used to be the only key here went stale on 2026-10-01 (between
+# 02:16 and 14:14 UTC): from then on every webhook failed verification and was
+# refused with a 401, so no go-live alert was posted for any Kick streamer for
+# weeks. So the key Kick publishes is the one used, fetched on the first
+# webhook and again whenever a signature fails, at most once per
+# KEY_REFETCH_SECONDS: anyone can POST a bad signature here, and that must not
+# turn into a request to Kick each time. The bundled key below (Kick's as of
+# 2026-10-25) is only the fallback for when the endpoint can't be reached.
+KICK_PUBLIC_KEY_URL = "https://api.kick.com/public/v1/public-key"
+KEY_REFETCH_SECONDS = 300
+
 KICK_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAq/+l1WnlRrGSolDMA+A8
-6rAhMbQGmQ2SapVcGM3zq8ANXjnhDWocMqfWcTd95btDydITa10kDvHzw9WQOqp2
-MZI7ZyrfzJuz5nhTPCiJwTwnEtWft7nV14BYRDHvlfqPUaZ+1KR4OCaO/wWIk/rQ
-L/TjY0M70gse8rlBkbo2a8rKhu69RQTRsoaf4DVhDPEeSeI5jVrRDGAMGL3cGuyY
-6CLKGdjVEM78g3JfYOvDU/RvfqD7L89TZ3iN94jrmWdGz34JNlEI5hqK8dd7C5EF
-BEbZ5jgB8s8ReQV8H+MkuffjdAj3ajDDX3DOJMIut1lBrUVD1AaSrGCKHooWoL2e
-twIDAQAB
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0C0tthITvk/EjIxCGCko
+YrxM7eqP4GDnUyP4BnfgJ9yaHqniNfraxTKeRv7TGkOOZviow2zcx/YP9waURfHd
+cZOHU+EKA3lSFdMpezLiDGaym+FxR0iXAFZXE9VBdCCOyBeK81/m3mGScGVBNumt
+6pGCZYU9DCn5oqnC6RC5pUnlHnJp+TOXW6z8Silr4Y81a/66b0FAJ6EGUVXmXXgP
+FXQRTmJcLM4EgCXfNXLwExzr2MtowBwp5PYD6Usl7uZcnMIPutPdXJ0JnvqrztFC
+QTvrGMxzKLKLcKQTG159jfHGJ4wKSeenvwXN8jaVJAtW7wRAooRRT8Kho7Axe8jp
+qQIDAQAB
 -----END PUBLIC KEY-----"""
 
-# Cache the loaded public key
-_kick_public_key = None
+_key_lock = threading.Lock()
+_bundled_public_key = None
+_fetched_public_key = None
+_fetched_pem = None
+_last_fetch_attempt = None
 
 
-def get_kick_public_key():
-    """Load and cache Kick's public key"""
-    global _kick_public_key
-    if _kick_public_key is None and CRYPTO_AVAILABLE:
-        _kick_public_key = serialization.load_pem_public_key(KICK_PUBLIC_KEY.encode("utf-8"), backend=default_backend())
-    return _kick_public_key
+def _load_pem(pem: str):
+    return serialization.load_pem_public_key(pem.encode("utf-8"), backend=default_backend())
+
+
+def _fetch_kick_public_key_pem() -> Optional[str]:
+    """The key Kick publishes now (PEM), or None when it can't be read."""
+    import requests
+
+    try:
+        resp = requests.get(KICK_PUBLIC_KEY_URL, timeout=5)
+        if resp.status_code != 200:
+            logger.warning(f"[Webhook] ⚠️ Kick public key endpoint returned HTTP {resp.status_code}")
+            return None
+        pem = ((resp.json() or {}).get("data") or {}).get("public_key")
+        return pem if isinstance(pem, str) and "BEGIN PUBLIC KEY" in pem else None
+    except Exception as e:
+        logger.warning(f"[Webhook] ⚠️ Could not fetch Kick's public key: {e}")
+        return None
+
+
+def refresh_kick_public_key(force: bool = False) -> bool:
+    """Fetch Kick's current key; True when it differs from the key held before.
+
+    Without `force` this only runs while no key has been fetched yet. Either
+    way it runs at most once per KEY_REFETCH_SECONDS.
+    """
+    global _fetched_public_key, _fetched_pem, _last_fetch_attempt
+    with _key_lock:
+        if _fetched_public_key is not None and not force:
+            return False
+        now = time.monotonic()
+        if _last_fetch_attempt is not None and now - _last_fetch_attempt < KEY_REFETCH_SECONDS:
+            return False
+        _last_fetch_attempt = now
+
+    pem = _fetch_kick_public_key_pem()
+    if not pem:
+        return False
+    try:
+        key = _load_pem(pem)
+    except Exception as e:
+        logger.warning(f"[Webhook] ⚠️ Kick's published key did not parse: {e}")
+        return False
+    with _key_lock:
+        changed = pem.strip() != (_fetched_pem or "").strip()
+        _fetched_public_key, _fetched_pem = key, pem
+    if changed:
+        logger.info("[Webhook] 🔑 Loaded Kick's current webhook public key")
+    return changed
+
+
+def get_kick_public_keys():
+    """The keys to verify against, current first: Kick's published key once it
+    has been fetched, then the bundled fallback."""
+    global _bundled_public_key
+    if not CRYPTO_AVAILABLE:
+        return []
+    if _fetched_public_key is None:
+        refresh_kick_public_key()
+    if _bundled_public_key is None:
+        _bundled_public_key = _load_pem(KICK_PUBLIC_KEY)
+    return [key for key in (_fetched_public_key, _bundled_public_key) if key is not None]
+
+
+def _verifies(keys, signature: bytes, message: bytes) -> bool:
+    for key in keys:
+        try:
+            key.verify(signature, message, padding.PKCS1v15(), hashes.SHA256())
+            return True
+        except InvalidSignature:
+            continue
+    return False
 
 
 # Create Flask Blueprint for webhook routes
@@ -182,9 +267,9 @@ def verify_kick_signature(
         return False
 
     try:
-        # Get Kick's public key
-        public_key = get_kick_public_key()
-        if not public_key:
+        # Kick's published key, then the bundled fallback
+        public_keys = get_kick_public_keys()
+        if not public_keys:
             logger.info("[Webhook] ❌ Could not load Kick public key")
             return False
 
@@ -205,20 +290,22 @@ def verify_kick_signature(
             logger.info(f"[Webhook] 🔐 Message to verify (first 100 chars): {message_to_verify[:100]}")
             logger.info(f"[Webhook] 🔐 Signature length: {len(signature_bytes)}")
 
-        # Verify using RSA PKCS1v15 with SHA256
-        try:
-            public_key.verify(signature_bytes, message_to_verify, padding.PKCS1v15(), hashes.SHA256())
+        # Verify using RSA PKCS1v15 with SHA256. A failure may only mean Kick has
+        # rotated its key since we last fetched it, so fetch again (rate-limited)
+        # and retry before refusing.
+        if _verifies(public_keys, signature_bytes, message_to_verify) or (
+            refresh_kick_public_key(force=True)
+            and _verifies(get_kick_public_keys(), signature_bytes, message_to_verify)
+        ):
             logger.info(f"[Webhook] ✅ RSA signature verification successful")
             return True
-        except Exception as verify_err:
-            logger.info(f"[Webhook] ❌ RSA verification failed: {verify_err}")
-            # Additional debug info
-            if os.getenv("DEBUG_WEBHOOKS") == "true":
-                import hashlib
 
-                msg_hash = hashlib.sha256(message_to_verify).hexdigest()
-                logger.info(f"[Webhook] 🔐 Message SHA256 hash: {msg_hash}")
-            return False
+        logger.info("[Webhook] ❌ RSA verification failed: the signature matches no known Kick key")
+        # Additional debug info
+        if os.getenv("DEBUG_WEBHOOKS") == "true":
+            msg_hash = hashlib.sha256(message_to_verify).hexdigest()
+            logger.info(f"[Webhook] 🔐 Message SHA256 hash: {msg_hash}")
+        return False
 
     except Exception as e:
         logger.info(f"[Webhook] ❌ Signature verification error: {e}")
