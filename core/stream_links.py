@@ -110,6 +110,56 @@ def resolve_discord_id(engine, username: str, guild_id: int, platform: str):
     return row[0] if row else None
 
 
+def resolve_chatter_discord_id(engine, guild_id: int, platform: str, handle: str, platform_user_id=None):
+    """The Discord account a chatter linked on THIS platform, or None.
+
+    For gates (a giveaway's role requirement) rather than crediting, so it
+    prefers the chatter's IMMUTABLE platform id when the chat event carries one,
+    and falls back to the handle only for rows that predate the id column. A
+    handle row stamped with a DIFFERENT id is refused: that handle was renamed
+    away and claimed by someone else, and matching it would let a stranger
+    through on another viewer's roles.
+
+    `handle` is the chatter's own name on `platform` — on Twitch that is the
+    display name, not the canonical username identity crediting remaps to.
+    """
+    platform = (platform or "kick").lower()
+    puid = str(platform_user_id) if platform_user_id not in (None, "", 0) else None
+    with engine.connect() as conn:
+        if puid:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT discord_id FROM links
+                    WHERE discord_server_id = :gid AND COALESCE(platform, 'kick') = :p
+                      AND platform_user_id = :puid
+                    LIMIT 1
+                    """
+                ),
+                {"gid": guild_id, "p": platform, "puid": puid},
+            ).fetchone()
+            if row:
+                return row[0]
+        if not handle:
+            return None
+        row = conn.execute(
+            text(
+                """
+                SELECT discord_id, platform_user_id FROM links
+                WHERE discord_server_id = :gid AND COALESCE(platform, 'kick') = :p
+                  AND LOWER(kick_name) = :u
+                LIMIT 1
+                """
+            ),
+            {"gid": guild_id, "p": platform, "u": handle.lower()},
+        ).fetchone()
+    if not row:
+        return None
+    if puid and row[1] and str(row[1]) != puid:
+        return None
+    return row[0]
+
+
 def resolve_canonical_identity(engine, username: str, guild_id: int, platform: str):
     """
     Resolve (username, platform) -> (discord_id, canonical_username) under the

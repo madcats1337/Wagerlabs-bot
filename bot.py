@@ -74,7 +74,14 @@ from features.games.gtb_panel import setup_gtb_panel
 from features.games.guess_the_balance import GuessTheBalanceManager, parse_amount
 
 # Giveaway system import
-from features.giveaway.giveaway_manager import GiveawayManager, setup_giveaway_managers
+from features.giveaway.giveaway_manager import (
+    ALREADY_ENTERED,
+    GATE_REFUSALS,
+    MAX_ENTRIES,
+    NOT_LINKED,
+    GiveawayManager,
+    setup_giveaway_managers,
+)
 
 # Link panel import — combined Kick+Twitch panel (per-platform buttons)
 from features.linking.combined_link_panel import setup_combined_link_panel_system
@@ -893,10 +900,12 @@ class KickWebSocketManager:
             # links row if it predates the platform_user_id column. Costs at most one
             # UPDATE per viewer per process (see backfill_platform_user_id), never a
             # write per message, and can never raise into chat handling.
+            chat_user_id = None
             try:
                 from core.stream_links import backfill_platform_user_id, extract_chat_platform_user_id
 
-                backfill_platform_user_id(engine, guild_id, platform, username, extract_chat_platform_user_id(msg))
+                chat_user_id = extract_chat_platform_user_id(msg)
+                backfill_platform_user_id(engine, guild_id, platform, username, chat_user_id)
             except Exception:
                 pass
 
@@ -940,11 +949,19 @@ class KickWebSocketManager:
                 },
             )
 
-            # 🎁 GIVEAWAY: Track messages for keyword and active chatter detection
+            # 🎁 GIVEAWAY: Track messages for keyword and active chatter detection.
+            # Several chat giveaways can run at once, and one keyword may be shared
+            # by several (an open one and a role-only one), so one message can enter
+            # a chatter into more than one.
             if guild_id in giveaway_managers:
                 giveaway_manager = giveaway_managers[guild_id]
                 if giveaway_manager.active_giveaways:
-                    for giveaway in giveaway_manager.active_giveaways:
+                    # A keyword giveaway took this message (entered them, or had them already).
+                    keyword_taken = False
+                    # Keyword giveaways whose role requirement turned them away.
+                    turned_away = []
+                    # A copy: add_entry drops a giveaway it finds closed from the cache.
+                    for giveaway in list(giveaway_manager.active_giveaways):
                         try:
                             entry_method = giveaway["entry_method"]
                             giveaway_id = giveaway["id"]
@@ -952,7 +969,7 @@ class KickWebSocketManager:
 
                             # Keyword detection - exact match only (no extra text)
                             if entry_method == "keyword":
-                                keyword = giveaway.get("keyword", "").lower()
+                                keyword = (giveaway.get("keyword") or "").lower()
                                 if keyword and content.strip().lower() == keyword:
                                     entry_added = await giveaway_manager.add_entry(
                                         username,
@@ -960,9 +977,14 @@ class KickWebSocketManager:
                                         platform=platform,
                                         display_name=display_username,
                                         giveaway=giveaway,
+                                        platform_user_id=chat_user_id,
                                     )
                                     if entry_added:
                                         logger.info(f"🎁 Giveaway entry added: {username} (keyword: {keyword})")
+                                    if entry_added or entry_added.refusal in (ALREADY_ENTERED, MAX_ENTRIES):
+                                        keyword_taken = True
+                                    elif entry_added.refusal in GATE_REFUSALS:
+                                        turned_away.append((giveaway, entry_added))
 
                             # Active chatter tracking
                             elif entry_method == "active_chatter":
@@ -972,6 +994,7 @@ class KickWebSocketManager:
                                     platform=platform,
                                     display_name=display_username,
                                     giveaway=giveaway,
+                                    platform_user_id=chat_user_id,
                                 )
 
                             # Notify the dashboard admin page so its entries list updates
@@ -988,6 +1011,15 @@ class KickWebSocketManager:
                                 )
                         except Exception as e:
                             logger.info(f"⚠️ Giveaway tracking error: {e}")
+
+                    # Say why typing the keyword did nothing, but not when the same
+                    # keyword got them into another giveaway: an open one sharing a
+                    # role-only one's keyword shouldn't answer an entry with a refusal.
+                    if turned_away and not keyword_taken:
+                        try:
+                            await notify_giveaway_gate_refusal(guild_id, display_username, platform, *turned_away[0])
+                        except Exception as e:
+                            logger.info(f"⚠️ Giveaway refusal notice failed: {e}")
 
             # Process commands from Kick chat
             content_stripped = content.strip()
@@ -1704,6 +1736,36 @@ def require_link_ok(guild_id: int, username: str, platform: str) -> bool:
     except Exception as e:
         logger.warning(f"[require_link] check failed (allowing): {e}")
         return True
+
+
+# One "why you weren't entered" reply per role-only giveaway per this many
+# seconds. Answering every chatter without the role would flood chat (and the
+# bot's send limit) the moment a giveaway opens, when most typing it don't
+# qualify; the start announcement names the role for the rest.
+GIVEAWAY_GATE_NOTICE_SECONDS = 30
+_giveaway_gate_notice_at = {}
+
+
+async def notify_giveaway_gate_refusal(guild_id, display_username, platform, giveaway, outcome):
+    """Tell a chatter a keyword giveaway's role requirement turned them away."""
+    key = (guild_id, giveaway["id"])
+    now = time.monotonic()
+    if now - _giveaway_gate_notice_at.get(key, float("-inf")) < GIVEAWAY_GATE_NOTICE_SECONDS:
+        return
+    _giveaway_gate_notice_at[key] = now
+
+    guild = bot.get_guild(int(guild_id))
+    role = guild.get_role(int(outcome.role_id)) if guild and outcome.role_id else None
+    role_name = f"{role.name} role" if role else "required role"
+    title = giveaway.get("title") or "This giveaway"
+    if outcome.refusal == NOT_LINKED:
+        message = (
+            f"@{display_username} {title} is for members with the {role_name} in Discord. "
+            f"Link your {platform.capitalize()} account with the Link Account panel in Discord to enter."
+        )
+    else:
+        message = f"@{display_username} {title} is only for members with the {role_name} in Discord."
+    await send_kick_message(message, guild_id=guild_id)
 
 
 # -------------------------

@@ -2316,6 +2316,12 @@ class RedisSubscriber:
 
                     policy = announce_settings(engine, guild_id, "started")
 
+                    # A role-only chat giveaway says so up front, as the Discord
+                    # panel's "Requires @role" line does: the bot answers only one
+                    # turned-away chatter per 30 seconds.
+                    required_role_id = started_giveaway.get("required_role_id")
+                    role = guild.get_role(int(required_role_id)) if guild and required_role_id else None
+
                     # Announce in Discord — the channel configured for started
                     # announcements first, then this giveaway's own channel, and
                     # only then the guild's raffle channel.
@@ -2355,6 +2361,13 @@ class RedisSubscriber:
                                 inline=False,
                             )
 
+                        if required_role_id:
+                            embed.add_field(
+                                name="Who Can Enter",
+                                value=f"Members with <@&{int(required_role_id)}>, with Kick or Twitch linked here.",
+                                inline=False,
+                            )
+
                         allow_multiple = started_giveaway.get("allow_multiple_entries", False)
                         if allow_multiple:
                             max_entries = started_giveaway.get("max_entries_per_user", 5)
@@ -2377,6 +2390,9 @@ class RedisSubscriber:
                             message = f"🎁 GIVEAWAY STARTED: {giveaway_title} | Type {keyword} to enter!"
                         else:
                             message = f"🎁 GIVEAWAY STARTED: {giveaway_title} | Be active in chat to enter!"
+                        if required_role_id:
+                            role_name = role.name if role else "required"
+                            message += f" Only for members with the {role_name} role in Discord."
 
                         await self.announce_in_chat(message, guild_id=guild_id)
                         logger.info(f"✅ Announced giveaway start in Kick chat")
@@ -2395,6 +2411,12 @@ class RedisSubscriber:
                 logger.info(
                     f"✏️  [giveaway] {giveaway_id} edited ({', '.join(fields) or 'no fields'}); refreshing panel"
                 )
+                # Chat entries re-read the role requirement themselves; this keeps
+                # the cached title (named in their refusal replies) current.
+                try:
+                    await giveaway_manager.load_active_giveaways()
+                except Exception as e:
+                    logger.warning(f"[giveaway] active giveaway reload after edit failed: {e}")
                 try:
                     from features.giveaway.giveaway_panel import refresh_panel
 
