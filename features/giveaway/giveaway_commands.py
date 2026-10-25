@@ -64,7 +64,7 @@ def _fetch_templates_full(engine, guild_id):
             text(
                 """
                 SELECT id, name, entry_method, max_winners, allow_multiple_entries,
-                       max_entries_per_user, required_role_id, discord_channel_id,
+                       max_entries_per_user, required_role_id, entry_list, discord_channel_id,
                        keyword, messages_required, time_window_minutes, bonus_roles,
                        entry_prompt, entry_prompts
                 FROM giveaway_templates
@@ -84,7 +84,7 @@ def _fetch_template(engine, template_id, guild_id):
             text(
                 """
                 SELECT id, name, entry_method, max_winners, allow_multiple_entries,
-                       max_entries_per_user, required_role_id, discord_channel_id,
+                       max_entries_per_user, required_role_id, entry_list, discord_channel_id,
                        keyword, messages_required, time_window_minutes, bonus_roles,
                        entry_prompt, entry_prompts
                 FROM giveaway_templates
@@ -132,13 +132,13 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
                   (discord_server_id, title, description, entry_method, keyword,
                    messages_required, time_window_minutes, allow_multiple_entries,
                    max_entries_per_user, status, created_by, discord_channel_id,
-                   duration_minutes, max_winners, required_role_id, bonus_roles,
+                   duration_minutes, max_winners, required_role_id, entry_list, bonus_roles,
                    entry_prompt, entry_prompts, started_at, ends_at)
                 VALUES
                   (:sid, :title, :description, :entry_method, :keyword,
                    :messages_required, :time_window_minutes, :allow_multiple,
                    :max_per_user, 'active', :created_by, :channel_id,
-                   :duration, :max_winners, :required_role_id, CAST(:bonus AS JSONB),
+                   :duration, :max_winners, :required_role_id, :entry_list, CAST(:bonus AS JSONB),
                    :entry_prompt, CAST(:entry_prompts AS JSONB), CURRENT_TIMESTAMP,
                    -- NULL duration = no timer: ends_at stays NULL and the
                    -- expiry loop ignores it, so it waits for a manual draw.
@@ -165,6 +165,9 @@ async def _create_giveaway_from_template(bot, engine, interaction, tpl, title, d
                 # unlimited template into a single-winner giveaway.
                 "max_winners": _normalize_max_winners(tpl.get("max_winners")),
                 "required_role_id": tpl.get("required_role_id"),
+                # A chat template's entry list must come along: without it, a
+                # "verified affiliates" template would start open to everyone.
+                "entry_list": tpl.get("entry_list") if (tpl.get("entry_method") or "discord") != "discord" else None,
                 "bonus": _json.dumps(bonus_roles) if bonus_roles else None,
                 # Both shapes are written: the array is authoritative, the
                 # scalar carries question #1 for a service that predates it.
@@ -242,6 +245,9 @@ def _describe_template(tpl) -> str:
         bits.append(f"<#{int(tpl['discord_channel_id'])}>")
     if tpl.get("required_role_id"):
         bits.append(f"requires <@&{int(tpl['required_role_id'])}>")
+    if tpl.get("entry_list"):
+        # Not named: a list is the owner's, and whoever opens this panel may not be.
+        bits.append("limited to an entry list")
     bonus = tpl.get("bonus_roles") or {}
     if isinstance(bonus, dict) and bonus:
         parts = [f"<@&{int(rid)}> +{int(extra)}" for rid, extra in list(bonus.items())[:3]]

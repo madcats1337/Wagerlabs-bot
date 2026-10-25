@@ -19,11 +19,12 @@ logger = logging.getLogger(__name__)
 CLOSED = "closed"  # the giveaway stopped taking entries
 ALREADY_ENTERED = "already_entered"
 MAX_ENTRIES = "max_entries"
-# The role gate's refusals, the ones worth telling the chatter about.
+# The entry gate's refusals, the ones worth telling the chatter about.
 NOT_LINKED = "not_linked"  # no Discord account linked to this chat account
 NOT_MEMBER = "not_member"  # linked, but not in the Discord server
 MISSING_ROLE = "missing_role"  # in the server without the role
-GATE_REFUSALS = frozenset({NOT_LINKED, NOT_MEMBER, MISSING_ROLE})
+NOT_ON_LIST = "not_on_list"  # a list-only giveaway, and they aren't on the list
+GATE_REFUSALS = frozenset({NOT_LINKED, NOT_MEMBER, MISSING_ROLE, NOT_ON_LIST})
 # Discord couldn't be asked. Refused rather than waved through: an outage must
 # not open a role-only giveaway to everyone.
 GATE_UNAVAILABLE = "gate_unavailable"
@@ -40,12 +41,13 @@ class EntryOutcome:
     """What one entry attempt did. Truthy only when an entry was recorded, so a
     caller that only asks "was someone entered?" keeps writing `if added:`."""
 
-    __slots__ = ("added", "refusal", "role_id")
+    __slots__ = ("added", "refusal", "role_id", "list_key")
 
-    def __init__(self, added, refusal=None, role_id=None):
+    def __init__(self, added, refusal=None, role_id=None, list_key=None):
         self.added = added
         self.refusal = refusal
         self.role_id = role_id
+        self.list_key = list_key
 
     def __bool__(self):
         return self.added
@@ -206,6 +208,31 @@ class GiveawayManager:
             return discord_id, MISSING_ROLE
         return discord_id, None
 
+    async def _entry_gate(self, role_id, list_key, platform, handle, platform_user_id):
+        """(discord_id, None) when the chatter may enter, else (discord_id, refusal).
+
+        A giveaway with a role and an entry list takes a chatter who meets
+        either. The list is asked first: one query, and no Discord call for
+        someone the site already vouches for.
+        """
+        from core.stream_links import resolve_chatter_discord_id
+        from features.giveaway.entry_lists import on_entry_list
+
+        if not list_key:
+            return await self._role_gate(role_id, platform, handle, platform_user_id)
+        if on_entry_list(self.engine, self.guild_id, list_key, platform, handle, platform_user_id):
+            return None, None
+        # Not on it under their chat name; perhaps under the Discord account
+        # they linked here, which the site may know them by.
+        discord_id = resolve_chatter_discord_id(self.engine, self.guild_id, platform, handle, platform_user_id)
+        if discord_id is not None and on_entry_list(
+            self.engine, self.guild_id, list_key, platform, None, discord_id=discord_id
+        ):
+            return discord_id, None
+        if not role_id:
+            return discord_id, NOT_ON_LIST
+        return await self._role_gate(role_id, platform, handle, platform_user_id)
+
     async def add_entry(
         self,
         kick_username,
@@ -227,7 +254,8 @@ class GiveawayManager:
         role gate's link lookup.
 
         The row is read here rather than trusted from the cached `giveaway`: the
-        role requirement can change (or go) while the giveaway runs, and a stop
+        role requirement and the entry list can change (or go) while the
+        giveaway runs, and a stop
         the bot never heard about must not keep entering people. Someone already
         in is turned away before the gate and the avatar lookup, so a chatter
         spamming the keyword costs one query.
@@ -242,7 +270,7 @@ class GiveawayManager:
             row = conn.execute(
                 text(
                     """
-                SELECT g.status, g.required_role_id, g.allow_multiple_entries, g.max_entries_per_user,
+                SELECT g.status, g.required_role_id, g.entry_list, g.allow_multiple_entries, g.max_entries_per_user,
                        (SELECT ge.entry_count FROM giveaway_entries ge
                         WHERE ge.giveaway_id = g.id AND ge.kick_username = :username
                         LIMIT 1) AS entry_count
@@ -267,14 +295,18 @@ class GiveawayManager:
                 logger.debug(f"{kick_username} reached max entries ({max_entries}) for giveaway {giveaway_id}")
                 return EntryOutcome(False, MAX_ENTRIES)
 
-        if row.required_role_id:
-            role_id = int(row.required_role_id)
-            gated_discord_id, refusal = await self._role_gate(
-                role_id, platform, display_name or kick_username, platform_user_id
+        if row.required_role_id or row.entry_list:
+            role_id = int(row.required_role_id) if row.required_role_id else None
+            list_key = row.entry_list or None
+            gated_discord_id, refusal = await self._entry_gate(
+                role_id, list_key, platform, display_name or kick_username, platform_user_id
             )
             if refusal:
-                logger.info(f"{kick_username} not entered in giveaway {giveaway_id}: {refusal} (role {role_id})")
-                return EntryOutcome(False, refusal, role_id=role_id)
+                logger.info(
+                    f"{kick_username} not entered in giveaway {giveaway_id}: {refusal} "
+                    f"(role {role_id}, list {list_key})"
+                )
+                return EntryOutcome(False, refusal, role_id=role_id, list_key=list_key)
             # Lets the winner announcement @mention them.
             discord_id = discord_id or gated_discord_id
 

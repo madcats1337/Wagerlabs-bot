@@ -31,7 +31,7 @@ def engine():
                 """
                 CREATE TABLE giveaways (
                     id INTEGER PRIMARY KEY, discord_server_id BIGINT, title TEXT,
-                    entry_method TEXT, keyword TEXT, status TEXT, required_role_id BIGINT,
+                    entry_method TEXT, keyword TEXT, status TEXT, required_role_id BIGINT, entry_list TEXT,
                     allow_multiple_entries BOOLEAN DEFAULT 0, max_entries_per_user INTEGER DEFAULT 1,
                     messages_required INTEGER DEFAULT 1, time_window_minutes INTEGER DEFAULT 10
                 )

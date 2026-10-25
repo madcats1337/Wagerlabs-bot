@@ -1754,7 +1754,9 @@ _giveaway_gate_notice_at = {}
 
 
 async def notify_giveaway_gate_refusal(guild_id, display_username, platform, giveaway, outcome):
-    """Tell a chatter a keyword giveaway's role requirement turned them away."""
+    """Tell a chatter a keyword giveaway's role or entry list turned them away."""
+    from features.giveaway.entry_lists import chat_requirement
+
     key = (guild_id, giveaway["id"])
     now = time.monotonic()
     if now - _giveaway_gate_notice_at.get(key, float("-inf")) < GIVEAWAY_GATE_NOTICE_SECONDS:
@@ -1762,16 +1764,15 @@ async def notify_giveaway_gate_refusal(guild_id, display_username, platform, giv
     _giveaway_gate_notice_at[key] = now
 
     guild = bot.get_guild(int(guild_id))
-    role = guild.get_role(int(outcome.role_id)) if guild and outcome.role_id else None
-    role_name = f"{role.name} role" if role else "required role"
+    who, hint = chat_requirement(engine, guild, guild_id, outcome.role_id, outcome.list_key)
     title = giveaway.get("title") or "This giveaway"
-    if outcome.refusal == NOT_LINKED:
-        message = (
-            f"@{display_username} {title} is for members with the {role_name} in Discord. "
-            f"Link your {platform.capitalize()} account with the Link Account panel in Discord to enter."
-        )
-    else:
-        message = f"@{display_username} {title} is only for members with the {role_name} in Discord."
+    message = f"@{display_username} {title} is only for {who or 'some viewers'}."
+    # The list's own hint says how to get on it. Without one, an unlinked
+    # chatter can still be told how to make the role count.
+    if hint:
+        message += f" {hint}"
+    elif outcome.refusal == NOT_LINKED:
+        message += f" Link your {platform.capitalize()} account with the Link Account panel in Discord to enter."
     await send_kick_message(message, guild_id=guild_id)
 
 
@@ -10029,6 +10030,49 @@ async def on_ready():
                     )
                 )
                 logger.debug("✅ giveaway_templates table ready")
+
+                # Giveaway entry lists, which a site replaces through the
+                # dashboard's public API and chat entries are checked against
+                # (features/giveaway/entry_lists.py). The dashboard owns them;
+                # mirrored here because add_entry reads giveaways.entry_list
+                # and either service may boot first.
+                conn.execute(
+                    text(
+                        """
+                    CREATE TABLE IF NOT EXISTS giveaway_lists (
+                        id SERIAL PRIMARY KEY,
+                        discord_server_id BIGINT NOT NULL,
+                        list_key VARCHAR(64) NOT NULL,
+                        name VARCHAR(100) NOT NULL,
+                        hint VARCHAR(150),
+                        member_count INTEGER NOT NULL DEFAULT 0,
+                        updated_by VARCHAR(255),
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE (discord_server_id, list_key)
+                    );
+                    CREATE TABLE IF NOT EXISTS giveaway_list_members (
+                        list_id INTEGER NOT NULL REFERENCES giveaway_lists(id) ON DELETE CASCADE,
+                        member_no INTEGER NOT NULL,
+                        platform VARCHAR(16) NOT NULL,
+                        platform_user_id VARCHAR(64),
+                        username_key VARCHAR(64),
+                        display_name VARCHAR(64)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_giveaway_list_members_member
+                        ON giveaway_list_members (list_id, member_no);
+                    CREATE INDEX IF NOT EXISTS idx_giveaway_list_members_uid
+                        ON giveaway_list_members (list_id, platform, platform_user_id)
+                        WHERE platform_user_id IS NOT NULL;
+                    CREATE INDEX IF NOT EXISTS idx_giveaway_list_members_name
+                        ON giveaway_list_members (list_id, platform, username_key)
+                        WHERE username_key IS NOT NULL;
+                    ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS entry_list VARCHAR(64);
+                    ALTER TABLE giveaway_templates ADD COLUMN IF NOT EXISTS entry_list VARCHAR(64);
+                """
+                    )
+                )
+                logger.debug("✅ giveaway entry lists ready")
 
                 # Add provably fair columns to slot_requests table
                 logger.debug("🔄 Checking provably fair columns in slot_requests table...")

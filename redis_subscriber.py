@@ -2316,11 +2316,15 @@ class RedisSubscriber:
 
                     policy = announce_settings(engine, guild_id, "started")
 
-                    # A role-only chat giveaway says so up front, as the Discord
-                    # panel's "Requires @role" line does: the bot answers only one
-                    # turned-away chatter per 30 seconds.
+                    # A gated chat giveaway (a role, an entry list, or either)
+                    # says so up front, as the Discord panel's "Requires @role"
+                    # line does: the bot answers only one turned-away chatter per
+                    # 30 seconds.
+                    from features.giveaway.entry_lists import chat_requirement
+
                     required_role_id = started_giveaway.get("required_role_id")
-                    role = guild.get_role(int(required_role_id)) if guild and required_role_id else None
+                    entry_list = started_giveaway.get("entry_list")
+                    who, list_hint = chat_requirement(engine, guild, guild_id, required_role_id, entry_list)
 
                     # Announce in Discord — the channel configured for started
                     # announcements first, then this giveaway's own channel, and
@@ -2361,10 +2365,16 @@ class RedisSubscriber:
                                 inline=False,
                             )
 
-                        if required_role_id:
+                        if who:
+                            who_here, _ = chat_requirement(
+                                engine, guild, guild_id, required_role_id, entry_list, mention_role=True
+                            )
+                            value = who_here[0].upper() + who_here[1:]
+                            if required_role_id:
+                                value += ", with Kick or Twitch linked here"
                             embed.add_field(
                                 name="Who Can Enter",
-                                value=f"Members with <@&{int(required_role_id)}>, with Kick or Twitch linked here.",
+                                value=f"{value}." + (f"\n{list_hint}" if list_hint else ""),
                                 inline=False,
                             )
 
@@ -2390,9 +2400,8 @@ class RedisSubscriber:
                             message = f"🎁 GIVEAWAY STARTED: {giveaway_title} | Type {keyword} to enter!"
                         else:
                             message = f"🎁 GIVEAWAY STARTED: {giveaway_title} | Be active in chat to enter!"
-                        if required_role_id:
-                            role_name = role.name if role else "required"
-                            message += f" Only for members with the {role_name} role in Discord."
+                        if who:
+                            message += f" Only for {who}." + (f" {list_hint}" if list_hint else "")
 
                         await self.announce_in_chat(message, guild_id=guild_id)
                         logger.info(f"✅ Announced giveaway start in Kick chat")
