@@ -54,6 +54,9 @@ def normalize_twitch_chat_event(event: dict) -> dict:
             "username": chatter_login,
             "slug": chatter_login,
         },
+        # set_ids ("moderator", "broadcaster", ...) — what mod-only chat
+        # commands check, alongside Kick's badge texts.
+        "badges": [b.get("set_id") for b in (event.get("badges") or []) if isinstance(b, dict)],
         "_platform": "twitch",
         "_server_id": event.get("_server_id"),
         "_broadcaster_user_id": event.get("_broadcaster_user_id"),

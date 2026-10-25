@@ -6,11 +6,17 @@ Handles dynamic custom commands loaded from database
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 import psycopg2
 
+from features.points.points_grants import MAX_GRANT, give_points_to_chat_name, parse_positive_int
+
 logger = logging.getLogger(__name__)
+
+#: `{give_points}` (amount typed after the target) or `{give_points:500}` (fixed).
+_GIVE_POINTS_RE = re.compile(r"\{give_points(?::([0-9][0-9,]*))?\}")
 
 
 _DATABASE_VARIABLES = frozenset(
@@ -56,7 +62,7 @@ _DATABASE_VARIABLES = frozenset(
 
 
 class CustomCommandsManager:
-    def __init__(self, bot, send_message_callback=None, discord_server_id=None):
+    def __init__(self, bot, send_message_callback=None, discord_server_id=None, engine=None):
         """
         Initialize custom commands manager
 
@@ -64,10 +70,12 @@ class CustomCommandsManager:
             bot: The Discord bot instance
             send_message_callback: Async function to send messages to Kick chat
             discord_server_id: Discord server ID for multiserver support
+            engine: SQLAlchemy engine, used by the {give_points} grant
         """
         self.bot = bot
         self.send_message_callback = send_message_callback
         self.discord_server_id = discord_server_id
+        self.engine = engine
         self.commands = {}  # {command_name: {response, cooldown, enabled, use_count}}
         self.last_used = {}  # {command_name: last_used_timestamp}
         self.database_url = os.getenv("DATABASE_URL")
@@ -148,7 +156,9 @@ class CustomCommandsManager:
         logger.info("🔄 Reloading custom commands from database...")
         await self.load_commands()
 
-    async def handle_message(self, message_content, username, *, platform="kick", display_name=None):
+    async def handle_message(
+        self, message_content, username, *, platform="kick", display_name=None, is_moderator=False, recent_names=()
+    ):
         """
         Check if message is a custom command and respond
 
@@ -157,6 +167,8 @@ class CustomCommandsManager:
             username: Canonical username used for shared viewer statistics
             platform: Originating chat platform (kick or twitch)
             display_name: Native platform username used for display
+            is_moderator: Chatter has a moderator or broadcaster badge
+            recent_names: Recent chatters, which count as known {give_points} targets
 
         Returns:
             bool: True if command was handled, False otherwise
@@ -184,6 +196,16 @@ class CustomCommandsManager:
         if not cmd_data["enabled"]:
             return False
 
+        give_match = _GIVE_POINTS_RE.search(cmd_data["response"])
+        native_name = display_name or username
+
+        # A {give_points} command creates points, so only mods and the
+        # broadcaster may run it. Anyone else is ignored without a reply (so it
+        # can't be used to spam chat), before the cooldown so a viewer's attempt
+        # can't block the next mod use.
+        if give_match and not is_moderator:
+            return True
+
         # Check cooldown
         if command in self.last_used:
             cooldown = cmd_data["cooldown"]
@@ -199,6 +221,22 @@ class CustomCommandsManager:
             if self.send_message_callback:
                 response = cmd_data["response"]
 
+                grant_replacements = {}
+                if give_match:
+                    outcome = await self._give_points(give_match, command, args, platform, recent_names)
+                    if isinstance(outcome, str):
+                        # Usage or lookup problem: tell the mod, grant nothing,
+                        # and leave the cooldown and use count alone.
+                        await self.send_message_callback(f"@{native_name} {outcome}")
+                        return True
+                    target, amount, balance = outcome
+                    grant_replacements = {
+                        give_match.group(0): f"{amount:,}",
+                        "{target}": target,
+                        "{target_points}": f"{balance:,}",
+                    }
+                    logger.info(f"Custom command !{command}: {username} gave {amount} points to {target}")
+
                 # Apply variable replacements
                 next_use_count = int(cmd_data.get("use_count") or 0) + 1
                 response = await self._replace_variables(
@@ -210,6 +248,7 @@ class CustomCommandsManager:
                     platform=platform,
                     display_name=display_name,
                     use_count=next_use_count,
+                    extra_replacements=grant_replacements,
                 )
 
                 await self.send_message_callback(response)
@@ -242,6 +281,7 @@ class CustomCommandsManager:
         platform: str = "kick",
         display_name: str = None,
         use_count: int = 0,
+        extra_replacements: dict = None,
     ) -> str:
         """
         Replace custom variables in command response text
@@ -290,6 +330,9 @@ class CustomCommandsManager:
         - {hunt_remaining} - Unopened bonuses in the active hunt
         - {hunt_total_payout} - Current total payout in the active hunt
         - {hunt_profit} - Current active-hunt profit or loss
+        - {give_points} / {give_points:N} - Points granted by a mod grant (see _give_points)
+        - {target} - The viewer a mod grant credited
+        - {target_points} - That viewer's balance after the grant
 
         Args:
             text: The response text with variables
@@ -310,6 +353,7 @@ class CustomCommandsManager:
             "{args}": args,
             "{arg1}": arg1,
             "{uses}": f"{int(use_count or 0):,}",
+            **(extra_replacements or {}),
         }
         requested_tokens = {token for token in _DATABASE_VARIABLES if token in text}
         if not requested_tokens:
@@ -419,6 +463,43 @@ class CustomCommandsManager:
             "{hunt_profit}": self._format_amount(data.get("hunt_profit")),
         }
         return self._replace_tokens(text, {**basic_replacements, **database_replacements})
+
+    async def _give_points(self, give_match, command, args, platform, recent_names):
+        """Run a {give_points} grant: ``!cmd @viewer [amount]``.
+
+        The target is the first word after the command. The amount is fixed by
+        ``{give_points:N}``, otherwise it's the second word. Returns
+        ``(target, amount, new_balance)``, or a message for the mod when the
+        command was used wrong or the viewer isn't known.
+        """
+        fixed = give_match.group(1)
+        words = args.split()
+        usage = f"usage: !{command} @viewer" + ("" if fixed else " amount")
+        if not words:
+            return usage
+        amount = parse_positive_int(fixed if fixed else (words[1] if len(words) > 1 else None), MAX_GRANT)
+        if amount is None:
+            return usage if not fixed else "this command's point amount is invalid."
+        if self.engine is None or not self.discord_server_id:
+            logger.warning("{give_points} used without an engine or server")
+            return "points can't be given right now."
+
+        try:
+            balance = await asyncio.to_thread(
+                give_points_to_chat_name,
+                self.engine,
+                self.discord_server_id,
+                words[0],
+                amount,
+                platform,
+                list(recent_names),
+            )
+        except Exception:
+            logger.exception(f"{{give_points}} grant failed in !{command}")
+            return "points couldn't be given, try again."
+        if balance is None:
+            return f"couldn't find a viewer named {words[0].lstrip('@')}."
+        return words[0].lstrip("@"), amount, balance
 
     @staticmethod
     def _replace_tokens(text, replacements):

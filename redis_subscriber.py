@@ -1279,6 +1279,33 @@ class RedisSubscriber:
         guild_name = guild.name if guild else "Unknown"
         logger.info(f"📥 Point Shop Event: {action} (guild={guild_name}, guild_id={guild_id})")
 
+        if action == "points_drop":
+            # Dashboard "Drop now". bot.py runs as __main__ — resolve the live
+            # module there, never `from bot import` (a second, unconfigured copy).
+            import sys as _sys
+
+            _main = _sys.modules.get("__main__")
+            run_drop = getattr(_main, "run_points_drop_for_guild", None)
+            send = getattr(_main, "send_stream_message", None)
+            if not guild_id or run_drop is None or send is None:
+                logger.warning("points_drop: no guild or bot drop runner available")
+                return
+            try:
+                amount = int(data.get("amount") or 0) or None
+            except (TypeError, ValueError):
+                amount = None
+            try:
+                line = await run_drop(
+                    int(guild_id), amount, source="dashboard", triggered_by=data.get("triggered_by") or "dashboard"
+                )
+                if line.startswith("Points drop!"):
+                    await send(line, guild_id=int(guild_id))
+                else:
+                    logger.info(f"points_drop: {line}")
+            except Exception as e:
+                logger.error(f"points_drop failed: {e}")
+            return
+
         if action == "post_shop":
             channel_id = data.get("channel_id")
 

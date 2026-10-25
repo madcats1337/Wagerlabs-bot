@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import random
+import re
 import ssl
 import string
 import time
@@ -85,6 +86,28 @@ from features.linking.shuffle_panel import setup_shuffle_panel_system
 
 # Timed messages import
 from features.messaging.timed_messages import setup_timed_messages
+
+# Loyalty points grants, drops and role bonuses
+from features.points.points_grants import (
+    KNOWN_CHAT_BOTS,
+    MAX_DROP_AMOUNT,
+    MAX_DROP_WINDOW_MINUTES,
+    MAX_GRANT,
+    broadcaster_names,
+    chatters_since,
+    credit_points,
+    format_drop_announcement,
+    give_points_to_chat_name,
+    is_chat_moderator,
+    load_drop_settings,
+    load_role_bonuses,
+    normalize_chat_name,
+    parse_positive_int,
+    record_chatter,
+    resolve_points_target,
+    role_bonus_for,
+    run_points_drop,
+)
 
 # Slot call tracker import
 from features.slot_requests.slot_calls import setup_slot_call_tracker
@@ -901,6 +924,7 @@ class KickWebSocketManager:
             guild_chatters = recent_chatters_by_guild.get(guild_id, {})
             guild_chatters[username_lower] = now
             recent_chatters_by_guild[guild_id] = guild_chatters
+            record_chatter(guild_id, username_lower, now)
 
             # Publish to Redis for dashboard (optional)
             publish_redis_event(
@@ -986,6 +1010,8 @@ class KickWebSocketManager:
                             username,
                             platform=platform,
                             display_name=display_username,
+                            is_moderator=is_chat_moderator(msg.get("badges")),
+                            recent_names=chatters_since(guild_id, MAX_DROP_WINDOW_MINUTES).keys(),
                         )
                     finally:
                         commands_manager.discord_server_id = original_guild_id
@@ -994,6 +1020,12 @@ class KickWebSocketManager:
                         return  # Command was handled, don't process further
                 except Exception as e:
                     logger.info(f"⚠️ Custom command error: {e}")
+
+            # Loyalty points mod commands: !givepoints, !drop
+            if await handle_points_chat_command(
+                guild_id, content_stripped, display_username, platform, msg.get("badges")
+            ):
+                return
 
             # !points command
             if content_stripped.lower() == "!points":
@@ -2178,6 +2210,26 @@ try:
             )
         )
 
+        # Random points drops on active chatters (mirrored in the dashboard's
+        # run_migrations, which reads it for the drop history).
+        conn.execute(
+            text(
+                """
+        CREATE TABLE IF NOT EXISTS points_drops (
+            id SERIAL PRIMARY KEY,
+            discord_server_id BIGINT NOT NULL,
+            amount INTEGER NOT NULL,
+            winners TEXT[] NOT NULL DEFAULT '{}',
+            source VARCHAR(20) NOT NULL,
+            triggered_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_points_drops_server_created
+            ON points_drops (discord_server_id, created_at DESC);
+        """
+            )
+        )
+
         # Point shop items
         conn.execute(
             text(
@@ -2798,6 +2850,7 @@ async def kick_chat_loop(channel_slug: str, guild_id: int):
                             guild_recent_chatters = recent_chatters_by_guild.get(guild_id, {})
                             guild_recent_chatters[username_lower] = now
                             recent_chatters_by_guild[guild_id] = guild_recent_chatters
+                            record_chatter(guild_id, username_lower, now)
 
                             # 🎁 GIVEAWAY: Track messages for keyword and active chatter detection
                             if guild_id in giveaway_managers:
@@ -2846,6 +2899,10 @@ async def kick_chat_loop(channel_slug: str, guild_id: int):
                                             username,
                                             platform="kick",
                                             display_name=username,
+                                            is_moderator=is_chat_moderator(
+                                                ((payload.get("sender") or {}).get("identity") or {}).get("badges")
+                                            ),
+                                            recent_names=chatters_since(guild_id, MAX_DROP_WINDOW_MINUTES).keys(),
                                         )
                                     finally:
                                         commands_manager.discord_server_id = original_guild_id
@@ -3990,6 +4047,7 @@ async def kick_chat_loop(channel_name: str, guild_id: int):
                                     guild_recent_chatters = recent_chatters_by_guild.get(guild_id, {})
                                     guild_recent_chatters[username_lower] = now
                                     recent_chatters_by_guild[guild_id] = guild_recent_chatters
+                                    record_chatter(guild_id, username_lower, now)
 
                                     logger.info(f"💬 {username}: {content_text}")
 
@@ -4012,6 +4070,14 @@ async def kick_chat_loop(channel_name: str, guild_id: int):
                                                     username,
                                                     platform="kick",
                                                     display_name=username,
+                                                    is_moderator=is_chat_moderator(
+                                                        ((event_data.get("sender") or {}).get("identity") or {}).get(
+                                                            "badges"
+                                                        )
+                                                    ),
+                                                    recent_names=chatters_since(
+                                                        guild_id, MAX_DROP_WINDOW_MINUTES
+                                                    ).keys(),
                                                 )
                                             finally:
                                                 commands_manager.discord_server_id = original_guild_id
@@ -4636,8 +4702,19 @@ async def award_points_for_watchtime(active_usernames: list, guild_id: Optional[
                 elif key == "sub_points_per_5min":
                     sub_points_per_5min = int(value)
 
-        if points_per_5min == 0 and sub_points_per_5min == 0:
+            # Members holding a configured Discord role earn extra points per
+            # block. Read every pass, like the rates, so dashboard edits apply
+            # without a restart. A bad setting only loses the bonus.
+            try:
+                role_bonuses = load_role_bonuses(conn, server_id)
+            except Exception as e:
+                logger.warning(f"[Points] Could not read role bonuses: {e}")
+                role_bonuses = {}
+
+        if points_per_5min == 0 and sub_points_per_5min == 0 and not role_bonuses:
             return  # Points system disabled
+
+        guild = bot.get_guild(server_id) if role_bonuses else None
 
         with engine.begin() as conn:
             for username in active_usernames:
@@ -4696,6 +4773,12 @@ async def award_points_for_watchtime(active_usernames: list, guild_id: Optional[
                         # TODO: Check if user is subscriber for bonus points
                         # For now, use regular points rate
                         points_to_award = intervals * points_per_5min
+
+                        # Role bonus: the highest bonus among the linked member's
+                        # roles, per block. Unlinked viewers have no member.
+                        if guild is not None and discord_id:
+                            bonus = role_bonus_for(guild.get_member(int(discord_id)), role_bonuses)
+                            points_to_award += intervals * bonus
 
                         if points_to_award > 0:
                             # discord_id already retrieved above for verification
@@ -4758,6 +4841,106 @@ async def award_points_for_watchtime(active_usernames: list, guild_id: Optional[
 
     except Exception as e:
         logger.info(f"[Points] ⚠️ Error in points award task: {e}")
+
+
+async def run_points_drop_for_guild(guild_id, amount=None, *, source, triggered_by=None):
+    """Credit random recent chatters; returns the chat line to post.
+
+    ``amount`` overrides the dashboard default; winners, the active window and
+    the exclusions always come from the dashboard. Chatters are collapsed to one
+    per person (the watchtime dedupe) so a dual-platform viewer can't win twice.
+    """
+    snapshot = chatters_since(guild_id, MAX_DROP_WINDOW_MINUTES)
+
+    def _drop():
+        with engine.begin() as conn:
+            settings = load_drop_settings(conn, guild_id)
+            if source == "chat" and not settings["chat_enabled"]:
+                return None, [], 0
+            drop_amount = amount or settings["amount"]
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings["window_minutes"])
+            excluded = settings["exclude"] | KNOWN_CHAT_BOTS | broadcaster_names(conn, guild_id)
+            pool = {u: t for u, t in snapshot.items() if t >= cutoff and u not in excluded}
+            pool = dedupe_active_users_by_person(conn, pool, guild_id)
+            candidates = [u for u in pool if u not in excluded]
+            winners = run_points_drop(
+                conn, guild_id, candidates, drop_amount, settings["winners"], source, triggered_by
+            )
+            return settings, winners, drop_amount
+
+    settings, winners, drop_amount = await asyncio.to_thread(_drop)
+    if settings is None:
+        return "Chat drops are turned off in the dashboard."
+    if not winners:
+        return "No recent chatters to drop points on."
+    logger.info(f"[Points] Drop ({source}) by {triggered_by}: {drop_amount} each to {winners}")
+    return format_drop_announcement(winners, drop_amount)
+
+
+async def handle_points_chat_command(guild_id, content, display_name, platform, badges) -> bool:
+    """Mod chat commands: ``!givepoints <user> <amount>`` and ``!drop [amount]``.
+
+    Returns True when the message was one of them. A viewer without a mod or
+    broadcaster badge is ignored, so the commands can't be used to spam chat.
+    """
+    parts = content.split()
+    command = parts[0].lower() if parts else ""
+    if command not in ("!givepoints", "!drop"):
+        return False
+    if not is_chat_moderator(badges):
+        return True
+    if not server_has_feature(engine, guild_id, "point_shop"):
+        await send_kick_message(upgrade_message(display_name, "point_shop"), guild_id=guild_id)
+        return True
+
+    if command == "!givepoints":
+        target = normalize_chat_name(parts[1]) if len(parts) > 1 else ""
+        amount = parse_positive_int(parts[2], MAX_GRANT) if len(parts) > 2 else None
+        if not target or amount is None:
+            await send_kick_message(f"@{display_name} usage: !givepoints @viewer amount", guild_id=guild_id)
+            return True
+        try:
+            balance = await asyncio.to_thread(
+                give_points_to_chat_name,
+                engine,
+                guild_id,
+                target,
+                amount,
+                platform,
+                list(chatters_since(guild_id, MAX_DROP_WINDOW_MINUTES)),
+            )
+        except Exception:
+            logger.exception("[Points] !givepoints failed")
+            await send_kick_message(f"@{display_name} points couldn't be given, try again.", guild_id=guild_id)
+            return True
+        if balance is None:
+            reply = f"@{display_name} couldn't find a viewer named {target}."
+        else:
+            reply = f"@{display_name} gave {amount:,} points to @{target}. They now have {balance:,}."
+            logger.info(f"[Points] {display_name} gave {amount} points to {target} in chat")
+        await send_kick_message(reply, guild_id=guild_id)
+        return True
+
+    amount = None
+    if len(parts) > 1:
+        amount = parse_positive_int(parts[1], MAX_DROP_AMOUNT)
+        if amount is None:
+            await send_kick_message(
+                f"@{display_name} usage: !drop or !drop amount (up to {MAX_DROP_AMOUNT:,})", guild_id=guild_id
+            )
+            return True
+    try:
+        line = await run_points_drop_for_guild(guild_id, amount, source="chat", triggered_by=display_name)
+    except Exception:
+        logger.exception("[Points] !drop failed")
+        await send_kick_message(f"@{display_name} the drop failed, try again.", guild_id=guild_id)
+        return True
+    if line.startswith("Points drop!"):
+        # Winners can be on either platform, so the result goes to every one.
+        await send_stream_message(line, guild_id=guild_id)
+    else:
+        await send_kick_message(f"@{display_name} {line}", guild_id=guild_id)
+    return True
 
 
 # -------------------------
@@ -8583,7 +8766,11 @@ async def admin_command_list(ctx):
     # Points
     embed.add_field(
         name="💰 Loyalty Points",
-        value="`/pointsgive <@user> <amount> [reason]` - Give loyalty points to a member",
+        value=(
+            "`/givepoints <user> <amount>` - Give points to a member or a Kick/Twitch viewer\n"
+            "`!givepoints <user> <amount>` - Same, typed in Kick/Twitch chat by a mod\n"
+            "`!drop [amount]` - Mods drop points on random recent chatters"
+        ),
         inline=False,
     )
 
@@ -10013,6 +10200,7 @@ async def on_ready():
                         send_stream_message(msg, guild_id=gid)
                     ),
                     discord_server_id=guild.id,
+                    engine=engine,
                 )
                 await custom_commands_manager.start()  # Load commands from database
                 if not hasattr(bot, "custom_commands_managers"):
@@ -10286,7 +10474,9 @@ async def on_ready():
 
             # Setup custom commands manager (platform-aware send; works for Kick
             # and/or Twitch servers).
-            custom_commands_manager = CustomCommandsManager(bot, send_message_callback=send_stream_message)
+            custom_commands_manager = CustomCommandsManager(
+                bot, send_message_callback=send_stream_message, engine=engine
+            )
             await custom_commands_manager.start()
             bot.custom_commands_manager = custom_commands_manager
             logger.debug(f"✅ Custom commands system initialized")
@@ -12910,75 +13100,86 @@ async def cmd_points_leaderboard(ctx, limit: int = 10):
     await ctx.send(embed=embed)
 
 
-@bot.hybrid_command(name="pointsgive", aliases=["givepoints"])
+_DISCORD_MENTION_RE = re.compile(r"^<@!?(\d{15,25})>$|^(\d{15,25})$")
+
+
+@bot.hybrid_command(name="givepoints", aliases=["pointsgive"])
 @app_commands.default_permissions(administrator=True)
 @commands.has_permissions(administrator=True)
-async def cmd_points_give(ctx, user: discord.Member, amount: int, *, reason: str = "Admin bonus"):
+@app_commands.describe(
+    user="A Discord member (@mention) or a Kick/Twitch username",
+    amount="Points to give",
+)
+async def cmd_give_points(ctx, user: str, amount: int):
     """
-    [ADMIN] Give loyalty points to a member
-    Usage: /pointsgive @user <amount> [reason]
-    Example: /pointsgive @John 500 Subathon bonus
+    [ADMIN] Give loyalty points to a member or a Kick/Twitch viewer
+    Usage: /givepoints <user> <amount>
+    Example: /givepoints @John 500  or  /givepoints luckylena 500
     """
     # Reads the database before its first reply — acknowledge the slash interaction first.
     await defer_slash_response(ctx)
 
-    if amount <= 0:
-        await ctx.send("❌ Point amount must be positive.")
+    amount = parse_positive_int(amount, MAX_GRANT)
+    if amount is None:
+        await ctx.send(f"❌ Amount must be between 1 and {MAX_GRANT:,}.")
         return
 
-    guild_id = ctx.guild.id
+    guild = ctx.guild
+    guild_id = guild.id
+    typed = user.strip()
+
+    # A mention or ID names a Discord member outright. Anything else is first
+    # read as a Kick/Twitch name (the usual case for chat viewers), then as a
+    # Discord username or nickname.
+    member = None
+    mention = _DISCORD_MENTION_RE.match(typed)
+    if mention:
+        member_id = int(mention.group(1) or mention.group(2))
+        member = guild.get_member(member_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(member_id)
+            except discord.HTTPException:
+                member = None
+        if member is None:
+            await ctx.send("❌ That member isn't in this server.")
+            return
 
     try:
         with engine.begin() as conn:
-            # Points are shared across a person's platforms and live on ONE row,
-            # keyed by their canonical username — the same row award_points writes
-            # to. Resolving through resolve_shop_identity is what keeps a grant
-            # visible to a dual-platform viewer no matter which handle they spend
-            # from; writing to the mentioned member's Kick handle directly would
-            # strand the points on a row nothing reads.
-            canonical, accounts = resolve_shop_identity(conn, user.id, guild_id)
-
-            if not accounts:
-                await ctx.send(
-                    f"❌ {user.mention} has not linked a Kick or Twitch account yet, "
-                    "so there is no points balance to credit."
-                )
+            if member is None:
+                resolved = resolve_points_target(conn, guild_id, typed, "kick")
+                if resolved is None:
+                    member = guild.get_member_named(typed.lstrip("@"))
+            if member is not None:
+                # Points are shared across a person's platforms and live on ONE
+                # row, keyed by their canonical username — the same row
+                # award_points writes to.
+                canonical, accounts = resolve_shop_identity(conn, member.id, guild_id)
+                if not accounts:
+                    await ctx.send(
+                        f"❌ {member.mention} has not linked a Kick or Twitch account yet, "
+                        "so there is no points balance to credit."
+                    )
+                    return
+                resolved = (canonical, member.id)
+            if resolved is None:
+                await ctx.send(f"❌ No member or viewer named **{discord.utils.escape_markdown(typed.lstrip('@'))}**.")
                 return
+            points_username, discord_id = resolved
+            new_balance = credit_points(conn, guild_id, points_username, amount, discord_id)
 
-            # Upsert, not UPDATE: a linked member who has never earned has no
-            # user_points row yet, and the grant must still land.
-            row = conn.execute(
-                text(
-                    """
-                INSERT INTO user_points (kick_username, discord_id, points, total_earned, discord_server_id, last_updated)
-                VALUES (:u, :d, :p, :p, :sid, CURRENT_TIMESTAMP)
-                ON CONFLICT(kick_username, discord_server_id) DO UPDATE SET
-                    points = user_points.points + :p,
-                    total_earned = user_points.total_earned + :p,
-                    discord_id = COALESCE(:d, user_points.discord_id),
-                    last_updated = CURRENT_TIMESTAMP
-                RETURNING points
-            """
-                ),
-                {"u": canonical, "d": user.id, "p": amount, "sid": guild_id},
-            ).fetchone()
-
-        new_balance = int(row[0]) if row else amount
-
+        recipient = member.mention if member is not None else discord.utils.escape_markdown(typed.lstrip("@"))
         embed = discord.Embed(title="💰 Points Granted", color=0xFFD700)
-        embed.add_field(name="Member", value=user.mention, inline=True)
+        embed.add_field(name="To", value=recipient, inline=True)
         embed.add_field(name="Granted", value=f"**+{amount:,}** points", inline=True)
         embed.add_field(name="New Balance", value=f"{new_balance:,} points", inline=True)
-        embed.add_field(name="Reason", value=reason, inline=False)
-        embed.set_footer(text=f"By {ctx.author.name} • Account: {format_linked_accounts(accounts)}")
-
+        embed.set_footer(text=f"By {ctx.author.name}")
         await ctx.send(embed=embed)
-        logger.info(f"💰 Admin {ctx.author} gave {amount} points to {user} ({canonical}): {reason}")
+        logger.info(f"💰 Admin {ctx.author} gave {amount} points to {points_username}")
 
-    except commands.BadArgument:
-        await ctx.send("❌ Invalid user or amount. Usage: `/pointsgive @user <amount> [reason]`")
     except Exception as e:
-        logger.error(f"Error giving points to {user}: {e}")
+        logger.error(f"Error giving points to {typed}: {e}")
         await ctx.send("❌ Error granting points. Please try again.")
 
 
