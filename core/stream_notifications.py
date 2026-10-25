@@ -280,6 +280,9 @@ async def send_stream_notification(
     if not discord_server_id:
         return
 
+    # ---- 0. Live state the dashboard shows (utils/stream_state.py) ----
+    _record_live_state(discord_server_id, is_live, platform)
+
     # ---- 1. Discord notification (only on go-live) ----
     if is_live:
         await _post_discord_notification(discord_server_id, streamer, title, category, platform)
@@ -302,6 +305,24 @@ async def send_stream_notification(
 
     # ---- 3. Clip buffer start/stop (reuses dashboard clip API) ----
     await _control_clip_buffer(discord_server_id, streamer, is_live, platform)
+
+
+def _record_live_state(discord_server_id, is_live, platform):
+    try:
+        from sqlalchemy import create_engine
+
+        from utils.stream_state import record_stream_live
+
+        db_url = os.getenv("DATABASE_URL")
+        if not db_url:
+            return
+        engine = create_engine(db_url, pool_pre_ping=True)
+        try:
+            record_stream_live(engine, discord_server_id, platform, is_live)
+        finally:
+            engine.dispose()
+    except Exception as e:
+        logger.info(f"[StreamNotify] ⚠️ Failed to record live state: {e}")
 
 
 async def _post_discord_notification(discord_server_id, streamer, title, category, platform):

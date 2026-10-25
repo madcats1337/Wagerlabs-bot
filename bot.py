@@ -35,6 +35,7 @@ from utils.logging_config import setup_logging  # noqa: E402
 from utils.redis_signing import sign_payload  # noqa: E402
 from utils.secret_settings import SecretConfigError, SecretDecryptError, decrypt_secret, encrypt_secret  # noqa: E402
 from utils.server_urls import get_server_base_url, get_server_public_page_url  # noqa: E402
+from utils.stream_state import record_stream_live  # noqa: E402
 from utils.subscription_tier import server_has_feature, upgrade_message  # noqa: E402
 from utils.wager_leaderboard import next_period_window, period_leaderboard_rows  # noqa: E402
 
@@ -6294,6 +6295,12 @@ async def clip_buffer_management_task():
                 if "403" not in str(e) and "Cloudflare" not in str(e):
                     logger.info(f"[Clip Buffer] ⚠️ Error checking stream status: {e}")
                 continue
+
+            # The dashboard shows the live state (utils/stream_state.py). Written
+            # when it changes and on the first check after a restart, so the Kick
+            # value stays right even when webhooks don't arrive.
+            if last_stream_live_state != is_live:
+                record_stream_live(engine, guild_id, "kick", is_live)
 
             # Detect state transitions
             should_start_buffer = False

@@ -266,6 +266,14 @@ if HAS_KICK_OFFICIAL and register_webhook_routes:
                 f"[Webhook] 📺 Stream status: {broadcaster} is_live={is_live}, server={discord_server_id}, simulated={is_simulated}"
             )
 
+            # The dashboard shows the live state (utils/stream_state.py): record
+            # it either way. A quick upsert, unlike the Discord post handed off
+            # below; a simulated event is a test and must not flip it.
+            if discord_server_id and not is_simulated:
+                from utils.stream_state import record_stream_live
+
+                record_stream_live(engine, discord_server_id, "kick", is_live)
+
             # Only send notification when going LIVE
             if not is_live:
                 logger.info(f"[Webhook] ℹ️ Stream offline, no notification sent")
