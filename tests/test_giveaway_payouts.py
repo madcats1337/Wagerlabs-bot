@@ -212,19 +212,18 @@ def test_who_a_winner_is_on_discord(engine):
     entry(engine, "alpha", uid="501")
     link(engine, 9001, "renamed", uid="501")  # by the chatter's id, whatever their handle now
     entry(engine, "beta")
-    link(engine, 9002, "Beta")  # by handle on that platform
+    link(engine, 9002, "Beta")  # by handle on that chat
     entry(engine, "gated", discord_id=9004)  # a gated entry holds it
-    link(engine, 9003, "gamma")  # no entry left: the handle names one person
-    link(engine, 9005, "twins")
-    link(engine, 9006, "twins")
     entry(engine, "delta", platform="twitch")
-    link(engine, 9007, "delta", platform="kick")  # another platform's link doesn't count
+    link(engine, 9007, "delta", platform="kick")  # another chat's link doesn't count
+    entry(engine, "twins")
+    link(engine, 9005, "twins")
+    link(engine, 9006, "twins")  # a handle that names two people names nobody
+    link(engine, 9003, "gamma")  # no entry, so no recorded chat: no guess
     g = p._priced_giveaway(engine, SERVER, 1)
-    who = {
-        name: p.winner_discord_id(engine, SERVER, g, {"kick_username": name})
-        for name in ("alpha", "beta", "gated", "gamma", "twins", "delta")
-    }
-    assert who == {"alpha": 9001, "beta": 9002, "gated": 9004, "gamma": 9003, "twins": None, "delta": None}
+    names = ("alpha", "beta", "gated", "delta", "twins", "gamma")
+    who = {name: p.winner_discord_id(engine, SERVER, g, {"kick_username": name}) for name in names}
+    assert who == {"alpha": 9001, "beta": 9002, "gated": 9004, "delta": None, "twins": None, "gamma": None}
     assert p.winner_discord_id(engine, SERVER, g, {"kick_username": "x", "discord_id": 9010}) == 9010
 
 
@@ -305,6 +304,7 @@ def test_a_rerolled_in_winner_is_the_only_one_asked(drawn):
     users = {9001: FakeUser(), 9002: FakeUser(), 9003: FakeUser()}
     bot = FakeBot(users)
     ask(drawn, bot)
+    entry(drawn, "gamma")
     link(drawn, 9003, "gamma")
     winner(drawn, "gamma")
     assert ask(drawn, bot) == 1

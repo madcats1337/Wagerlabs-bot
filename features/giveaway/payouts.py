@@ -191,11 +191,13 @@ def _set_notice(engine, winner_id, notice):
 def winner_discord_id(engine, guild_id, giveaway, winner):
     """The Discord account a winner's prize is keyed by, or None.
 
-    A Discord winner's own. A chat winner's: the one their entry or winner row
-    holds (a gated entry resolves it), else the link on the chat their entry
-    came from (by the chatter's id there when the chat gave one, else by
-    handle), else, with no chat recorded, the handle's link when it names
-    exactly one person. Mirrors the dashboard's utils/giveaway_payouts.
+    A prize follows it, so it names the right person or nobody. A Discord
+    winner's own. A chat winner's: the one their winner row or entry holds (a
+    gated entry resolves it), else the link on the chat their entry came from,
+    by the chatter's id there when the chat gave one, else by handle on that
+    chat, and only when either names one person. With no chat recorded there is
+    no guess: a bare handle could be someone else's on the other chat. Mirrors
+    the dashboard's utils/giveaway_payouts.
     """
     if winner.get("discord_id"):
         return int(winner["discord_id"])
@@ -215,43 +217,23 @@ def winner_discord_id(engine, guild_id, giveaway, winner):
         ).fetchone()
         if entry and entry.discord_id:
             return int(entry.discord_id)
-        if giveaway.get("entry_method") == "discord" or not name:
+        if giveaway.get("entry_method") == "discord" or not entry or not entry.platform:
             return None
-        if entry and entry.platform:
-            if entry.platform_user_id:
-                row = conn.execute(
-                    text(
-                        """
-                        SELECT discord_id FROM links
-                        WHERE discord_server_id = :g AND platform = :p AND platform_user_id = :uid
-                        ORDER BY linked_at ASC
-                        LIMIT 1
-                        """
-                    ),
-                    {"g": int(guild_id), "p": entry.platform, "uid": str(entry.platform_user_id)},
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    text(
-                        """
-                        SELECT discord_id FROM links
-                        WHERE discord_server_id = :g AND platform = :p AND LOWER(kick_name) = LOWER(:name)
-                        ORDER BY linked_at ASC
-                        LIMIT 1
-                        """
-                    ),
-                    {"g": int(guild_id), "p": entry.platform, "name": entry.kick_username or name},
-                ).fetchone()
-            return int(row[0]) if row and row[0] else None
-        rows = conn.execute(
-            text(
-                """
+        if entry.platform_user_id:
+            sql = """
                 SELECT DISTINCT discord_id FROM links
-                WHERE discord_server_id = :g AND LOWER(kick_name) = LOWER(:name) AND discord_id IS NOT NULL
-                """
-            ),
-            {"g": int(guild_id), "name": name},
-        ).fetchall()
+                WHERE discord_server_id = :g AND platform = :p AND platform_user_id = :who
+                  AND discord_id IS NOT NULL
+            """
+            who = str(entry.platform_user_id)
+        else:
+            sql = """
+                SELECT DISTINCT discord_id FROM links
+                WHERE discord_server_id = :g AND platform = :p AND LOWER(kick_name) = LOWER(:who)
+                  AND discord_id IS NOT NULL
+            """
+            who = entry.kick_username or name
+        rows = conn.execute(text(sql), {"g": int(guild_id), "p": entry.platform, "who": who}).fetchall()
     return int(rows[0][0]) if len(rows) == 1 else None
 
 
