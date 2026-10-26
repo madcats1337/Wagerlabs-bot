@@ -2,8 +2,9 @@
 
 A giveaway with a prize amount owes each winner that much, and the streamer tips it on
 the casino the server names (`giveaway_payout_casino`). Viewers save their username
-there with the Payout details button (link panel or winner DM); once the winners are
-announced, each one nobody asked yet gets one DM (features/giveaway/payouts.py).
+there with the Payout details button (link panel or winner DM), or the streamer's own
+site sends the names it knows; once the winners are announced, each one nobody asked
+yet gets one DM (features/giveaway/payouts.py).
 """
 
 import asyncio
@@ -45,6 +46,14 @@ def engine():
             """CREATE TABLE links (
                 discord_id BIGINT, kick_name TEXT, discord_server_id BIGINT, platform TEXT,
                 platform_user_id TEXT, linked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""",
+            """CREATE TABLE site_payout_name_syncs (
+                discord_server_id BIGINT NOT NULL, casino TEXT NOT NULL, source TEXT,
+                member_count INTEGER NOT NULL DEFAULT 0, updated_by TEXT, updated_at TIMESTAMP,
+                PRIMARY KEY (discord_server_id, casino))""",
+            """CREATE TABLE site_payout_names (
+                discord_server_id BIGINT NOT NULL, casino TEXT NOT NULL, platform TEXT NOT NULL,
+                platform_user_id TEXT NOT NULL, username TEXT NOT NULL,
+                PRIMARY KEY (discord_server_id, casino, platform, platform_user_id))""",
         ):
             conn.execute(text(ddl))
     return eng
@@ -117,6 +126,30 @@ def link(engine, discord_id, name, platform="kick", uid=None, server=SERVER):
     )
 
 
+def site_names(engine, names, casino="stake", source="nickcleveland.com", server=SERVER):
+    """What the dashboard stores when a site replaces its names: {(platform, id): username}."""
+    run(
+        engine,
+        """INSERT INTO site_payout_name_syncs (discord_server_id, casino, source, member_count)
+           VALUES (:g, :c, :s, :n)""",
+        g=server,
+        c=casino,
+        s=source,
+        n=len(set(names.values())),
+    )
+    for (platform, account_id), username in names.items():
+        run(
+            engine,
+            """INSERT INTO site_payout_names (discord_server_id, casino, platform, platform_user_id, username)
+               VALUES (:g, :c, :p, :a, :u)""",
+            g=server,
+            c=casino,
+            p=platform,
+            a=account_id,
+            u=username,
+        )
+
+
 def notices(engine, gid=1):
     with engine.connect() as conn:
         return dict(
@@ -163,6 +196,13 @@ def test_the_winner_dm_says_where_the_prize_goes_or_how_to_say_where():
         content == "You won **$10.50** in **Friday drop**. Add your Shuffle username below so it can be tipped to you."
     )
     assert label == "Add payout details"
+    # A name from the streamer's site only the site can change: no button.
+    content, label = p.winner_dm_text(25, "Friday drop", None, "stake", "Site_A", "nickcleveland.com")
+    assert content == (
+        "You won **$25** in **Friday drop**. It will be tipped to **Site\\_A** on Stake, "
+        "the account you linked on nickcleveland.com."
+    )
+    assert label is None
 
 
 def test_the_chat_note_fits_in_one_kick_message():
@@ -193,18 +233,66 @@ def test_a_saved_name_wins_over_a_verified_link_and_belongs_to_one_server(engine
         engine,
         "INSERT INTO raffle_shuffle_links (shuffle_username, discord_id, verified, platform) VALUES ('maybe', 9003, 0, 'shuffle')",
     )
-    assert p.payout_destination(engine, SERVER, 9002, "shuffle") == ("BetaShuf", True)
-    assert p.payout_destination(engine, SERVER, 9003, "shuffle") == (None, False)  # not verified
+    assert p.payout_destination(engine, SERVER, 9002, "shuffle") == ("BetaShuf", True, None)
+    assert p.payout_destination(engine, SERVER, 9003, "shuffle") == (None, False, None)  # not verified
     p.save_username(engine, SERVER, 9002, "shuffle", "betashuf")
-    assert p.payout_destination(engine, SERVER, 9002, "shuffle") == ("betashuf", True)
+    assert p.payout_destination(engine, SERVER, 9002, "shuffle") == ("betashuf", True, None)
     p.save_username(engine, SERVER, 9002, "shuffle", "newBeta")
-    assert p.payout_destination(engine, SERVER, 9002, "shuffle") == ("newBeta", False)
+    assert p.payout_destination(engine, SERVER, 9002, "shuffle") == ("newBeta", False, None)
     with engine.connect() as conn:
         assert conn.execute(text("SELECT COUNT(*) FROM viewer_payout_details")).scalar() == 1
-    assert p.payout_destination(engine, OTHER_SERVER, 9001, "shuffle") == (None, False)
+    assert p.payout_destination(engine, OTHER_SERVER, 9001, "shuffle") == (None, False, None)
     p.save_username(engine, SERVER, 9001, "stake", "alpha")
-    assert p.payout_destination(engine, OTHER_SERVER, 9001, "stake") == (None, False)
-    assert p.payout_destination(engine, SERVER, 9001, "shuffle") == (None, False)
+    assert p.payout_destination(engine, OTHER_SERVER, 9001, "stake") == (None, False, None)
+    assert p.payout_destination(engine, SERVER, 9001, "shuffle") == (None, False, None)
+
+
+def test_the_streamers_site_comes_first(engine):
+    site = "nickcleveland.com"
+    site_names(engine, {("discord", "9001"): "SiteAlpha", ("discord", "9002"): "SiteBeta"})
+    site_names(engine, {("discord", "9001"): "ShuffleAlpha"}, casino="shuffle")
+    assert p.payout_destination(engine, SERVER, 9001, "stake") == ("SiteAlpha", False, site)
+    assert p.payout_destination(engine, SERVER, 9001, "shuffle") == ("ShuffleAlpha", False, site)
+    assert p.payout_destination(engine, OTHER_SERVER, 9001, "stake") == (None, False, None)
+    # Ahead of a name they saved and of their verified link: the site checks its links.
+    p.save_username(engine, SERVER, 9002, "stake", "typedBeta")
+    assert p.payout_destination(engine, SERVER, 9002, "stake") == ("SiteBeta", False, site)
+    run(
+        engine,
+        "INSERT INTO raffle_shuffle_links (shuffle_username, discord_id, verified, platform) VALUES ('shufflealpha', 9001, 1, 'shuffle')",
+    )
+    assert p.payout_destination(engine, SERVER, 9001, "shuffle") == ("ShuffleAlpha", True, site)
+    # A site that sent no name for itself is still the site.
+    run(engine, "UPDATE site_payout_name_syncs SET source = NULL WHERE casino = 'stake'")
+    assert p.payout_destination(engine, SERVER, 9002, "stake") == ("SiteBeta", False, p.SITE_FALLBACK)
+
+
+def test_a_site_name_follows_the_chat_account_a_winner_entered_with(engine):
+    site_names(engine, {("kick", "501"): "KickAlpha", ("discord", "9001"): "DiscordAlpha", ("twitch", "77"): "Tw"})
+    site = "nickcleveland.com"
+    assert p.payout_destination(engine, SERVER, None, "stake", ("kick", "501")) == ("KickAlpha", False, site)
+    # Their own chat account first, then the Discord account linked to it.
+    assert p.payout_destination(engine, SERVER, 9001, "stake", ("kick", "501")) == ("KickAlpha", False, site)
+    assert p.payout_destination(engine, SERVER, 9001, "stake", ("kick", "999")) == ("DiscordAlpha", False, site)
+    # An id on another chat is someone else.
+    assert p.payout_destination(engine, SERVER, None, "stake", ("twitch", "501")) == p.NOWHERE
+    assert p.payout_destination(engine, SERVER, None, "stake", None) == (None, False, None)
+
+
+def test_a_winners_chat_account_is_the_one_their_entry_recorded(engine):
+    giveaway(engine)
+    entry(engine, "alpha", uid="501")
+    entry(engine, "beta")  # recorded before the chatter's id was
+    entry(engine, "gamma", platform="twitch", uid="77")
+    g = p._priced_giveaway(engine, SERVER, 1)
+    accounts = {
+        n: p.winner_chat_account(engine, SERVER, g, {"kick_username": n}) for n in ("alpha", "beta", "gamma", "x")
+    }
+    assert accounts == {"alpha": ("kick", "501"), "beta": None, "gamma": ("twitch", "77"), "x": None}
+    giveaway(engine, gid=2, method="discord")
+    assert (
+        p.winner_chat_account(engine, SERVER, p._priced_giveaway(engine, SERVER, 2), {"kick_username": "alpha"}) is None
+    )
 
 
 def test_who_a_winner_is_on_discord(engine):
@@ -298,6 +386,29 @@ def test_each_winner_is_asked_once_and_how_it_went_is_kept(drawn):
     # Announcing again (a reroll's re-announcement, the stop after the last draw) asks nobody twice.
     assert ask(drawn, bot, chat=chat) == 0
     assert len(users[9001].sent) == 1 and len(said) == 1
+
+
+def test_a_chat_winner_the_site_knows_is_not_told_to_link_discord(drawn):
+    entry(drawn, "eps", uid="505")
+    winner(drawn, "eps")
+    site_names(drawn, {("kick", "503"): "deltaStake", ("discord", "9002"): "betaStake"})
+    run(drawn, "UPDATE giveaway_entries SET platform_user_id = '503' WHERE kick_username = 'delta'")
+    users = {9001: FakeUser(), 9002: FakeUser()}
+    said = []
+
+    async def chat(message, guild_id=None):
+        said.append(message)
+
+    assert ask(drawn, FakeBot(users), chat=chat) == 4
+    assert notices(drawn) == {"alpha": "dm_sent", "beta": "dm_sent", "delta": "not_linked", "eps": "not_linked"}
+    # Their prize has somewhere to go; only eps is told how to add a name.
+    assert said == [p.not_linked_chat_text(["eps"], "Friday drop", "stake")]
+    # Where the site has no name, the one they saved, with a button to change it;
+    # the site's name comes first, and only the site can change it.
+    alpha_dm, alpha_view = users[9001].sent[0]
+    assert "**alphaStake** on Stake. Wrong name? Change it below." in alpha_dm and alpha_view is not None
+    beta_dm, beta_view = users[9002].sent[0]
+    assert "**betaStake** on Stake, the account you linked on nickcleveland.com." in beta_dm and beta_view is None
 
 
 def test_a_rerolled_in_winner_is_the_only_one_asked(drawn):
@@ -417,6 +528,41 @@ def test_the_button_opens_the_form_with_the_name_they_have(engine):
     assert field["label"] == "Your Stake username" and field["value"] == "alphaStake"
 
 
+def test_a_viewer_the_site_knows_is_sent_to_it_not_to_the_form(engine):
+    tip_on(engine, "stake")
+    site_names(engine, {("discord", "9001"): "SiteAlpha"})
+
+    async def go():
+        i = interaction()
+        await p.PayoutDetailsButton(SERVER, engine=engine).callback(i)
+        return i
+
+    response = asyncio.run(go()).response
+    assert response.modals == []
+    assert response.messages == [
+        "Prizes you win in **Lele's** go to **SiteAlpha** on Stake, the account you linked on nickcleveland.com. "
+        "To change it, change your Stake link there."
+    ]
+
+
+def test_a_name_saved_under_a_site_name_says_where_prizes_still_go(engine):
+    # A form opened before the site's names arrived.
+    tip_on(engine, "stake")
+    site_names(engine, {("discord", "9001"): "SiteAlpha"})
+
+    async def submit():
+        modal = p.PayoutDetailsModal(engine, SERVER, "Lele's", "stake")
+        modal.username._value = "typedAlpha"
+        i = interaction()
+        await modal.on_submit(i)
+        return i.response.messages
+
+    assert asyncio.run(submit()) == [
+        "Saved, but prizes you win in **Lele's** go to **SiteAlpha** on Stake, the account you linked on "
+        "nickcleveland.com. To change that, change your Stake link there."
+    ]
+
+
 def test_the_form_saves_a_good_name_for_the_casino_it_asked_about(engine):
     tip_on(engine, "stake")
 
@@ -430,13 +576,13 @@ def test_the_form_saves_a_good_name_for_the_casino_it_asked_about(engine):
         return i.response.messages
 
     assert asyncio.run(submit("has space")) == [p.USERNAME_RULE]
-    assert p.payout_destination(engine, SERVER, 9001, "stake") == (None, False)
+    assert p.payout_destination(engine, SERVER, 9001, "stake") == (None, False, None)
     assert asyncio.run(submit(" alpha_1 ")) == ["Saved. Prizes you win in **Lele's** go to **alpha\\_1** on Stake."]
-    assert p.payout_destination(engine, SERVER, 9001, "stake") == ("alpha_1", False)
+    assert p.payout_destination(engine, SERVER, 9001, "stake") == ("alpha_1", False, None)
     assert asyncio.run(submit("beta", switch_to="shuffle")) == [
         "This server changed where it sends prizes. Press the button again."
     ]
-    assert p.payout_destination(engine, SERVER, 9001, "stake") == ("alpha_1", False)
+    assert p.payout_destination(engine, SERVER, 9001, "stake") == ("alpha_1", False, None)
 
 
 def _custom_ids(view):
@@ -463,3 +609,34 @@ def test_the_link_panel_shows_payout_details_where_prizes_are_tipped(engine):
     assert any("add your Stake username" in getattr(item, "content", "") for item in posted.walk_children())
     # The global persistent view carries no copy: the button answers as a dynamic item.
     assert not any((cid or "").startswith("wl_payout:") for cid in _custom_ids(panel()))
+
+
+def _texts(view):
+    return " ".join(getattr(item, "content", "") or "" for item in view.walk_children())
+
+
+def test_the_link_panel_names_the_site_that_sends_payout_names(engine):
+    run(
+        engine,
+        "INSERT INTO bot_settings (key, value, discord_server_id) VALUES ('stream_platforms', 'kick', :g)",
+        g=SERVER,
+    )
+    tip_on(engine, "stake")
+
+    def panel():
+        async def build():
+            view = CombinedLinkPanelView(
+                None, engine, lambda *a: "", lambda *a: "", show_logo=False, platforms=["kick"], guild_id=SERVER
+            )
+            return _texts(view)
+
+        return asyncio.run(build())
+
+    hint = "Linked your Stake account on nickcleveland.com? Prizes go to it automatically."
+    assert hint not in panel()
+    site_names(engine, {("discord", "9001"): "SiteAlpha"}, casino="shuffle")
+    assert hint not in panel()  # names for another casino
+    site_names(engine, {("discord", "9001"): "SiteAlpha"})
+    assert hint in panel()
+    run(engine, "UPDATE site_payout_name_syncs SET source = NULL")
+    assert "Linked your" not in panel()  # a site that sent no name for itself

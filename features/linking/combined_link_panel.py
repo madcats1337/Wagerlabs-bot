@@ -199,13 +199,19 @@ class CombinedLinkPanelView(LayoutView):
         # Giveaway prizes (features/giveaway/payouts.py): a Payout details
         # button on a posted panel of a server that tips prizes on a casino. It
         # carries the server in its custom_id and answers as a dynamic item, so
-        # the global persistent view needs no copy of it.
+        # the global persistent view needs no copy of it. When the streamer's
+        # own site sends the names it knows, the panel names the site, so its
+        # players know they needn't add theirs.
         payout_label = None
+        payout_site = None
         if platforms is not None and guild_id:
-            from features.giveaway.payouts import CASINO_LABELS, payout_casino
+            from features.giveaway.payouts import CASINO_LABELS, payout_casino, payout_site_source
 
             try:
-                payout_label = CASINO_LABELS.get(payout_casino(engine, guild_id))
+                casino = payout_casino(engine, guild_id)
+                payout_label = CASINO_LABELS.get(casino)
+                if payout_label:
+                    payout_site = payout_site_source(engine, guild_id, casino)
             except Exception as e:
                 logger.warning(f"[CombinedLink] Could not read the payout casino for {guild_id}: {e}")
 
@@ -238,13 +244,17 @@ class CombinedLinkPanelView(LayoutView):
                 how_to = f"**How to Link**\nClick the **'Link {only}'** button below to get started!"
             container.add_item(TextDisplay(how_to))
             if payout_label:
-                container.add_item(
-                    TextDisplay(
-                        "**Giveaway prizes**\n"
-                        f"Won a giveaway? Press **Payout details** and add your {payout_label} username "
-                        "so your prize can be sent to you."
-                    )
+                prizes = (
+                    "**Giveaway prizes**\n"
+                    f"Won a giveaway? Press **Payout details** and add your {payout_label} username "
+                    "so your prize can be sent to you."
                 )
+                if payout_site:
+                    prizes += (
+                        f" Linked your {payout_label} account on {discord.utils.escape_markdown(payout_site)}? "
+                        "Prizes go to it automatically."
+                    )
+                container.add_item(TextDisplay(prizes))
             container.add_item(
                 TextDisplay(
                     "**🔒 Privacy & Security**\n"

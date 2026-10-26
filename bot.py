@@ -10121,8 +10121,10 @@ async def on_ready():
 
                 # Giveaway prize payouts (features/giveaway/payouts.py): the
                 # prize per winner, whether a winner was paid and where to,
-                # whether they were asked where to send it, and the casino
-                # username a viewer saved for prizes. Mirrors the dashboard's
+                # whether they were asked where to send it, the casino
+                # username a viewer saved for prizes, and the names the
+                # streamer's own site sends (the dashboard's
+                # utils/site_payout_names.py). Mirrors the dashboard's
                 # run_migrations; either service may boot first.
                 conn.execute(
                     text(
@@ -10142,6 +10144,23 @@ async def on_ready():
                         username VARCHAR(64) NOT NULL,
                         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         PRIMARY KEY (discord_server_id, discord_id, casino)
+                    );
+                    CREATE TABLE IF NOT EXISTS site_payout_name_syncs (
+                        discord_server_id BIGINT NOT NULL,
+                        casino VARCHAR(32) NOT NULL,
+                        source VARCHAR(60),
+                        member_count INTEGER NOT NULL DEFAULT 0,
+                        updated_by VARCHAR(255),
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (discord_server_id, casino)
+                    );
+                    CREATE TABLE IF NOT EXISTS site_payout_names (
+                        discord_server_id BIGINT NOT NULL,
+                        casino VARCHAR(32) NOT NULL,
+                        platform VARCHAR(16) NOT NULL,
+                        platform_user_id VARCHAR(64) NOT NULL,
+                        username VARCHAR(64) NOT NULL,
+                        PRIMARY KEY (discord_server_id, casino, platform, platform_user_id)
                     );
                 """
                     )
