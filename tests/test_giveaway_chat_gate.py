@@ -44,7 +44,7 @@ def engine():
                 CREATE TABLE giveaway_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, giveaway_id INTEGER, discord_server_id BIGINT,
                     discord_id BIGINT, kick_username TEXT, kick_user_id INTEGER, entry_method TEXT,
-                    entry_count INTEGER DEFAULT 1, profile_pic_url TEXT, display_name TEXT,
+                    entry_count INTEGER DEFAULT 1, profile_pic_url TEXT, display_name TEXT, platform TEXT, platform_user_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """

@@ -356,8 +356,10 @@ class GiveawayManager:
                     text(
                         """
                     INSERT INTO giveaway_entries
-                    (giveaway_id, discord_server_id, discord_id, kick_username, kick_user_id, entry_method, entry_count, profile_pic_url, display_name)
-                    VALUES (:giveaway_id, :server_id, :discord_id, :username, :user_id, :method, 1, :profile_pic, :display_name)
+                    (giveaway_id, discord_server_id, discord_id, kick_username, kick_user_id, entry_method, entry_count,
+                     profile_pic_url, display_name, platform, platform_user_id)
+                    VALUES (:giveaway_id, :server_id, :discord_id, :username, :user_id, :method, 1, :profile_pic,
+                            :display_name, :platform, :platform_user_id)
                 """
                     ),
                     {
@@ -369,6 +371,10 @@ class GiveawayManager:
                         "method": entry_method,
                         "profile_pic": profile_pic_url,
                         "display_name": display_name or kick_username,
+                        # Which chat, and who there: the dashboard's API names the
+                        # winner's linked Discord account from these.
+                        "platform": platform,
+                        "platform_user_id": str(platform_user_id) if platform_user_id else None,
                     },
                 )
                 logger.info(f"Added new entry for {kick_username} in giveaway {giveaway_id} via {entry_method}")

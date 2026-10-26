@@ -45,7 +45,7 @@ def engine():
                 CREATE TABLE giveaway_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, giveaway_id INTEGER, discord_server_id BIGINT,
                     discord_id BIGINT, kick_username TEXT, kick_user_id INTEGER, entry_method TEXT,
-                    entry_count INTEGER DEFAULT 1, profile_pic_url TEXT, display_name TEXT,
+                    entry_count INTEGER DEFAULT 1, profile_pic_url TEXT, display_name TEXT, platform TEXT, platform_user_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -381,3 +381,19 @@ def test_an_unchanged_name_is_not_written_again(engine):
     guild = guild_with({111: person("Same", "s")})
     assert refresh(engine, guild, NamesBot()) == 1
     assert refresh(engine, guild, NamesBot()) == 0
+
+
+def test_an_entry_records_its_chat_and_the_chatter_id(engine, monkeypatch):
+    """The dashboard's public API names a chat winner's linked Discord account from these."""
+    giveaway = add_giveaway(engine, 30)
+    m = manager(engine, FakeGuild(), monkeypatch)
+    assert enter(m, giveaway, "kickfan")
+    assert enter(m, giveaway, "twitchfan", platform="twitch", platform_user_id=777)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT kick_username, platform, platform_user_id FROM giveaway_entries "
+                "WHERE giveaway_id = 30 ORDER BY id"
+            )
+        ).fetchall()
+    assert [tuple(r) for r in rows] == [("kickfan", "kick", None), ("twitchfan", "twitch", "777")]

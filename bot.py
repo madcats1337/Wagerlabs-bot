@@ -9968,7 +9968,13 @@ async def on_ready():
                     -- Answers to a multi-question giveaway, positionally
                     -- aligned with giveaways.entry_prompts. `entry_answer`
                     -- stays populated with answer #1 for older readers.
-                    ADD COLUMN IF NOT EXISTS entry_answers JSONB
+                    ADD COLUMN IF NOT EXISTS entry_answers JSONB,
+                    -- The chat a chat entry came from and the chatter's id
+                    -- there, when known: the dashboard's public API names a
+                    -- winner's linked Discord account from them. Mirrors the
+                    -- dashboard's run_migrations.
+                    ADD COLUMN IF NOT EXISTS platform VARCHAR(16),
+                    ADD COLUMN IF NOT EXISTS platform_user_id VARCHAR(64)
                 """
                     )
                 )
