@@ -3296,6 +3296,22 @@ def _start_giveaway_expiry_loop(bot, engine):
                     except Exception as e:
                         logger.debug(f"[giveaway] chat announce skipped: {e}")
 
+                    # Ask each winner where to send their prize: a priced
+                    # giveaway, on a server that tips prizes on a casino. In the
+                    # background, so the next expired giveaway isn't held up.
+                    try:
+                        from features.giveaway.payouts import ask_prize_winners_soon
+
+                        ask_prize_winners_soon(
+                            bot,
+                            engine,
+                            guild_id,
+                            giveaway_id,
+                            send_chat=send_stream_message if policy["chat"] else None,
+                        )
+                    except Exception as e:
+                        logger.warning(f"[giveaway] asking prize winners failed: {e}")
+
                     publish_redis_event(
                         channel="dashboard:giveaway",
                         action="giveaway_ended",
@@ -10103,6 +10119,35 @@ async def on_ready():
                 )
                 logger.debug("✅ giveaway entry lists ready")
 
+                # Giveaway prize payouts (features/giveaway/payouts.py): the
+                # prize per winner, whether a winner was paid and where to,
+                # whether they were asked where to send it, and the casino
+                # username a viewer saved for prizes. Mirrors the dashboard's
+                # run_migrations; either service may boot first.
+                conn.execute(
+                    text(
+                        """
+                    ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS prize_amount NUMERIC(12, 2);
+                    ALTER TABLE giveaway_winners
+                        ADD COLUMN IF NOT EXISTS paid_at TIMESTAMP,
+                        ADD COLUMN IF NOT EXISTS paid_by VARCHAR(100),
+                        ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12, 2),
+                        ADD COLUMN IF NOT EXISTS paid_to VARCHAR(255),
+                        ADD COLUMN IF NOT EXISTS payout_notice VARCHAR(16),
+                        ADD COLUMN IF NOT EXISTS payout_notice_at TIMESTAMP;
+                    CREATE TABLE IF NOT EXISTS viewer_payout_details (
+                        discord_server_id BIGINT NOT NULL,
+                        discord_id BIGINT NOT NULL,
+                        casino VARCHAR(32) NOT NULL,
+                        username VARCHAR(64) NOT NULL,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (discord_server_id, discord_id, casino)
+                    );
+                """
+                    )
+                )
+                logger.debug("✅ giveaway payouts ready")
+
                 # Add provably fair columns to slot_requests table
                 logger.debug("🔄 Checking provably fair columns in slot_requests table...")
                 conn.execute(
@@ -10426,6 +10471,11 @@ async def on_ready():
                 # in the custom_id, so it registers as a dynamic item rather than a
                 # fixed template view.
                 bot.add_dynamic_items(GiveawayAnswerButton)
+                # Payout details (link panel and winner DMs) carries its server
+                # the same way: a DM has none of its own.
+                from features.giveaway.payouts import PayoutDetailsButton
+
+                bot.add_dynamic_items(PayoutDetailsButton)
                 logger.debug(f"✅ Giveaway panel persistent view registered (handles all guilds)")
             except Exception as e:
                 logger.warning(f"⚠️ Giveaway panel view registration failed (non-fatal): {e}")

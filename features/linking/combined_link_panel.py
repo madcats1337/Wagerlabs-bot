@@ -196,6 +196,19 @@ class CombinedLinkPanelView(LayoutView):
             names = "Kick & Twitch"
         accent = TWITCH_COLOUR if platforms == ["twitch"] else KICK_COLOUR
 
+        # Giveaway prizes (features/giveaway/payouts.py): a Payout details
+        # button on a posted panel of a server that tips prizes on a casino. It
+        # carries the server in its custom_id and answers as a dynamic item, so
+        # the global persistent view needs no copy of it.
+        payout_label = None
+        if platforms is not None and guild_id:
+            from features.giveaway.payouts import CASINO_LABELS, payout_casino
+
+            try:
+                payout_label = CASINO_LABELS.get(payout_casino(engine, guild_id))
+            except Exception as e:
+                logger.warning(f"[CombinedLink] Could not read the payout casino for {guild_id}: {e}")
+
         container = Container(accent_colour=resolve_accent(cfg, accent))
         if MediaGalleryItem is not None:
             if banner_url:
@@ -224,6 +237,14 @@ class CombinedLinkPanelView(LayoutView):
                 only = "Twitch" if show_twitch and not show_kick else "Kick"
                 how_to = f"**How to Link**\nClick the **'Link {only}'** button below to get started!"
             container.add_item(TextDisplay(how_to))
+            if payout_label:
+                container.add_item(
+                    TextDisplay(
+                        "**Giveaway prizes**\n"
+                        f"Won a giveaway? Press **Payout details** and add your {payout_label} username "
+                        "so your prize can be sent to you."
+                    )
+                )
             container.add_item(
                 TextDisplay(
                     "**🔒 Privacy & Security**\n"
@@ -255,6 +276,10 @@ class CombinedLinkPanelView(LayoutView):
             )
             twitch_btn.callback = self._twitch_callback
             row.add_item(twitch_btn)
+        if payout_label:
+            from features.giveaway.payouts import PayoutDetailsButton
+
+            row.add_item(PayoutDetailsButton(guild_id))
         container.add_item(row)
 
         footer = resolve_footer(cfg)

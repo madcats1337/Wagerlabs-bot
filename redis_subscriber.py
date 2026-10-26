@@ -2251,6 +2251,19 @@ class RedisSubscriber:
         except Exception as e:
             logger.info(f"ℹ️ Could not delete custom embed message {message_id}: {e}")
 
+    def _ask_prize_winners(self, guild_id, giveaway_id, chat):
+        """DM a priced giveaway's winners whom nobody asked yet where to send
+        their prize (features/giveaway/payouts.py), in the background so the
+        next dashboard event isn't held up. `chat` lets chat winners with no
+        Discord account linked be told in stream chat instead."""
+        try:
+            from features.giveaway.payouts import ask_prize_winners_soon
+
+            send_chat = self.announce_in_chat if chat and self.send_message_callback else None
+            ask_prize_winners_soon(self.bot, engine, guild_id, giveaway_id, send_chat=send_chat)
+        except Exception as e:
+            logger.warning(f"[giveaway] asking prize winners failed: {e}")
+
     async def handle_giveaway_event(self, action, data):
         """Handle giveaway events from dashboard"""
         logger.info(f"🎁 Giveaway event: {action}")
@@ -2517,6 +2530,20 @@ class RedisSubscriber:
                 elif self.send_message_callback and not _is_dh(engine, giveaway_id):
                     await self.announce_in_chat("Giveaway has been stopped by moderators.", guild_id=guild_id)
 
+                # The winners drawn before the stop were just announced: ask
+                # them where to send their prize.
+                if drawn_winners:
+                    self._ask_prize_winners(guild_id, giveaway_id, chat=stop_policy["chat"])
+
+            elif action == "giveaway_payout_set":
+                # The dashboard put a prize amount on a giveaway whose entries
+                # had closed, or asked for its winners to be asked: ask the ones
+                # nobody asked yet, under the winner announcement's chat policy.
+                from features.giveaway.giveaway_panel import announce_settings
+
+                policy = announce_settings(engine, guild_id, "winner")
+                self._ask_prize_winners(guild_id, giveaway_id, chat=policy["chat"])
+
             elif action == "giveaway_winner":
                 winner = data.get("winner_username")
                 winner_discord_id = data.get("winner_discord_id")
@@ -2663,6 +2690,10 @@ class RedisSubscriber:
                     message = f"GIVEAWAY WINNER{'S' if plural else ''}: {plain} won {giveaway_title}!"
                     await self.announce_in_chat(message, guild_id=guild_id)
                     logger.info(f"✅ Announced giveaway winner(s) in Kick chat: {plain}")
+
+                # Every winner is known and announced: ask them where to send
+                # their prize. A reroll's re-announcement asks only the new one.
+                self._ask_prize_winners(guild_id, giveaway_id, chat=policy["chat"])
 
                 # Clean up active giveaways cache
                 if hasattr(giveaway_manager, "active_giveaways"):
