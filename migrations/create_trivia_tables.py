@@ -102,6 +102,17 @@ def migrate_create_trivia_tables(engine):
                 )
             )
 
+            # The dashboard's GET /api/v1/trivia/wins/user counts one winner's
+            # events in a time window.
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_trivia_events_winner_time
+                    ON trivia_events (discord_server_id, winner_discord_id, won_at)
+                    """
+                )
+            )
+
         logger.debug("✅ trivia_events table ready")
         return True
     except Exception as e:

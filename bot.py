@@ -2280,6 +2280,23 @@ try:
             )
         )
 
+        # Per-viewer time windows over the ledger, for the dashboard's
+        # GET /api/v1/watchtime/user (mirrored in its run_migrations; either
+        # service may boot first). SAVEPOINT-isolated like the token-table
+        # ALTERs above: on a DB whose ledger lacks the discord_server_id column
+        # (this CREATE TABLE doesn't declare it) the index fails, and that must
+        # not abort the rest of init.
+        try:
+            with conn.begin_nested():
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_pwc_server_user_time "
+                        "ON points_watchtime_converted (discord_server_id, LOWER(kick_username), converted_at);"
+                    )
+                )
+        except Exception as e:
+            logger.warning(f"points_watchtime_converted window index skipped: {e}")
+
         # Random points drops on active chatters (mirrored in the dashboard's
         # run_migrations, which reads it for the drop history).
         conn.execute(
