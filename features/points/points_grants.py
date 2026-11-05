@@ -93,6 +93,16 @@ def normalize_chat_name(raw) -> str:
     return name if _NAME_RE.match(name) else ""
 
 
+def is_kick_bot_sender(username) -> bool:
+    """True for a Kick bot account, which Kick lists under "Bots" as ``@Name``.
+
+    The "@" is part of the name Kick sends, and viewers' names never start with
+    one. This reads names from chat events; typed names go through
+    ``normalize_chat_name``, which strips the "@".
+    """
+    return str(username or "").startswith("@")
+
+
 def parse_positive_int(raw, maximum):
     """``raw`` as an int in 1..maximum (commas allowed), or None."""
     try:
@@ -270,7 +280,7 @@ _drop_chatters = {}
 
 def record_chatter(guild_id, username, now=None):
     """Note a chat message; called by every chat path alongside watchtime."""
-    if not guild_id or not username:
+    if not guild_id or not username or is_kick_bot_sender(username):
         return
     now = now or datetime.now(timezone.utc)
     chatters = _drop_chatters.setdefault(guild_id, {})

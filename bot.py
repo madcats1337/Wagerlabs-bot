@@ -107,6 +107,7 @@ from features.points.points_grants import (
     format_drop_announcement,
     give_points_to_chat_name,
     is_chat_moderator,
+    is_kick_bot_sender,
     load_drop_settings,
     load_role_bonuses,
     normalize_chat_name,
@@ -885,14 +886,17 @@ class KickWebSocketManager:
             platform = (msg.get("_platform") or "kick").lower()
             _reply_platform.set(platform)
 
-            # Ignore the bot's OWN messages so its replies don't loop back in as new
-            # input. On Twitch the chatter id equals our bot account id; on Kick the
-            # username matches the bot account login.
+            # Ignore bot accounts so their messages don't loop back in as new input or
+            # count as a viewer (watchtime, points, drops, giveaways, live detection).
+            # On Twitch the chatter id equals our bot account id; Kick sends a bot
+            # account's name with a literal "@" ("@Wagerlabs").
             twitch_bot_id = os.getenv("TWITCH_BOT_USER_ID")
             if platform == "twitch" and twitch_bot_id:
                 chatter_id = str((msg.get("user") or {}).get("id") or "")
                 if chatter_id and chatter_id == str(twitch_bot_id):
                     return
+            if platform == "kick" and is_kick_bot_sender(username):
+                return
 
             # Debug: Log every incoming message
             logger.info(f"💬 Received {platform} message: {username}: {content[:100]}")

@@ -109,6 +109,34 @@ def test_drop_chatter_window():
     assert "gone" not in points_grants._drop_chatters[SERVER]
 
 
+def test_kick_bot_accounts_are_not_drop_chatters():
+    # Kick sends bot accounts' names with a literal "@" and lists them under "Bots".
+    assert points_grants.is_kick_bot_sender("@Wagerlabs")
+    assert not points_grants.is_kick_bot_sender("wagerlabs")
+    assert not points_grants.is_kick_bot_sender(None)
+
+    now = datetime.now(timezone.utc)
+    points_grants._drop_chatters.clear()
+    points_grants.record_chatter(SERVER, "@Wagerlabs", now)
+    points_grants.record_chatter(SERVER, "Viewer", now)
+    assert set(points_grants.chatters_since(SERVER, 10, now)) == {"viewer"}
+
+
+def test_never_pick_skips_names_however_they_were_typed(engine):
+    now = datetime.now(timezone.utc)
+    points_grants._drop_chatters.clear()
+    points_grants.record_chatter(SERVER, "ModName", now)
+    points_grants.record_chatter(SERVER, "Viewer", now)
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE point_settings (key TEXT, value TEXT, discord_server_id BIGINT)"))
+        conn.execute(
+            text("INSERT INTO point_settings VALUES ('points_drop_exclude', 'ModName, @other', :s)"), {"s": SERVER}
+        )
+        exclude = points_grants.load_drop_settings(conn, SERVER)["exclude"]
+    assert exclude == {"modname", "other"}
+    assert set(points_grants.chatters_since(SERVER, 10, now)) - exclude == {"viewer"}
+
+
 def test_linked_target_credits_the_canonical_row(engine):
     with engine.begin() as conn:
         conn.execute(
