@@ -261,6 +261,8 @@ if DATABASE_URL.startswith("postgres://"):
 logger.debug(f"📊 Using database: {DATABASE_URL.split('@')[1] if '@' in DATABASE_URL else 'SQLite (local)'}")
 
 WATCH_INTERVAL_SECONDS = int(os.getenv("WATCH_INTERVAL_SECONDS", "60"))
+# A viewer keeps earning watchtime for this long after their last chat message.
+ACTIVE_VIEWER_WINDOW_SECONDS = int(os.getenv("ACTIVE_VIEWER_WINDOW_SECONDS", "600"))
 ROLE_UPDATE_INTERVAL_SECONDS = int(os.getenv("ROLE_UPDATE_INTERVAL_SECONDS", "600"))
 CODE_EXPIRY_MINUTES = int(os.getenv("CODE_EXPIRY_MINUTES", "10"))
 
@@ -5079,7 +5081,7 @@ async def update_watchtime_task():
 
             # Memory: evict stale keys so these accumulators don't grow unbounded with
             # every unique username that ever chats. They are only ever read as a
-            # recent-window snapshot (active viewers within WATCH_INTERVAL_SECONDS+60,
+            # recent-window snapshot (active viewers within ACTIVE_VIEWER_WINDOW_SECONDS,
             # chatters within CHAT_ACTIVITY_WINDOW_MINUTES), so older entries are dead
             # weight. Runs before the early-continue live checks so offline guilds -
             # whose accumulators would otherwise never shrink - get pruned too.
@@ -5087,7 +5089,7 @@ async def update_watchtime_task():
             _viewers = active_viewers_by_guild.get(server_id)
             if _viewers:
                 for _u in [
-                    u for u, t in _viewers.items() if (_prune_now - t).total_seconds() >= (WATCH_INTERVAL_SECONDS + 60)
+                    u for u, t in _viewers.items() if (_prune_now - t).total_seconds() >= ACTIVE_VIEWER_WINDOW_SECONDS
                 ]:
                     del _viewers[_u]
                 if not _viewers:
@@ -5151,11 +5153,11 @@ async def update_watchtime_task():
             # Get active viewers for this guild
             guild_active_viewers = active_viewers_by_guild.get(server_id, {})
 
-            # Filter to active users (seen in last 5 minutes)
+            # Filter to active users (chatted within ACTIVE_VIEWER_WINDOW_SECONDS)
             active_users = {
                 user: last_seen
                 for user, last_seen in list(guild_active_viewers.items())
-                if (datetime.now(timezone.utc) - last_seen).total_seconds() < (WATCH_INTERVAL_SECONDS + 60)
+                if (datetime.now(timezone.utc) - last_seen).total_seconds() < ACTIVE_VIEWER_WINDOW_SECONDS
             }
 
             if not active_users:
