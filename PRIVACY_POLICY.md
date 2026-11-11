@@ -1,12 +1,12 @@
 # Privacy Policy
 
-**Last Updated:** August 2026
+**Last Updated:** November 2026
 
-**Service:** Wagerlabs - Chat Bot (Kick & Twitch), Discord Bot, Admin Dashboard & Browser Extension
+**Service:** Wagerlabs - Chat Bot (Kick & Twitch), Discord Bot, Admin Dashboard, Browser Extension & Stream Deck Plugin
 
 ## 1. Introduction
 
-This Privacy Policy explains how we collect, use, store, and protect your personal information when you use the Kick Community Bot (the "Bot"), the Admin Dashboard, and the Wagerlabs Browser Extension (the "Extension") (collectively, the "Service"). By using the Service, you agree to the collection and use of information in accordance with this policy.
+This Privacy Policy explains how we collect, use, store, and protect your personal information when you use the Kick Community Bot (the "Bot"), the Admin Dashboard, the Wagerlabs Browser Extension (the "Extension"), and the Wagerlabs Stream Deck plugin (the "Plugin") (collectively, the "Service"). By using the Service, you agree to the collection and use of information in accordance with this policy.
 
 ## 2. Information We Collect
 
@@ -102,7 +102,23 @@ The Wagerlabs Browser Extension is an optional companion to your Admin Dashboard
 - It does not execute remote code; all of its code is contained in the published package.
 - It only communicates with your own Wagerlabs dashboard — never with third-party servers.
 
-### 2.5 Subscription and Billing Information
+### 2.5 Stream Deck Plugin
+
+The Wagerlabs Stream Deck plugin is an optional add-on for the Elgato Stream Deck app that lets you control your Admin Dashboard from Stream Deck keys. It runs on your own computer and works only with the dashboards you authorize.
+
+**What the Plugin stores and sends:**
+- **OAuth 2.0 Authentication:** the Plugin signs in through your browser with OAuth 2.0 Authorization Code + PKCE. It stores a refresh token and the list of dashboards you authorized in the Stream Deck app's settings for the Plugin, on your computer. Its short-lived access tokens are kept in memory only. It never receives your Discord, Google, or email password.
+- **Requests to your dashboard:** pressing a key sends that action (for example starting a countdown, picking a slot request, or drawing a giveaway winner) to your wagerlabs.app dashboard, and the keys read what they display (timers, the number of waiting slot requests, giveaway names and status) from it.
+- **What your dashboard records:** the connection (shown as "Stream Deck", with when it was created and last used), and key actions in your activity log in the same way as the same buttons in the dashboard.
+
+**What the Plugin does NOT do:**
+- It does not collect analytics or usage data, and does not track anything else you do on your computer or in the Stream Deck app.
+- It does not read other plugins, profiles, or keys.
+- It only communicates with wagerlabs.app — never with third-party servers. The Stream Deck app itself is provided by Elgato under its own privacy policy.
+
+**Disconnecting:** press **Disconnect** in any Wagerlabs key's settings, or disconnect the Stream Deck from your dashboard (Browser Extension page, or **Connected apps** in the account menu). This revokes the Plugin's tokens immediately. A connection also lapses on its own after 30 days without use, and after 90 days at most.
+
+### 2.6 Subscription and Billing Information
 
 If you purchase a paid subscription, payment is processed by **Stripe, Inc.**, our third-party payment processor.
 
@@ -115,12 +131,13 @@ If you purchase a paid subscription, payment is processed by **Stripe, Inc.**, o
 
 **What Stripe handles and may collect** to process your payment includes your payment method details, billing name, and related transaction information, in accordance with Stripe's own privacy policy (https://stripe.com/privacy). We receive from Stripe only the non-card information needed to provision and manage your subscription (such as the identifiers and status above).
 
-### 2.6 AI Support Chat
+### 2.7 AI Support Chat
 
-The dashboard provides an automated support chat feature powered by a self-hosted Flowise instance and a third-party Large Language Model (Google Gemini).
+The dashboard provides an automated support chat assistant powered by a third-party Large Language Model, Anthropic's Claude. Our server sends the request to Anthropic; your browser does not contact Anthropic directly.
 
 **What we collect and share:**
-- Any questions, text, or information you type into the support chat widget are sent to Google's Gemini API for processing to generate an answer.
+- Any questions, text, or information you type into the support chat widget are sent to Anthropic's API for processing to generate an answer, in accordance with Anthropic's privacy policy (https://www.anthropic.com/legal/privacy).
+- **Data Retention:** We log and store these support chat transcripts in our database (including your messages and the AI's responses), under your account so you can return to them, for quality review and to improve our support services. You can delete a conversation from the support chat widget at any time.
 - **Do not submit sensitive personal information**, such as full payment card details, passwords, or personal identification numbers, into the support chat.
 
 ## 3. How We Use Your Information
