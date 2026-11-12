@@ -6265,6 +6265,26 @@ async def cleanup_pending_links_task():
             pass
 
 
+@tasks.loop(hours=1)
+async def kick_subscription_repair_task():
+    """Re-subscribe Kick events that Kick dropped on its side (core/kick_subscription_repair.py).
+
+    Kick unsubscribes an event after its webhook fails for more than a day and
+    never tells us, so go-live alerts can stop with every row still 'active'.
+    The first run is at startup, so a deploy repairs at once.
+    """
+    try:
+        from core.kick_subscription_repair import repair_kick_subscriptions
+
+        summary = await repair_kick_subscriptions(engine)
+        if summary.get("created") or summary.get("adopted") or summary.get("failed"):
+            logger.info(f"[KickSubs] Repair run: {summary}")
+    except Exception as e:
+        logger.warning(f"[KickSubs] ⚠️ Repair run failed: {e}")
+    finally:
+        clear_server()
+
+
 @tasks.loop(minutes=5)  # Fallback check every 5 minutes (PRIMARY: webhooks)
 async def clip_buffer_management_task():
     """
@@ -10256,6 +10276,10 @@ async def on_ready():
         if not check_oauth_notifications_task.is_running():
             check_oauth_notifications_task.start()
             logger.debug("✅ OAuth notifications task started")
+
+        if not kick_subscription_repair_task.is_running() and engine:
+            kick_subscription_repair_task.start()
+            logger.debug("✅ Kick subscription repair started (startup, then hourly)")
 
         # Start clip buffer management task
         if not clip_buffer_management_task.is_running():
