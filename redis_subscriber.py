@@ -796,6 +796,14 @@ class RedisSubscriber:
                 guild_id=int(server_id) if server_id is not None else None,
             )
 
+        elif action == "site_links_changed":
+            # A streamer's site linked or unlinked Kick accounts through the
+            # public API: give or take the Kick linked role, in a task of its
+            # own (features/linking/site_link_roles.py).
+            from features.linking.site_link_roles import schedule_site_link_roles
+
+            schedule_site_link_roles(self.bot, get_engine(), data)
+
     async def handle_raffle_event(self, action, data):
         """Handle raffle events from dashboard"""
         logger.info(f"📥 Raffle Event: {action}")
