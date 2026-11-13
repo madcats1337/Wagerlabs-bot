@@ -145,13 +145,48 @@ def engine():
                 """
                 CREATE TABLE kick_oauth_tokens (
                     user_id BIGINT NOT NULL, discord_server_id BIGINT NOT NULL DEFAULT 0,
-                    access_token TEXT NOT NULL, PRIMARY KEY (user_id, discord_server_id)
+                    access_token TEXT NOT NULL, needs_reauth BOOLEAN NOT NULL DEFAULT FALSE,
+                    PRIMARY KEY (user_id, discord_server_id)
                 )
                 """
             )
         )
-        conn.execute(text("INSERT INTO kick_oauth_tokens VALUES (1, :s, 'tok')"), {"s": NICK_SERVER})
+        conn.execute(
+            text(
+                """
+                CREATE TABLE bot_settings (
+                    key TEXT NOT NULL, value TEXT, discord_server_id BIGINT NOT NULL,
+                    UNIQUE (key, discord_server_id)
+                )
+                """
+            )
+        )
+    # Nick's server: connected to Kick and bound to nickcleveland's channel.
+    connect_kick(eng, NICK_SERVER)
+    bind_channel(eng, NICK_SERVER, NICK)
     return eng
+
+
+def connect_kick(engine, server, needs_reauth=False):
+    # user_id is the Discord user who connected, not the Kick broadcaster.
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO kick_oauth_tokens (user_id, discord_server_id, access_token, needs_reauth) "
+                "VALUES (411359946861445120, :s, 'tok', :r)"
+            ),
+            {"s": server, "r": needs_reauth},
+        )
+
+
+def bind_channel(engine, server, broadcaster):
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO bot_settings (key, value, discord_server_id) VALUES ('kick_broadcaster_user_id', :b, :s)"
+            ),
+            {"b": broadcaster, "s": server},
+        )
 
 
 def add_sub(engine, sub_id, broadcaster, event, server=NICK_SERVER, status="active", secret="enc:v1:abc"):
@@ -223,7 +258,9 @@ def test_adopting_a_live_id_already_held_by_a_deleted_row_reactivates_it(engine,
 
 def test_server_that_unlinked_kick_is_left_alone(engine, trust_listing):
     # api_kick_oauth_unlink deletes kick_oauth_tokens but leaves these rows
-    # 'active'. Re-subscribing with the app token would undo the streamer's choice.
+    # 'active' (and the binding). Re-subscribing with the app token would undo
+    # the streamer's choice.
+    bind_channel(engine, LELES_SERVER, LELES)
     add_sub(engine, "L", LELES, "livestream.status.updated", server=LELES_SERVER)
     kick = FakeKick([])
 
@@ -231,6 +268,41 @@ def test_server_that_unlinked_kick_is_left_alone(engine, trust_listing):
 
     assert kick.subscribe_calls == []
     assert subs(engine)["L"]["status"] == "active"
+
+
+def test_channel_the_server_moved_away_from_is_left_alone(engine, trust_listing):
+    # Rebinding to another channel only clears the NEW channel's rows, so the
+    # old channel's stay 'active'. The server no longer has that streamer's say.
+    add_sub(engine, "OLD", "777", "livestream.status.updated")
+    kick = FakeKick([])
+
+    run(repair_kick_subscriptions(engine, client=kick))
+
+    assert kick.subscribe_calls == []
+    assert subs(engine)["OLD"]["status"] == "active"
+
+
+def test_revoked_kick_connection_is_left_alone(engine, trust_listing):
+    # needs_reauth is set on invalid_grant: the streamer revoked the app on Kick.
+    connect_kick(engine, LELES_SERVER, needs_reauth=True)
+    bind_channel(engine, LELES_SERVER, LELES)
+    add_sub(engine, "L", LELES, "livestream.status.updated", server=LELES_SERVER)
+    kick = FakeKick([])
+
+    run(repair_kick_subscriptions(engine, client=kick))
+
+    assert kick.subscribe_calls == []
+
+
+def test_load_active_rows_keeps_only_consented_rows(engine):
+    connect_kick(engine, LELES_SERVER, needs_reauth=True)
+    bind_channel(engine, LELES_SERVER, LELES)
+    add_sub(engine, "NICK_OK", NICK, "livestream.status.updated")
+    add_sub(engine, "NICK_OLD_CHANNEL", "777", "livestream.status.updated")
+    add_sub(engine, "NICK_DELETED", NICK, "channel.subscription.new", status="deleted")
+    add_sub(engine, "LELES_REVOKED", LELES, "livestream.status.updated", server=LELES_SERVER)
+
+    assert [r["subscription_id"] for r in repair.load_active_rows(engine)] == ["NICK_OK"]
 
 
 def test_event_kick_refuses_keeps_old_row_for_the_next_run(engine, trust_listing):

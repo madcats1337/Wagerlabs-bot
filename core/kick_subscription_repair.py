@@ -14,9 +14,9 @@ credentials + broadcaster_user_id, which Kick accepts for creating
 subscriptions), so no streamer has to reconnect Kick. The bot runs it on
 startup and every hour (bot.py, kick_subscription_repair_task).
 
-Only rows of servers that still have a Kick connection (a kick_oauth_tokens
-row) are considered: unlinking Kick deletes the tokens but leaves these rows
-'active', and re-subscribing them would undo the streamer's choice.
+Only rows we still have the streamer's consent for are considered: the server
+must still be connected to Kick, not revoked, and bound to that channel (see
+load_active_rows). Re-subscribing anything else would undo the streamer's choice.
 """
 
 import logging
@@ -123,7 +123,20 @@ def listing_trustworthy(live_subs, local_rows) -> bool:
 
 
 def load_active_rows(engine) -> list:
-    """Active subscription rows of servers that still have a Kick connection."""
+    """Active subscription rows we still have the streamer's consent to keep.
+
+    The app token can subscribe to ANY channel, so consent is checked per row:
+      - the server still has a Kick connection (unlinking deletes its
+        kick_oauth_tokens row but leaves these rows 'active');
+      - that connection is not dead: needs_reauth is set on invalid_grant, i.e.
+        the streamer revoked the app on Kick;
+      - the row is for the channel the server is bound to now
+        (bot_settings.kick_broadcaster_user_id, written by the dashboard's Kick
+        connect). Rebinding to another channel only clears the NEW channel's
+        rows, so the old channel's would otherwise be re-subscribed.
+    kick_oauth_tokens.user_id is the Discord user, not the Kick broadcaster, so
+    the binding comes from bot_settings.
+    """
     with engine.connect() as conn:
         result = conn.execute(
             text(
@@ -135,6 +148,13 @@ def load_active_rows(engine) -> list:
                   AND EXISTS (
                       SELECT 1 FROM kick_oauth_tokens t
                       WHERE t.discord_server_id = s.discord_server_id
+                        AND NOT COALESCE(t.needs_reauth, FALSE)
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM bot_settings b
+                      WHERE b.discord_server_id = s.discord_server_id
+                        AND b.key = 'kick_broadcaster_user_id'
+                        AND b.value = s.broadcaster_user_id
                   )
                 ORDER BY s.id
                 """
