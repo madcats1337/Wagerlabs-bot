@@ -14,14 +14,18 @@ so there is a single source of truth for go-live behavior.
 import asyncio
 import logging
 import os
+import time
 from typing import Optional
+
+from utils.server_urls import PUBLIC_BASE_DOMAIN
 
 logger = logging.getLogger(__name__)
 
 
-# Per-platform URL builders. Kick uses clkick.com as a Discord-unfurl video proxy;
-# Twitch HLS is locked down so we fall back to the channel page (the dashboard
-# /stream/live embed for Twitch is deferred — see the plan §D).
+# Per-platform URL builders. Kick links the dashboard's own link card
+# (/kick/<channel>), which Discord unfurls into the live card + clip; Twitch HLS
+# is locked down so we fall back to the channel page (the dashboard /stream/live
+# embed for Twitch is deferred — see the plan §D).
 def _stream_url(platform: str, streamer: str) -> str:
     if platform == "twitch":
         return f"https://twitch.tv/{streamer}"
@@ -32,7 +36,11 @@ def _embed_url(platform: str, streamer: str) -> str:
     if platform == "twitch":
         # No video-unfurl proxy yet for Twitch; link the channel directly.
         return f"https://twitch.tv/{streamer}"
-    return f"https://clkick.com/{streamer}"
+    # Was clkick.com (noti.bot's proxy, which added noti.bot's own buttons to
+    # every alert). `t` makes each alert a new URL: Discord caches an unfurl per
+    # URL for ~30 minutes, so a stream restarted inside that window would
+    # otherwise get the previous alert's card and clip.
+    return f"https://{PUBLIC_BASE_DOMAIN}/kick/{streamer}?t={int(time.time())}"
 
 
 def _platform_label(platform: str) -> str:
@@ -99,8 +107,9 @@ def alert_setting(settings: dict, platform: str, suffix: str):
 
 def _build_live_message(settings: dict, platform: str, streamer: str, title: str, category: str):
     """Build the (content, footer) for a go-live message from a platform's alert
-    settings. Kick includes the clkick video-unfurl link; Twitch has no video
-    proxy, so it omits the hidden link (the Watch Stream button links the channel).
+    settings. Kick includes the link-card URL Discord unfurls into the live card;
+    Twitch has no video proxy, so it omits the hidden link (the Watch Stream
+    button links the channel).
     """
 
     def repl(t):
@@ -129,7 +138,7 @@ def _build_live_message(settings: dict, platform: str, streamer: str, title: str
         link_text = alert_setting(settings, platform, "link_text") or "Watch on Twitch"
         parts.append(f"[{link_text}]({_embed_url(platform, streamer)})")
     else:
-        # Kick: the clkick unfurl link that Discord turns into the video preview.
+        # Kick: the link-card URL Discord unfurls into the live card and clip.
         link_text = alert_setting(settings, platform, "link_text") or "Watch Preview"
         hidden_link = f"[{link_text}]({_embed_url(platform, streamer)})"
         if alert_setting(settings, platform, "link_small") == "true":
