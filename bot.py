@@ -10147,6 +10147,14 @@ async def on_ready():
                         WHERE username_key IS NOT NULL;
                     ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS entry_list VARCHAR(64);
                     ALTER TABLE giveaway_templates ADD COLUMN IF NOT EXISTS entry_list VARCHAR(64);
+                    -- Extra entries for the members a list marks active: the
+                    -- site's per-member flag, a giveaway's bonus, and the
+                    -- bonus each entry was given (add_entry), so a per-user
+                    -- cap counts joins rather than bonus tickets.
+                    ALTER TABLE giveaway_list_members ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT FALSE;
+                    ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS list_bonus_entries INTEGER;
+                    ALTER TABLE giveaway_templates ADD COLUMN IF NOT EXISTS list_bonus_entries INTEGER;
+                    ALTER TABLE giveaway_entries ADD COLUMN IF NOT EXISTS bonus_entries INTEGER NOT NULL DEFAULT 0;
                     -- Display names for the Discord ids on a guild's lists,
                     -- filled by _refresh_entry_list_names for the dashboard's
                     -- Entry lists tab.

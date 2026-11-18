@@ -32,7 +32,7 @@ def engine():
                 CREATE TABLE giveaways (
                     id INTEGER PRIMARY KEY, discord_server_id BIGINT, title TEXT,
                     entry_method TEXT, keyword TEXT, status TEXT, required_role_id BIGINT, entry_list TEXT,
-                    allow_multiple_entries BOOLEAN DEFAULT 0, max_entries_per_user INTEGER DEFAULT 1,
+                    allow_multiple_entries BOOLEAN DEFAULT 0, max_entries_per_user INTEGER DEFAULT 1, list_bonus_entries INTEGER,
                     messages_required INTEGER DEFAULT 1, time_window_minutes INTEGER DEFAULT 10
                 )
                 """
@@ -44,7 +44,7 @@ def engine():
                 CREATE TABLE giveaway_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, giveaway_id INTEGER, discord_server_id BIGINT,
                     discord_id BIGINT, kick_username TEXT, kick_user_id INTEGER, entry_method TEXT,
-                    entry_count INTEGER DEFAULT 1, profile_pic_url TEXT, display_name TEXT, platform TEXT, platform_user_id TEXT,
+                    entry_count INTEGER DEFAULT 1, bonus_entries INTEGER DEFAULT 0, profile_pic_url TEXT, display_name TEXT, platform TEXT, platform_user_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """

@@ -19,18 +19,9 @@ from sqlalchemy import text
 NAME_FETCHES_PER_REFRESH = 25
 
 
-def on_entry_list(engine, guild_id, list_key, platform, handle, platform_user_id=None, discord_id=None):
-    """Whether this chatter is on the server's list `list_key`.
-
-    By their account id on `platform` when the chat event carries one (Twitch),
-    else by their username: kickpython gives the bot only a Kick sender's
-    name, so Kick matches by username. With an id in hand, a username counts
-    only against a member the site sent without one, since a handle can be
-    renamed away and claimed by someone else. `discord_id`, the Discord account
-    the chatter linked in Wagerlabs, matches a Discord id on the list.
-
-    A list that doesn't exist matches nobody.
-    """
+def _list_match(engine, guild_id, list_key, platform, handle, platform_user_id=None, discord_id=None):
+    """The `active` flag of the list member this chatter matches, or None when
+    they match nobody. The matching rules are on_entry_list's, below."""
     platform = (platform or "kick").lower()
     puid = str(platform_user_id) if platform_user_id not in (None, "", 0) else None
     handle_key = handle.strip().lower() if handle else None
@@ -48,23 +39,50 @@ def on_entry_list(engine, guild_id, list_key, platform, handle, platform_user_id
         clauses.append("(m.platform = 'discord' AND m.platform_user_id = :did)")
         params["did"] = str(discord_id)
     if not clauses:
-        return False
+        return None
 
     with engine.connect() as conn:
         row = conn.execute(
             text(
                 f"""
-                SELECT 1
+                SELECT m.active
                 FROM giveaway_lists l
                 JOIN giveaway_list_members m ON m.list_id = l.id
                 WHERE l.discord_server_id = :sid AND l.list_key = :key
                   AND ({" OR ".join(clauses)})
+                ORDER BY m.active DESC
                 LIMIT 1
                 """
             ),
             params,
         ).fetchone()
-    return row is not None
+    return None if row is None else bool(row[0])
+
+
+def on_entry_list(engine, guild_id, list_key, platform, handle, platform_user_id=None, discord_id=None):
+    """Whether this chatter is on the server's list `list_key`.
+
+    By their account id on `platform` when the chat event carries one (Twitch),
+    else by their username: kickpython gives the bot only a Kick sender's
+    name, so Kick matches by username. With an id in hand, a username counts
+    only against a member the site sent without one, since a handle can be
+    renamed away and claimed by someone else. `discord_id`, the Discord account
+    the chatter linked in Wagerlabs, matches a Discord id on the list.
+
+    A list that doesn't exist matches nobody.
+    """
+    return _list_match(engine, guild_id, list_key, platform, handle, platform_user_id, discord_id) is not None
+
+
+def is_active_on_list(engine, guild_id, list_key, platform, handle, platform_user_id=None, discord_id=None):
+    """Whether this chatter is on `list_key` AND the site marks them active.
+
+    A site marks members `active` (nickcleveland.com: its affiliates wagering
+    under the code lately); a giveaway limited to the list may give them
+    extra entries (`list_bonus_entries`, applied in giveaway_manager.add_entry).
+    Matched exactly as on_entry_list matches, by any identity the site sent.
+    """
+    return _list_match(engine, guild_id, list_key, platform, handle, platform_user_id, discord_id) is True
 
 
 def entry_list_meta(engine, guild_id, list_key):

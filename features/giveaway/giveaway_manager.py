@@ -271,7 +271,8 @@ class GiveawayManager:
                 text(
                     """
                 SELECT g.status, g.required_role_id, g.entry_list, g.allow_multiple_entries, g.max_entries_per_user,
-                       (SELECT ge.entry_count FROM giveaway_entries ge
+                       g.list_bonus_entries,
+                       (SELECT ge.entry_count - COALESCE(ge.bonus_entries, 0) FROM giveaway_entries ge
                         WHERE ge.giveaway_id = g.id AND ge.kick_username = :username
                         LIMIT 1) AS entry_count
                 FROM giveaways g
@@ -287,6 +288,9 @@ class GiveawayManager:
 
         allow_multiple = row.allow_multiple_entries
         max_entries = row.max_entries_per_user or 1
+        # `entry_count` here is how many times they joined: their tickets less
+        # any bonus their first entry was given (below), so a bonus never uses
+        # up the per-user cap.
         if row.entry_count is not None:
             if not allow_multiple:
                 logger.debug(f"{kick_username} already entered giveaway {giveaway_id}")
@@ -310,6 +314,26 @@ class GiveawayManager:
             # Lets the winner announcement @mention them.
             discord_id = discord_id or gated_discord_id
 
+        # Extra entries for a member the list marks active (the site's word,
+        # Admin-Dashboard utils/giveaway_lists.py). Given on their first entry
+        # only, and recorded on it, so it counts once in the draw and never
+        # toward the per-user cap. Read on every entry: an edit mid-run applies
+        # to entries from then on, and one already in keeps what it got.
+        bonus = 0
+        if row.entry_list and (row.list_bonus_entries or 0) > 0 and row.entry_count is None:
+            from features.giveaway.entry_lists import is_active_on_list
+
+            if is_active_on_list(
+                self.engine,
+                self.guild_id,
+                row.entry_list,
+                platform,
+                display_name or kick_username,
+                platform_user_id,
+                discord_id=discord_id,
+            ):
+                bonus = min(int(row.list_bonus_entries), 100)
+
         # Fetch profile picture from the entrant's platform.
         profile_pic_url = await self._fetch_avatar(kick_username, platform)
 
@@ -319,7 +343,7 @@ class GiveawayManager:
             existing = conn.execute(
                 text(
                     """
-                SELECT entry_count FROM giveaway_entries
+                SELECT entry_count - COALESCE(bonus_entries, 0) FROM giveaway_entries
                 WHERE giveaway_id = :giveaway_id
                 AND kick_username = :username
             """
@@ -357,9 +381,9 @@ class GiveawayManager:
                         """
                     INSERT INTO giveaway_entries
                     (giveaway_id, discord_server_id, discord_id, kick_username, kick_user_id, entry_method, entry_count,
-                     profile_pic_url, display_name, platform, platform_user_id)
-                    VALUES (:giveaway_id, :server_id, :discord_id, :username, :user_id, :method, 1, :profile_pic,
-                            :display_name, :platform, :platform_user_id)
+                     bonus_entries, profile_pic_url, display_name, platform, platform_user_id)
+                    VALUES (:giveaway_id, :server_id, :discord_id, :username, :user_id, :method, 1 + :bonus, :bonus,
+                            :profile_pic, :display_name, :platform, :platform_user_id)
                 """
                     ),
                     {
@@ -369,6 +393,7 @@ class GiveawayManager:
                         "username": kick_username,
                         "user_id": kick_user_id,
                         "method": entry_method,
+                        "bonus": bonus,
                         "profile_pic": profile_pic_url,
                         "display_name": display_name or kick_username,
                         # Which chat, and who there: the dashboard's API names the
@@ -377,7 +402,10 @@ class GiveawayManager:
                         "platform_user_id": str(platform_user_id) if platform_user_id else None,
                     },
                 )
-                logger.info(f"Added new entry for {kick_username} in giveaway {giveaway_id} via {entry_method}")
+                logger.info(
+                    f"Added new entry for {kick_username} in giveaway {giveaway_id} via {entry_method}"
+                    + (f" (+{bonus} for an active list member)" if bonus else "")
+                )
 
             conn.commit()
             return EntryOutcome(True)

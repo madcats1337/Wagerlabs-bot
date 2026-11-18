@@ -34,7 +34,7 @@ def engine():
                 CREATE TABLE giveaways (
                     id INTEGER PRIMARY KEY, discord_server_id BIGINT, title TEXT,
                     entry_method TEXT, keyword TEXT, status TEXT, required_role_id BIGINT, entry_list TEXT,
-                    allow_multiple_entries BOOLEAN DEFAULT 0, max_entries_per_user INTEGER DEFAULT 1
+                    allow_multiple_entries BOOLEAN DEFAULT 0, max_entries_per_user INTEGER DEFAULT 1, list_bonus_entries INTEGER
                 )
                 """
             )
@@ -45,7 +45,7 @@ def engine():
                 CREATE TABLE giveaway_entries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, giveaway_id INTEGER, discord_server_id BIGINT,
                     discord_id BIGINT, kick_username TEXT, kick_user_id INTEGER, entry_method TEXT,
-                    entry_count INTEGER DEFAULT 1, profile_pic_url TEXT, display_name TEXT, platform TEXT, platform_user_id TEXT,
+                    entry_count INTEGER DEFAULT 1, bonus_entries INTEGER DEFAULT 0, profile_pic_url TEXT, display_name TEXT, platform TEXT, platform_user_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -76,7 +76,7 @@ def engine():
                 """
                 CREATE TABLE giveaway_list_members (
                     list_id INTEGER, member_no INTEGER, platform TEXT, platform_user_id TEXT,
-                    username_key TEXT, display_name TEXT
+                    username_key TEXT, display_name TEXT, active BOOLEAN DEFAULT 0
                 )
                 """
             )
@@ -96,7 +96,7 @@ def engine():
 
 
 def make_list(engine, key="affiliates", server=SERVER, members=(), name="Verified affiliates", hint=None):
-    """`members`: (platform, platform_user_id, username) tuples, one person each."""
+    """`members`: (platform, platform_user_id, username[, active]) tuples, one person each."""
     with engine.begin() as conn:
         list_id = conn.execute(
             text(
@@ -104,11 +104,11 @@ def make_list(engine, key="affiliates", server=SERVER, members=(), name="Verifie
             ),
             {"s": server, "k": key, "n": name, "h": hint},
         ).scalar()
-        for n, (platform, uid, username) in enumerate(members):
+        for n, (platform, uid, username, *rest) in enumerate(members):
             conn.execute(
                 text(
                     "INSERT INTO giveaway_list_members (list_id, member_no, platform, platform_user_id, username_key, "
-                    "display_name) VALUES (:l, :n, :p, :u, :k, :d)"
+                    "display_name, active) VALUES (:l, :n, :p, :u, :k, :d, :a)"
                 ),
                 {
                     "l": list_id,
@@ -117,6 +117,7 @@ def make_list(engine, key="affiliates", server=SERVER, members=(), name="Verifie
                     "u": uid,
                     "k": username.lower() if username else None,
                     "d": username,
+                    "a": bool(rest[0]) if rest else False,
                 },
             )
 
@@ -397,3 +398,79 @@ def test_an_entry_records_its_chat_and_the_chatter_id(engine, monkeypatch):
             )
         ).fetchall()
     assert [tuple(r) for r in rows] == [("kickfan", "kick", None), ("twitchfan", "twitch", "777")]
+
+
+# ---------------------------------------------------------------------------
+# Extra entries for the members a list marks active
+# ---------------------------------------------------------------------------
+def set_bonus(engine, gid, bonus, allow_multiple=False, max_entries=1):
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE giveaways SET list_bonus_entries = :b, allow_multiple_entries = :m, max_entries_per_user = :x "
+                "WHERE id = :g"
+            ),
+            {"b": bonus, "m": allow_multiple, "x": max_entries, "g": gid},
+        )
+
+
+def tickets(engine, gid):
+    with engine.connect() as conn:
+        return {
+            r[0]: (r[1], r[2])
+            for r in conn.execute(
+                text("SELECT kick_username, entry_count, bonus_entries FROM giveaway_entries WHERE giveaway_id = :g"),
+                {"g": gid},
+            )
+        }
+
+
+def test_an_active_member_enters_with_the_extra_entries(engine, monkeypatch):
+    make_list(engine, members=[("kick", None, "player", True), ("kick", None, "signup", False)])
+    g = add_giveaway(engine, 1, entry_list="affiliates")
+    set_bonus(engine, 1, 4)
+    m = manager(engine, FakeGuild(), monkeypatch)
+
+    assert enter(m, g, username="player")
+    assert enter(m, g, username="signup")
+    # 1 + 4 tickets in the draw for the active member, 1 for the rest.
+    assert tickets(engine, 1) == {"player": (5, 4), "signup": (1, 0)}
+
+
+def test_no_bonus_is_given_until_the_giveaway_sets_one(engine, monkeypatch):
+    make_list(engine, members=[("kick", None, "player", True)])
+    g = add_giveaway(engine, 1, entry_list="affiliates")
+    assert enter(manager(engine, FakeGuild(), monkeypatch), g, username="player")
+    assert tickets(engine, 1) == {"player": (1, 0)}
+
+
+def test_an_active_member_known_by_their_linked_discord_gets_it_too(engine, monkeypatch):
+    make_list(engine, members=[("discord", str(DISCORD_ID), None, True)])
+    link(engine, "viewer")
+    g = add_giveaway(engine, 1, entry_list="affiliates")
+    set_bonus(engine, 1, 2)
+    assert enter(manager(engine, FakeGuild(), monkeypatch), g, username="viewer")
+    assert tickets(engine, 1) == {"viewer": (3, 2)}
+
+
+def test_the_bonus_never_uses_up_the_per_user_cap(engine, monkeypatch):
+    """Multiple entries allowed, three per viewer: the active member still gets
+    three joins, the bonus on top, given once."""
+    make_list(engine, members=[("kick", None, "player", True)])
+    g = add_giveaway(engine, 1, entry_list="affiliates")
+    set_bonus(engine, 1, 10, allow_multiple=True, max_entries=3)
+    m = manager(engine, FakeGuild(), monkeypatch)
+
+    assert [bool(enter(m, g, username="player")) for _ in range(3)] == [True, True, True]
+    assert enter(m, g, username="player").refusal == gm.MAX_ENTRIES
+    assert tickets(engine, 1) == {"player": (13, 10)}
+
+
+def test_a_bonus_set_mid_run_counts_for_entries_from_then_on(engine, monkeypatch):
+    make_list(engine, members=[("kick", None, "early", True), ("kick", None, "late", True)])
+    g = add_giveaway(engine, 1, entry_list="affiliates")
+    m = manager(engine, FakeGuild(), monkeypatch)
+    assert enter(m, g, username="early")
+    set_bonus(engine, 1, 3)
+    assert enter(m, g, username="late")
+    assert tickets(engine, 1) == {"early": (1, 0), "late": (4, 3)}
